@@ -451,9 +451,7 @@ impl<'a> Checker<'a> {
                 .collect()
         };
         self.level -= 1;
-        for ty in &types {
-            self.close_top_row(ty);
-        }
+        self.close_top_rows(&types);
         for (function, ty) in group.iter().zip(&types) {
             let (scheme, ambiguous) = generalize(&self.table, self.level, ty);
             self.report_constraints(ambiguous, &function.span);
@@ -895,24 +893,35 @@ impl<'a> Checker<'a> {
         Type::Fun(params, result, Row::with_tail(row.labels, tail))
     }
 
-    /// Before generalization, a row variable that occurs only in the function's own row stands
-    /// for nothing more: close it, so schemes read `! {db.read}` instead of `! {db.read | 'e}`.
-    /// Rows of returned functions stay open (a caller may still join them with other effects,
-    /// e.g. two branches returning different closures); the display hides them when they are
-    /// unconstrained. Variables in parameters are never closed (that would lose generality).
-    fn close_top_row(&mut self, ty: &Type) {
-        let resolved = self.table.resolve(ty);
-        let Type::Fun(_, _, row) = &resolved else {
-            return;
-        };
+    /// Before generalization, a row variable that occurs only in the own rows of a group's
+    /// functions stands for nothing more: close it, so schemes read `! {db.read}` instead of
+    /// `! {db.read | 'e}`. Occurrences are counted across every member of the group, because
+    /// the members share rows through their calls (closing a tail that also appears in a
+    /// sibling's parameter would make that parameter pure). Rows of returned functions stay
+    /// open (a caller may still join them with other effects, e.g. two branches returning
+    /// different closures); the display hides them when they are unconstrained. Variables in
+    /// parameters are never closed (that would lose generality).
+    fn close_top_rows(&mut self, types: &[Type]) {
         let mut occurrences: BTreeMap<RowVarId, (usize, bool)> = BTreeMap::new();
-        row_occurrences(&resolved, true, &mut occurrences);
-        if let Some(tail) = row.tail
-            && occurrences.get(&tail).is_some_and(|(count, _)| *count == 1)
-            && let RowState::Unbound { level } = self.table.row_state(tail).clone()
-            && level > self.level
-        {
-            self.table.set_row(tail, RowState::Link(Row::empty()));
+        let mut top: BTreeMap<RowVarId, usize> = BTreeMap::new();
+        for ty in types {
+            let resolved = self.table.resolve(ty);
+            row_occurrences(&resolved, true, &mut occurrences);
+            if let Type::Fun(_, _, row) = &resolved
+                && let Some(tail) = row.tail
+            {
+                *top.entry(tail).or_default() += 1;
+            }
+        }
+        for (tail, count) in top {
+            if occurrences
+                .get(&tail)
+                .is_some_and(|(total, _)| *total == count)
+                && let RowState::Unbound { level } = self.table.row_state(tail).clone()
+                && level > self.level
+            {
+                self.table.set_row(tail, RowState::Link(Row::empty()));
+            }
         }
     }
 
@@ -3738,5 +3747,17 @@ mod tests {
             "(Int, () -> Int ! 'e) -> Int ! 'e"
         );
         assert_eq!(scheme_in(&schemes, "usa"), "(ClienteId) -> Int ! {db.read}");
+    }
+
+    #[test]
+    fn group_members_share_row_variables_before_closing() {
+        let schemes = db_schemes(
+            "fun a(n: Int): Int = if (n == 0) 0 else b(n, { -> 1 })\nfun b(n: Int, g) = g() + a(n - 1)\nfun use(id: ClienteId) = b(1, { -> length(listOf(db.clientes.require(id).nome)) })\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "b"),
+            "(Int, () -> Int ! 'e) -> Int ! 'e"
+        );
+        assert_eq!(scheme_in(&schemes, "use"), "(ClienteId) -> Int ! {db.read}");
     }
 }
