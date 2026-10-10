@@ -1,1 +1,1 @@
-E7201 2:23 `when` is not exhaustive; missing case: null.
+E7101 2:23 Type mismatch: expected `Int`, found `Int?`.

@@ -28,6 +28,9 @@ pub struct TypedProgram {
     pub signatures: BTreeMap<String, Type>,
     /// Resolved type of each expression and block, keyed by function and node.
     pub node_types: BTreeMap<(String, NodeId), Type>,
+    /// Elaborated patterns of each `when`, keyed by function and the `when` node, with the
+    /// optional layers made explicit (`Some(...)`), so later passes need not re-derive them.
+    pub patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
 }
 
 pub fn check_program(program: &Program, env: &Env, schema: &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>) {
@@ -51,6 +54,7 @@ struct Checker<'a> {
     return_type: Option<Type>,
     lambda_depth: usize,
     nodes: BTreeMap<(String, NodeId), (Type, Span)>,
+    patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -71,6 +75,7 @@ impl<'a> Checker<'a> {
             return_type: None,
             lambda_depth: 0,
             nodes: BTreeMap::new(),
+            patterns: BTreeMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -305,6 +310,7 @@ impl<'a> Checker<'a> {
             }
         }
         typed.node_types = self.nodes.iter().map(|(key, (ty, _))| (key.clone(), self.table.resolve(ty))).collect();
+        typed.patterns = self.patterns.clone();
         typed
     }
 
@@ -534,7 +540,7 @@ impl<'a> Checker<'a> {
                 self.unify_at(&then_ty, &else_ty, &else_branch.span, Some("the first `if` branch".into()));
                 then_ty
             }
-            ExprKind::When { scrutinee, arms } => self.infer_when(scrutinee, arms, &expr.span),
+            ExprKind::When { scrutinee, arms } => self.infer_when(expr.id, scrutinee, arms, &expr.span),
             ExprKind::Lambda { params, body } => self.infer_lambda(params, body, None),
             ExprKind::Block(block) => self.infer_block(block),
             ExprKind::Return(value) => {
@@ -1021,7 +1027,7 @@ impl<'a> Checker<'a> {
 
     // ---- when and patterns ---------------------------------------------------------
 
-    fn infer_when(&mut self, scrutinee: &Expr, arms: &[Arm], span: &Span) -> Type {
+    fn infer_when(&mut self, id: NodeId, scrutinee: &Expr, arms: &[Arm], span: &Span) -> Type {
         let subject = self.infer(scrutinee);
         if arms.iter().any(|arm| matches!(arm.pattern, Pattern::Null(_))) {
             let inner = self.fresh();
@@ -1030,11 +1036,20 @@ impl<'a> Checker<'a> {
         let result = self.fresh();
         let mut patterns = Vec::new();
         let mut invalid_pattern = false;
+        let mut null_seen = false;
         for arm in arms {
             let mark = self.locals.len();
             let mut bound = BTreeSet::new();
             let reported = self.diagnostics.len();
-            let pattern = self.check_pattern(&arm.pattern, &subject, &mut bound);
+            let pattern = match (&arm.pattern, self.optional_inner(&subject)) {
+                // Smart cast: after a `null` arm, a variable arm binds the non-null value.
+                (Pattern::Name(name, span), Some(inner)) if null_seen && self.is_variable(name) => {
+                    self.bind_variable(name, &inner, span, &mut bound);
+                    Pat::Ctor("Some".into(), vec![Pat::Wild])
+                }
+                _ => self.check_pattern(&arm.pattern, &subject, &mut bound),
+            };
+            null_seen |= matches!(arm.pattern, Pattern::Null(_));
             invalid_pattern |= self.diagnostics.len() > reported;
             let body = self.infer(&arm.body);
             self.unify_at(&result, &body, &arm.body.span, Some("the first `when` branch".into()));
@@ -1056,20 +1071,46 @@ impl<'a> Checker<'a> {
                 );
             }
         }
+        self.patterns.insert((self.function.clone(), id), patterns);
         result
     }
 
-    /// Checks `pattern` against `ty`. At a type already known to be `T?`, every pattern other
-    /// than `_` and `null` describes a non-null value and is checked against `T`.
-    fn check_pattern(&mut self, pattern: &Pattern, ty: &Type, bound: &mut BTreeSet<String>) -> Pat {
-        if !matches!(pattern, Pattern::Wildcard | Pattern::Null(_))
-            && let Type::Con(name, args) = self.table.shallow(ty)
-            && name == "Option"
-            && args.len() == 1
-        {
-            let inner = self.check_pattern(pattern, &args[0], bound);
-            return Pat::Ctor("Some".into(), vec![inner]);
+    fn optional_inner(&self, ty: &Type) -> Option<Type> {
+        match self.table.shallow(ty) {
+            Type::Con(name, mut args) if name == "Option" && args.len() == 1 => args.pop(),
+            _ => None,
         }
+    }
+
+    /// A lowercase name that is not a constructor binds a variable in a pattern.
+    fn is_variable(&self, name: &str) -> bool {
+        !self.env.ctors.contains_key(name) && !name.chars().next().is_some_and(char::is_uppercase)
+    }
+
+    fn bind_variable(&mut self, name: &str, ty: &Type, span: &Span, bound: &mut BTreeSet<String>) {
+        if !bound.insert(name.to_string()) {
+            self.error("E7113", format!("`{name}` is bound more than once in this pattern."), span);
+        }
+        self.locals.push((name.to_string(), Scheme::mono(ty.clone())));
+    }
+
+    /// Checks `pattern` against `ty`. Variables and `_` are irrefutable and take `ty` as is.
+    /// At a type already known to be `T?`, a constructor or literal pattern describes a
+    /// non-null value: it is checked against `T`, unwrapping one layer per pattern level.
+    fn check_pattern(&mut self, pattern: &Pattern, ty: &Type, bound: &mut BTreeSet<String>) -> Pat {
+        let refutable = match pattern {
+            Pattern::Wildcard | Pattern::Null(_) | Pattern::Double(..) => false,
+            Pattern::Name(name, _) => !self.is_variable(name),
+            _ => true,
+        };
+        if refutable && let Some(inner) = self.optional_inner(ty) {
+            let pattern = self.check_value_pattern(pattern, &inner, bound);
+            return Pat::Ctor("Some".into(), vec![pattern]);
+        }
+        self.check_value_pattern(pattern, ty, bound)
+    }
+
+    fn check_value_pattern(&mut self, pattern: &Pattern, ty: &Type, bound: &mut BTreeSet<String>) -> Pat {
         match pattern {
             Pattern::Wildcard => Pat::Wild,
             Pattern::Null(span) => {
@@ -1111,10 +1152,7 @@ impl<'a> Checker<'a> {
                     self.error("E7103", format!("Unknown constructor `{name}`."), span);
                     return Pat::Wild;
                 }
-                if !bound.insert(name.clone()) {
-                    self.error("E7113", format!("`{name}` is bound more than once in this pattern."), span);
-                }
-                self.locals.push((name.clone(), Scheme::mono(ty.clone())));
+                self.bind_variable(name, ty, span, bound);
                 Pat::Wild
             }
             Pattern::Constructor { name, args, span } => {
@@ -1460,8 +1498,52 @@ mod tests {
     #[test]
     fn nullable_patterns() {
         assert_eq!(scheme("fun f(x: Int?): Int = when (x) {\n    null -> 0\n    n -> n\n}", "f"), "(Int?) -> Int");
-        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n }"), vec!["E7201"]);
+        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n }"), vec!["E7101"]);
         assert_eq!(scheme("fun f(x) = when (x) {\n    null -> 0\n    n -> n + 1\n}", "f"), "(Int?) -> Int");
+    }
+
+    #[test]
+    fn variable_patterns_bind_the_type_as_is() {
+        let record = "data class U(val nome: String, val email: String?)\n";
+        assert_eq!(scheme(&format!("{record}fun f(u: U): String = when (u) {{ U(n, e) -> n }}"), "f"), "(U) -> String");
+        let email = format!("{record}fun f(u: U): String = when (u) {{ U(_, e) -> e ?: \"\" }}");
+        assert_eq!(scheme(&email, "f"), "(U) -> String");
+        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { null -> 0; n -> n }", "f"), "(Int?) -> Int");
+        assert_eq!(scheme("fun f(x: Int?): Int? = when (x) { n -> n }", "f"), "(Int?) -> Int?");
+        assert_eq!(scheme("fun f(x: Int??): Int = when (x) { null -> 0; y -> y ?: 1 }", "f"), "(Int??) -> Int");
+        // Only a top-level variable arm after a top-level `null` arm is smart-cast; before it,
+        // the variable takes `Int?` and already covers `null`.
+        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n; null -> 0 }"), vec!["E7101", "E7202"]);
+        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n ?: 0; null -> 0 }"), vec!["E7202"]);
+    }
+
+    #[test]
+    fn elaborated_patterns_are_recorded_per_when() {
+        use crate::types::exhaustive::Pat;
+        let (tokens, _) = crate::lexer::lex("t.bd", "fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; n -> n }");
+        let (program, _) = crate::parser::parse(tokens);
+        let (typed, diagnostics) = crate::types::check(&program, &crate::schema::DatabaseSchema::default());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let patterns: Vec<&Vec<Pat>> = typed.patterns.values().collect();
+        let some = |inner: Pat| Pat::Ctor("Some".into(), vec![inner]);
+        assert_eq!(
+            patterns,
+            vec![&vec![Pat::Ctor("null".into(), Vec::new()), some(Pat::Lit("1".into())), some(Pat::Wild)]]
+        );
+        assert!(typed.patterns.keys().all(|(function, _)| function == "f"));
+    }
+
+    #[test]
+    fn constructor_and_literal_patterns_unwrap_one_optional_layer() {
+        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }", "f"), "(Int?) -> Int");
+        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { 1 -> 1; _ -> 2 }", "f"), "(Int?) -> Int");
+        assert_eq!(errors("fun f(x: Int??): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }"), vec!["E7101"]);
+        let pedido = format!("{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    null -> 0\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}");
+        assert_eq!(scheme(&pedido, "f"), "(Pedido?) -> Int");
+        let missing = format!("{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}");
+        assert_eq!(errors(&missing), vec!["E7201"]);
+        let nested = "data class W(val v: Int?)\nfun f(w: W): Int = when (w) { W(null) -> 0; W(1) -> 1; W(n) -> n ?: 2 }";
+        assert_eq!(scheme(nested, "f"), "(W) -> Int");
     }
 
     #[test]

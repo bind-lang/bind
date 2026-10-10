@@ -1,2 +1,2 @@
-// expect: E7201
+// expect: E7101
 fun f(x: Int?): Int = when (x) { n -> n }
