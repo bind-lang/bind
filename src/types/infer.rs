@@ -6,7 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{Domain, Function, Program, TypeKind, TypeRef};
-use crate::diagnostic::{Diagnostic, Span};
+use crate::diagnostic::{Diagnostic, Severity, Span};
 use crate::parser::expr::parse_type_text;
 use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
@@ -85,6 +85,10 @@ struct Checker<'a> {
     function_domains: BTreeMap<String, Domain>,
     /// `server fun`s that are not components: the only targets of `server.f`.
     endpoints: BTreeSet<String>,
+    /// Functions and labels already reported as exceeding the domain's ceiling (E7401).
+    ceiling_failures: BTreeSet<(String, Label)>,
+    /// Functions whose body reported an error.
+    body_errors: BTreeSet<String>,
     /// Calls each function makes to program functions, in order, for effect paths.
     calls: BTreeMap<String, Vec<(String, Span)>>,
 }
@@ -164,6 +168,8 @@ impl<'a> Checker<'a> {
             domain: Domain::Inferred,
             function_domains: BTreeMap::new(),
             endpoints: BTreeSet::new(),
+            ceiling_failures: BTreeSet::new(),
+            body_errors: BTreeSet::new(),
             calls: BTreeMap::new(),
         }
     }
@@ -469,11 +475,18 @@ impl<'a> Checker<'a> {
             self.effect_scope = effects;
             produced.push(self.check_body(function, ty));
         }
-        for ((function, ty), context) in group.iter().zip(&types).zip(produced) {
-            if let (Some(context), Type::Fun(_, _, declared)) = (context, ty) {
-                self.check_effects(function, declared, &context);
-            }
-        }
+        let checked: Vec<(&Function, Row, Row)> = group
+            .iter()
+            .zip(&types)
+            .zip(produced)
+            .filter_map(|((function, ty), context)| match (context, ty) {
+                (Some(context), Type::Fun(_, _, declared)) => {
+                    Some((*function, declared.clone(), context))
+                }
+                _ => None,
+            })
+            .collect();
+        self.check_effects(&checked);
         self.rigid.clear();
         for (function, scope) in group.iter().zip(&scopes) {
             self.check_declared_generics(function, scope);
@@ -620,7 +633,7 @@ impl<'a> Checker<'a> {
         let ty = self.signature(function, &rigid, &effects, false);
         self.effect_scope = effects;
         if let (Some(context), Type::Fun(_, _, declared)) = (self.check_body(function, &ty), &ty) {
-            self.check_effects(function, declared, &context);
+            self.check_effects(&[(function, declared.clone(), context)]);
         }
         self.report_ambiguous(&function.name);
         self.rigid.clear();
@@ -633,6 +646,7 @@ impl<'a> Checker<'a> {
         let Type::Fun(params, result, row) = ty else {
             return None;
         };
+        let errors = self.error_count();
         let mut names = BTreeSet::new();
         for parameter in &function.parameters {
             if !names.insert(parameter.name.as_str()) {
@@ -675,6 +689,9 @@ impl<'a> Checker<'a> {
         self.return_type = None;
         let context = std::mem::replace(&mut self.context, Row::empty());
         self.settle_origins(&context);
+        if self.error_count() > errors {
+            self.body_errors.insert(function.name.clone());
+        }
         self.effect_scope.clear();
         self.domain = Domain::Inferred;
         Some(context)
@@ -859,27 +876,60 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// After a body: every concrete label it produced must fit its domain's ceiling (effect
-    /// variables are exempt; the caller is charged when it instantiates them). Then a
-    /// function whose effects are known is compared with its declaration.
-    fn check_effects(&mut self, function: &Function, declared: &Row, produced: &Row) {
-        if let Some(ceiling) = ceiling(&function.domain) {
-            let resolved = self.table.resolve_row(produced);
-            for label in &resolved.labels {
-                if !label.is_rigid() && !ceiling.contains(label) {
-                    self.ceiling_error(function, label);
+    /// After the bodies of a group (or of one annotated function), given each function with
+    /// its declared and produced rows: every concrete label a body produced must fit its
+    /// domain's ceiling (effect variables are exempt; the caller is charged when it
+    /// instantiates them). Then a function whose effects are known is compared with its
+    /// declaration.
+    fn check_effects(&mut self, checked: &[(&Function, Row, Row)]) {
+        let mut violations = Vec::new();
+        for (function, _, produced) in checked {
+            if let Some(ceiling) = ceiling(&function.domain) {
+                let resolved = self.table.resolve_row(produced);
+                for label in resolved.labels {
+                    if !label.is_rigid() && !ceiling.contains(&label) {
+                        violations.push((*function, label));
+                    }
                 }
             }
         }
-        if effects_known(function) {
-            self.check_declared_effects(function, declared, produced);
+        // Functions that perform the effect themselves are reported first, so a group member
+        // that only reaches it through them is recognized as a cascade whatever the order.
+        violations.sort_by_key(|(function, label)| {
+            !matches!(
+                self.effect_origins
+                    .get(&function.name)
+                    .and_then(|origins| origins.get(label)),
+                Some(Origin::Operation { .. })
+            )
+        });
+        for (function, label) in violations {
+            self.ceiling_error(function, &label);
+        }
+        for (function, declared, produced) in checked {
+            if effects_known(function) {
+                self.check_declared_effects(function, declared, produced);
+            }
         }
     }
 
-    /// E7401: `function` produced `label`, outside its domain's ceiling.
+    /// E7401: `function` produced `label`, outside its domain's ceiling. Not reported when the
+    /// path goes through a function that already got E7401 for the same label: the error is
+    /// reported once, where the effect is performed.
     fn ceiling_error(&mut self, function: &Function, label: &Label) {
         let what = domain_description(&function.domain);
         let steps = self.effect_trace(&function.name, label);
+        let cascade = steps.iter().any(|step| {
+            !step.operation
+                && self
+                    .ceiling_failures
+                    .contains(&(step.name.clone(), label.clone()))
+        });
+        self.ceiling_failures
+            .insert((function.name.clone(), label.clone()));
+        if cascade {
+            return;
+        }
         let mut path = vec![function.name.clone()];
         path.extend(steps.iter().map(Step::render));
         let hint = self.ceiling_hint(&function.domain, label, &steps);
@@ -1084,8 +1134,11 @@ impl<'a> Checker<'a> {
         }
         for label in declared.labels.difference(&produced.labels) {
             // Effect variables included implicitly (no `effects [...]` clause) are not a
-            // promise to perform them.
-            if label.is_rigid() && !function.effects_declared {
+            // promise to perform them. After an error in the body, what it performs is not
+            // reliable, so a missing effect is not reported on top of it.
+            if (label.is_rigid() && !function.effects_declared)
+                || self.body_errors.contains(&function.name)
+            {
                 continue;
             }
             self.diagnostics.push(
@@ -1182,6 +1235,13 @@ impl<'a> Checker<'a> {
 
     fn fresh(&mut self) -> Type {
         self.table.fresh(self.level)
+    }
+
+    fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|item| item.severity == Severity::Error)
+            .count()
     }
 
     fn record(&mut self, id: NodeId, ty: &Type, span: &Span) {
@@ -4026,6 +4086,43 @@ mod tests {
         assert_eq!(
             undeclared.message,
             "`f` performs `db.read`, but its effects declare only [server.call]."
+        );
+    }
+
+    #[test]
+    fn ceiling_errors_are_reported_once_where_the_effect_is_performed() {
+        let diagnostics = db_diagnostics(
+            "client fun ler(id: ClienteId) = db.clientes.require(id).nome\nclient fun tela(id: ClienteId) = ler(id)\npure fun p(id: ClienteId): String = ler(id)\n",
+        );
+        let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7401"], "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.starts_with("`ler`"),
+            "{diagnostics:?}"
+        );
+        let cycle = db_diagnostics(
+            "client fun b(n: Int, k: ClienteId): String = a(n, k)\nclient fun a(n: Int, k: ClienteId): String = if (n == 0) db.clientes.require(k).nome else b(n - 1, k)\n",
+        );
+        let codes: Vec<&str> = cycle.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7401"], "{cycle:?}");
+        assert!(cycle[0].message.starts_with("`a`"), "{cycle:?}");
+    }
+
+    #[test]
+    fn no_unused_effect_errors_after_an_error_in_the_body() {
+        assert_eq!(
+            db_errors("server fun f(id: ClienteId): Int effects [db.read] = \"x\"\n"),
+            vec!["E7101"]
+        );
+        assert_eq!(
+            db_errors(
+                "server fun f(id: ClienteId): Cliente effects [db.read] = db.clientes.delete(id)\n"
+            ),
+            vec!["E7004"]
+        );
+        assert_eq!(
+            db_errors("fun f(x: Int, g: () -> Int ! [e]) effects [e] = x + \"a\"\n"),
+            vec!["E7101"]
         );
     }
 }
