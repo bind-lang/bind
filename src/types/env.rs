@@ -86,6 +86,13 @@ impl Env {
                 ));
                 continue;
             }
+            if declaration.kind == TypeKind::Entity && !declaration.type_params.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    "E7004",
+                    "An `entity` cannot have type parameters; it maps to a concrete database table.",
+                    declaration.span.clone(),
+                ));
+            }
             let constructors: Vec<(String, Vec<Field>, Span)> = match declaration.kind {
                 TypeKind::Data | TypeKind::Entity => {
                     vec![(declaration.name.clone(), declaration.fields.clone(), declaration.span.clone())]
@@ -458,5 +465,7 @@ mod tests {
         assert_eq!(build("data class String(val x: Int)").1, vec!["E7110"]);
         assert_eq!(build("enum class A { X }\nenum class B { X }").1, vec!["E7110"]);
         assert_eq!(build("fun f() = 1\nfun f() = 2").1, vec!["E7110"]);
+        assert_eq!(build("entity C<T>(val id: UUID, val x: T)").1, vec!["E7004"]);
+        assert!(build("entity C(val id: UUID, val x: Int)").1.is_empty());
     }
 }
