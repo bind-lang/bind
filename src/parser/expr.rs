@@ -56,6 +56,13 @@ pub fn parse_type_text(text: &str, span: &Span) -> Result<TypeExpr, Diagnostic> 
     }
 }
 
+/// Deepest nesting of expressions, patterns and types the parser descends into, so that
+/// hostile input is reported instead of overflowing the stack (here or in later passes).
+const MAX_DEPTH: usize = 256;
+
+/// Most operators in the open operator chains, which later passes traverse recursively.
+const MAX_CHAIN: usize = 1000;
+
 enum Infix {
     Op(BinaryOp),
     Elvis,
@@ -73,6 +80,12 @@ pub(crate) struct ExprParser {
     next_id: NodeId,
     /// Depth of enclosing parentheses; newlines are insignificant when it is non-zero.
     nesting: usize,
+    /// Current recursion depth, bounded by `MAX_DEPTH`.
+    depth: usize,
+    /// Operators consumed by the `binary` loops still open, bounded by `MAX_CHAIN`.
+    chain: usize,
+    /// Set once a limit is reported; parsing then unwinds without further diagnostics.
+    limit_reported: bool,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -83,7 +96,16 @@ impl ExprParser {
             let span = tokens.last().map_or_else(|| fallback.clone(), |token| token.span.clone());
             tokens.push(Token { kind: TokenKind::Eof, text: String::new(), span });
         }
-        Self { tokens, index: 0, next_id: 0, nesting: 0, diagnostics: Vec::new() }
+        Self {
+            tokens,
+            index: 0,
+            next_id: 0,
+            nesting: 0,
+            depth: 0,
+            chain: 0,
+            limit_reported: false,
+            diagnostics: Vec::new(),
+        }
     }
 
     // ---- token helpers -------------------------------------------------------------
@@ -195,10 +217,33 @@ impl ExprParser {
         self.diagnostics.push(Diagnostic::error("E7001", message, span).with_hint(hint));
     }
 
+    /// Runs `parse` one nesting level deeper, or reports E7004 (once) beyond `MAX_DEPTH`.
+    fn nested<T>(&mut self, parse: impl FnOnce(&mut Self) -> Option<T>) -> Option<T> {
+        if self.limit_reported {
+            return None;
+        }
+        if self.depth >= MAX_DEPTH {
+            self.limit("Expression is nested too deeply (limit 256).");
+            return None;
+        }
+        self.depth += 1;
+        let result = parse(self);
+        self.depth -= 1;
+        result
+    }
+
+    fn limit(&mut self, message: &str) {
+        if !self.limit_reported {
+            self.limit_reported = true;
+            let span = self.peek().span.clone();
+            self.error("E7004", message, span);
+        }
+    }
+
     // ---- expressions ---------------------------------------------------------------
 
     fn expression(&mut self) -> Option<Expr> {
-        self.binary(1)
+        self.nested(|parser| parser.binary(1))
     }
 
     fn infix(&self) -> Option<(Infix, u8, usize)> {
@@ -237,6 +282,13 @@ impl ExprParser {
     }
 
     fn binary(&mut self, min: u8) -> Option<Expr> {
+        let open = self.chain;
+        let left = self.binary_chain(min);
+        self.chain = open;
+        left
+    }
+
+    fn binary_chain(&mut self, min: u8) -> Option<Expr> {
         let mut left = self.unary()?;
         while let Some((infix, precedence, width)) = self.infix() {
             if precedence < min {
@@ -246,6 +298,11 @@ impl ExprParser {
             if !self.same_line() && !crosses_lines {
                 break;
             }
+            if self.chain >= MAX_CHAIN {
+                self.limit("Operator chain is too long (limit 1000).");
+                return None;
+            }
+            self.chain += 1;
             for _ in 0..width {
                 self.advance();
             }
@@ -269,7 +326,7 @@ impl ExprParser {
             return self.postfix();
         };
         let span = self.advance().span;
-        let operand = self.unary()?;
+        let operand = self.nested(Self::unary)?;
         Some(self.node(ExprKind::Unary { op, operand: Box::new(operand) }, span))
     }
 
@@ -681,6 +738,10 @@ impl ExprParser {
     }
 
     fn pattern(&mut self) -> Option<Pattern> {
+        self.nested(Self::pattern_inner)
+    }
+
+    fn pattern_inner(&mut self) -> Option<Pattern> {
         if self.is("-") && self.peek_at(1).kind == TokenKind::Number {
             self.advance();
             let number = self.advance();
@@ -750,6 +811,10 @@ impl ExprParser {
     // ---- types ---------------------------------------------------------------------
 
     pub(crate) fn type_expr(&mut self) -> Option<TypeExpr> {
+        self.nested(Self::type_expr_inner)
+    }
+
+    fn type_expr_inner(&mut self) -> Option<TypeExpr> {
         let span = self.peek().span.clone();
         let mut ty = if self.is("(") {
             self.advance();
@@ -980,6 +1045,45 @@ mod tests {
             block("return db.customers.insert {\n    name = name\n    email = email\n}"),
             "{ (return db.customers.insert { name = name; email = email }) }"
         );
+    }
+
+    fn chain(terms: usize) -> String {
+        vec!["1"; terms].join(" + ")
+    }
+
+    fn nested(depth: usize) -> String {
+        format!("{}1{}", "(".repeat(depth), ")".repeat(depth))
+    }
+
+    /// Deep inputs run on the stack the `bind` binary gives the compiler (see `main.rs`).
+    #[test]
+    fn deep_nesting_is_reported_without_overflowing() {
+        crate::with_compiler_stack(deep_nesting_cases);
+    }
+
+    fn deep_nesting_cases() {
+        assert_eq!(codes(&nested(300)), vec!["E7004"]);
+        assert_eq!(codes(&nested(2_000)), vec!["E7004"]);
+        assert_eq!(codes(&format!("{}x", "- ".repeat(2_000))), vec!["E7004"]);
+        let whens = format!("{}x{}", "when (x) { _ -> ".repeat(300), " }".repeat(300));
+        assert_eq!(codes(&whens), vec!["E7004"]);
+        let patterns = format!("when (x) {{ {}y{} -> 1 }}", "C(".repeat(300), ")".repeat(300));
+        assert_eq!(codes(&patterns), vec!["E7004"]);
+        assert!(parse_type_text(&format!("{}Int{}", "List<".repeat(300), ">".repeat(300)), &Span::default()).is_err());
+        assert!(codes(&nested(200)).is_empty());
+    }
+
+    #[test]
+    fn long_operator_chains_are_reported_without_overflowing() {
+        crate::with_compiler_stack(long_chain_cases);
+    }
+
+    fn long_chain_cases() {
+        assert_eq!(codes(&chain(1_500)), vec!["E7004"]);
+        assert_eq!(codes(&chain(20_000)), vec!["E7004"]);
+        assert_eq!(codes(&vec!["a"; 20_000].join(" ?: ")), vec!["E7004"]);
+        assert!(codes(&chain(500)).is_empty());
+        assert!(codes(&chain(1_001)).is_empty());
     }
 
     #[test]

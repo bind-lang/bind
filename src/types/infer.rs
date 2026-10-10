@@ -1311,7 +1311,7 @@ fn collect_expr(expr: &Expr, names: &mut BTreeSet<String>) {
 
 #[cfg(test)]
 mod tests {
-    use crate::types::testing::{errors, scheme};
+    use crate::types::testing::{errors, infer, scheme};
 
     const PEDIDO: &str = "sealed class Pedido {\n    data class Pendente(val itens: Int)\n    data class Pago(val valor: Money)\n    data object Cancelado\n}\n";
 
@@ -1370,6 +1370,30 @@ mod tests {
         assert_eq!(errors(&functions), vec!["E7301"]);
         let local = format!("{holder}fun f(x: H): Boolean {{\n    val y = x\n    y == x\n}}");
         assert_eq!(errors(&local), vec!["E7301"]);
+    }
+
+    /// The largest inputs the parser accepts type-check without exhausting the stack the
+    /// `bind` binary gives the compiler; inputs past the limits stop at the parser.
+    #[test]
+    fn inputs_at_the_parser_limits_type_check() {
+        crate::with_compiler_stack(|| {
+            let chain = vec!["x"; 1_001].join(" + ");
+            assert_eq!(scheme(&format!("fun f(x: Int): Int = {chain}"), "f"), "(Int) -> Int");
+            let nested = format!("{}x{}", "(x + ".repeat(255), ")".repeat(255));
+            assert_eq!(scheme(&format!("fun f(x: Int): Int = {nested}"), "f"), "(Int) -> Int");
+            let mixed = format!("{}{}{}", "-(".repeat(127), vec!["x"; 744].join(" - "), ")".repeat(127));
+            assert_eq!(scheme(&format!("fun f(x: Int): Int = {mixed}"), "f"), "(Int) -> Int");
+            let calls = format!("{}x{}", "g(".repeat(254), ")".repeat(254));
+            assert_eq!(scheme(&format!("fun g(x: Int): Int = x\nfun f(x: Int): Int = {calls}"), "f"), "(Int) -> Int");
+            let ifs = format!("{}x{}", "if (true) { ".repeat(126), " } else { x }".repeat(126));
+            assert_eq!(scheme(&format!("fun f(x: Int): Int = {ifs}"), "f"), "(Int) -> Int");
+            let whens = format!("{}x{}", "when (x) { _ -> ".repeat(255), " }".repeat(255));
+            assert_eq!(scheme(&format!("fun f(x: Int): Int = {whens}"), "f"), "(Int) -> Int");
+            let lambdas = format!("{}x{}", "{ y -> ".repeat(250), " }".repeat(250));
+            assert!(infer(&format!("fun f(x: Int) = {lambdas}")).is_ok());
+            assert_eq!(errors(&format!("fun f(x: Int): Int = {}", vec!["x"; 1_500].join(" + "))), vec!["E7004"]);
+            assert_eq!(errors(&format!("fun f(x: Int): Int = {}x{}", "(".repeat(300), ")".repeat(300))), vec!["E7004"]);
+        });
     }
 
     #[test]
