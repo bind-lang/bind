@@ -1029,7 +1029,12 @@ impl<'a> Checker<'a> {
 
     fn infer_when(&mut self, id: NodeId, scrutinee: &Expr, arms: &[Arm], span: &Span) -> Type {
         let subject = self.infer(scrutinee);
-        if arms.iter().any(|arm| matches!(arm.pattern, Pattern::Null(_))) {
+        // A scrutinee of still unknown type matched against `null` is optional, which the arms
+        // before the `null` arm must already see. A known type is left to the `null` pattern,
+        // which reports a mismatch once, at the pattern.
+        if arms.iter().any(|arm| matches!(arm.pattern, Pattern::Null(_)))
+            && matches!(self.table.shallow(&subject), Type::Var(_))
+        {
             let inner = self.fresh();
             self.unify_at(&Type::option(inner), &subject, &scrutinee.span, Some("a `null` pattern".into()));
         }
@@ -1515,6 +1520,21 @@ mod tests {
         // the variable takes `Int?` and already covers `null`.
         assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n; null -> 0 }"), vec!["E7101", "E7202"]);
         assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n ?: 0; null -> 0 }"), vec!["E7202"]);
+    }
+
+    fn diagnostic_codes(source: &str) -> Vec<&'static str> {
+        let (tokens, _) = crate::lexer::lex("t.bd", source);
+        let (program, parse_diagnostics) = crate::parser::parse(tokens);
+        assert!(parse_diagnostics.is_empty(), "{parse_diagnostics:?}");
+        let (_, diagnostics) = crate::types::check(&program, &crate::schema::DatabaseSchema::default());
+        diagnostics.iter().map(|item| item.code).collect()
+    }
+
+    #[test]
+    fn null_pattern_on_a_non_optional_scrutinee_is_reported_once() {
+        assert_eq!(diagnostic_codes("fun f(x: Int): Int = when (x) { null -> 0; _ -> 1 }"), vec!["E7101"]);
+        assert_eq!(diagnostic_codes("fun f(x: String): Int = when (x) { \"a\" -> 1; null -> 0; _ -> 1 }"), vec!["E7101"]);
+        assert_eq!(scheme("fun f(x) = when (x) { 1 -> 1; null -> 0; _ -> 2 }", "f"), "(Int?) -> Int");
     }
 
     #[test]
