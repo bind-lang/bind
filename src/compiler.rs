@@ -8,8 +8,10 @@ use crate::config::ProjectConfig;
 use crate::core::ir::CoreProgram;
 use crate::diagnostic::{Diagnostic, Severity, Span, has_errors};
 use crate::lexer::{Token, TokenKind, lex};
+use crate::parser::expr::parse_type_text;
 use crate::parser::parse;
 use crate::schema::{DatabaseSchema, closest, stable_hash};
+use crate::syntax::expr::TypeExpr;
 
 #[derive(Clone, Debug)]
 pub struct EnvironmentStatus {
@@ -36,8 +38,6 @@ pub struct DatabaseOperation {
     pub table: String,
     pub method: String,
     pub effect: String,
-    pub arguments: Vec<String>,
-    pub assignments: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -227,7 +227,6 @@ pub struct VerifiedApplication {
     pub required_capabilities: BTreeSet<String>,
     pub unsafe_operations: Vec<String>,
     /// The validated typed core IR: the input of the typed code generators.
-    #[allow(dead_code)] // Read by the typed Rust server backend (later tasks of subproject 3).
     pub core: CoreProgram,
 }
 
@@ -444,7 +443,13 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
     if target_config.certified {
-        validate_certified_surface(&program, &database_operations, config, &mut diagnostics);
+        validate_certified_surface(
+            &program,
+            &database,
+            &database_operations,
+            config,
+            &mut diagnostics,
+        );
     }
 
     if config.warnings_as_errors {
@@ -619,6 +624,7 @@ fn validate_type(
 
 fn validate_certified_surface(
     program: &Program,
+    database: &DatabaseSchema,
     operations: &[DatabaseOperation],
     config: &ProjectConfig,
     diagnostics: &mut Vec<Diagnostic>,
@@ -669,67 +675,96 @@ fn validate_certified_surface(
     }
 
     for function in &program.functions {
-        for type_ref in function
-            .parameters
-            .iter()
-            .map(Parameter::declared_type)
-            .chain(std::iter::once(function.declared_return()))
-        {
-            if !certified_wire_type(&type_ref.name, program) {
+        // Client functions are compiled by the token-based Elm generator, whose wire format
+        // is the original one. Endpoints are checked against the v2 wire types (E8309); other
+        // server code may use the whole language.
+        if function.domain == Domain::Client {
+            for type_ref in function
+                .parameters
+                .iter()
+                .map(Parameter::declared_type)
+                .chain(std::iter::once(function.declared_return()))
+            {
+                if !certified_wire_type(&type_ref.name, program) {
+                    diagnostics.push(Diagnostic::error(
+                        "E8303",
+                        format!(
+                            "Function `{}` exposes unsupported certified wire type `{}`.",
+                            function.name,
+                            type_ref.display()
+                        ),
+                        function.span.clone(),
+                    ));
+                }
+            }
+        }
+        if function.domain == Domain::Server && !function.component {
+            for type_ref in function
+                .parameters
+                .iter()
+                .map(Parameter::declared_type)
+                .chain(std::iter::once(function.declared_return()))
+            {
+                let Ok(parsed) = parse_type_text(&type_ref.display(), &function.span) else {
+                    continue;
+                };
+                if !v2_wire_type(&parsed, program, &mut BTreeSet::new()) {
+                    diagnostics.push(Diagnostic::error(
+                        "E8309",
+                        format!(
+                            "Endpoint `{}` uses `{}`, which cannot cross the wire in profile {}.",
+                            function.name,
+                            render_type_expr(&parsed),
+                            crate::certified::profile_version()
+                        ),
+                        function.span.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // `Duration` has no database mapping: neither entity fields nor schema columns may use it.
+    for declaration in &program.types {
+        if declaration.kind != TypeKind::Entity {
+            continue;
+        }
+        for field in &declaration.fields {
+            let Ok(parsed) = parse_type_text(&field.type_ref.display(), &field.span) else {
+                continue;
+            };
+            if mentions_duration(&parsed, program, 0) {
                 diagnostics.push(Diagnostic::error(
-                    "E8303",
+                    "E8309",
                     format!(
-                        "Function `{}` exposes unsupported certified wire type `{}`.",
-                        function.name,
-                        type_ref.display()
+                        "Entity field `{}.{}` uses `{}`, which has no database mapping in profile {}.",
+                        declaration.name,
+                        field.name,
+                        render_type_expr(&parsed),
+                        crate::certified::profile_version()
                     ),
-                    function.span.clone(),
+                    field.span.clone(),
                 ));
             }
         }
-
-        if function.domain == Domain::Server {
-            let function_operations: Vec<_> = operations
-                .iter()
-                .filter(|operation| operation.function == function.name)
-                .collect();
-            if function_operations.len() != 1 {
+    }
+    for table in database.tables.values() {
+        for column in table.columns.values() {
+            let Ok(parsed) = parse_type_text(&column.type_name, &Span::default()) else {
+                continue;
+            };
+            if mentions_duration(&parsed, program, 0) {
                 diagnostics.push(Diagnostic::error(
-                    "E8304",
+                    "E8309",
                     format!(
-                        "Certified server function `{}` must lower to exactly one structural database operation; found {}.",
-                        function.name,
-                        function_operations.len()
+                        "Column `{}.{}` uses `{}`, which has no database mapping in profile {}.",
+                        table.name,
+                        column.name,
+                        column.type_name,
+                        crate::certified::profile_version()
                     ),
-                    function.span.clone(),
+                    Span::default(),
                 ));
-            } else {
-                let operation = function_operations[0];
-                match operation.method.as_str() {
-                    "require" | "find" if operation.arguments.len() != 1 => {
-                        diagnostics.push(Diagnostic::error(
-                            "E8305",
-                            format!(
-                                "Database method `{}` requires exactly one primary-key argument.",
-                                operation.method
-                            ),
-                            function.span.clone(),
-                        ));
-                    }
-                    "insert" if operation.assignments.is_empty() => {
-                        diagnostics.push(Diagnostic::error(
-                            "E8305",
-                            "A certified INSERT must declare its assignments structurally.",
-                            function.span.clone(),
-                        ));
-                    }
-                    "require" | "find" | "insert" => {}
-                    method => diagnostics.push(Diagnostic::error(
-                        "E8305",
-                        format!("Database method `{method}` is not implemented by the certified Rust generator."),
-                        function.span.clone(),
-                    )),
-                }
             }
         }
     }
@@ -816,6 +851,116 @@ fn certified_wire_type(name: &str, program: &Program) -> bool {
         .any(|declaration| declaration.name == base)
 }
 
+/// Wire types of profile rust-elm-web-v2: the scalars of the certified wire format except
+/// `Duration`; `data class`/`entity` (and `distinct type`) whose fields are wire types;
+/// `enum class`/`sealed class` whose variants have no fields; `List<T>` and `T?` of wire
+/// types. Generic user types, functions, `Result`, `Set` and `Map` are not wire types.
+fn v2_wire_type(ty: &TypeExpr, program: &Program, visiting: &mut BTreeSet<String>) -> bool {
+    const SCALARS: &[&str] = &[
+        "Unit", "String", "Int", "Float", "Double", "Decimal", "Boolean", "UUID", "Date",
+        "DateTime", "Instant", "Money", "Email", "Url",
+    ];
+    match ty {
+        TypeExpr::Function { .. } => false,
+        TypeExpr::Nullable(inner) => v2_wire_type(inner, program, visiting),
+        TypeExpr::Named { name, args, .. } => {
+            if args.is_empty() && SCALARS.contains(&name.as_str()) {
+                return true;
+            }
+            if name == "List" {
+                return matches!(args.as_slice(), [inner] if v2_wire_type(inner, program, visiting));
+            }
+            let Some(declaration) = program.types.iter().find(|item| item.name == *name) else {
+                return false;
+            };
+            if !args.is_empty() || !declaration.type_params.is_empty() {
+                return false;
+            }
+            if !visiting.insert(name.clone()) {
+                // A recursive occurrence: decided by the enclosing check.
+                return true;
+            }
+            let field_is_wire =
+                |type_ref: &TypeRef, span: &Span, visiting: &mut BTreeSet<String>| {
+                    parse_type_text(&type_ref.display(), span)
+                        .is_ok_and(|parsed| v2_wire_type(&parsed, program, visiting))
+                };
+            let wire = match declaration.kind {
+                TypeKind::Data | TypeKind::Entity => declaration
+                    .fields
+                    .iter()
+                    .all(|field| field_is_wire(&field.type_ref, &field.span, visiting)),
+                TypeKind::Distinct => declaration.underlying.as_ref().is_some_and(|underlying| {
+                    field_is_wire(underlying, &declaration.span, visiting)
+                }),
+                TypeKind::Enum | TypeKind::Sealed => {
+                    declaration.cases.iter().all(|case| case.fields.is_empty())
+                }
+            };
+            visiting.remove(name);
+            wire
+        }
+    }
+}
+
+/// Whether `ty` mentions `Duration`, directly or through a `distinct type`.
+fn mentions_duration(ty: &TypeExpr, program: &Program, depth: usize) -> bool {
+    if depth > program.types.len() {
+        return false;
+    }
+    match ty {
+        TypeExpr::Nullable(inner) => mentions_duration(inner, program, depth),
+        TypeExpr::Function { params, result, .. } => {
+            params
+                .iter()
+                .any(|param| mentions_duration(param, program, depth))
+                || mentions_duration(result, program, depth)
+        }
+        TypeExpr::Named { name, args, .. } => {
+            name == "Duration"
+                || args
+                    .iter()
+                    .any(|arg| mentions_duration(arg, program, depth))
+                || program
+                    .types
+                    .iter()
+                    .find(|item| item.name == *name && item.kind == TypeKind::Distinct)
+                    .and_then(|item| item.underlying.as_ref())
+                    .and_then(|underlying| {
+                        parse_type_text(&underlying.display(), &Span::default()).ok()
+                    })
+                    .is_some_and(|parsed| mentions_duration(&parsed, program, depth + 1))
+        }
+    }
+}
+
+/// A type as written in Bind source (`List<Int>?`, `(Int) -> Int`).
+fn render_type_expr(ty: &TypeExpr) -> String {
+    match ty {
+        TypeExpr::Named { name, args, .. } if args.is_empty() => name.clone(),
+        TypeExpr::Named { name, args, .. } => format!(
+            "{name}<{}>",
+            args.iter()
+                .map(render_type_expr)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        TypeExpr::Nullable(inner) => match **inner {
+            TypeExpr::Function { .. } => format!("({})?", render_type_expr(inner)),
+            _ => format!("{}?", render_type_expr(inner)),
+        },
+        TypeExpr::Function { params, result, .. } => format!(
+            "({}) -> {}",
+            params
+                .iter()
+                .map(render_type_expr)
+                .collect::<Vec<_>>()
+                .join(", "),
+            render_type_expr(result)
+        ),
+    }
+}
+
 fn generic_arguments(name: &str) -> Option<Vec<String>> {
     let start = name.find('<')?;
     let end = name.rfind('>')?;
@@ -857,61 +1002,26 @@ fn analyze_function(
     diagnostics: &mut Vec<Diagnostic>,
     pending_database_errors: &mut Vec<(String, String, Diagnostic)>,
 ) {
-    let mut locals: BTreeMap<String, TypeRef> = function
-        .parameters
-        .iter()
-        .filter_map(|item| {
-            item.type_ref
-                .clone()
-                .map(|type_ref| (item.name.clone(), type_ref))
-        })
-        .collect();
     let body = &function.body;
     let mut index = 0;
     while index < body.len() {
-        if (body[index].text == "val" || body[index].text == "var")
-            && let Some(name) = body
-                .get(index + 1)
-                .filter(|token| token.kind == TokenKind::Identifier)
-                .map(|token| token.text.clone())
-        {
-            let equals = (index + 2..body.len().min(index + 10))
-                .find(|position| body[*position].text == "=");
-            if let Some(equals) = equals
-                && let Some(value_type) =
-                    infer_expression(body, equals + 1, &locals, functions, database)
-            {
-                locals.insert(name, value_type);
-            }
-        }
-        let (call_name, call_start) = if body.get(index).is_some_and(|token| token.text == "server")
+        // Calls only feed the application graph: the type checker verifies them.
+        let call_name = if body.get(index).is_some_and(|token| token.text == "server")
             && body.get(index + 1).is_some_and(|token| token.text == ".")
         {
-            (
-                body.get(index + 2).map(|token| token.text.clone()),
-                index + 2,
-            )
+            body.get(index + 2).map(|token| token.text.clone())
         } else if body.get(index + 1).is_some_and(|token| token.text == "(")
             && functions.contains_key(&body[index].text)
             && !(index >= 2 && body[index - 2].text == "server" && body[index - 1].text == ".")
         {
-            (Some(body[index].text.clone()), index)
+            Some(body[index].text.clone())
         } else {
-            (None, index)
+            None
         };
         if let Some(call_name) = call_name
-            && let Some(callee) = functions.get(&call_name)
+            && functions.contains_key(&call_name)
         {
-            graph.add_edge(function.name.clone(), call_name.clone());
-            validate_call_arguments(
-                body,
-                call_start + 1,
-                callee,
-                &locals,
-                functions,
-                database,
-                diagnostics,
-            );
+            graph.add_edge(function.name.clone(), call_name);
         }
         if body.get(index).is_some_and(|token| token.text == "db")
             && body.get(index + 1).is_some_and(|token| token.text == ".")
@@ -931,14 +1041,11 @@ fn analyze_function(
             } else {
                 Vec::new()
             };
-            let arguments = call_arguments_as_source(body, index + 5);
             operations.push(DatabaseOperation {
                 function: function.name.clone(),
                 table: table_name.clone(),
                 method: method.clone(),
                 effect: effect.clone(),
-                arguments,
-                assignments: assignments.clone(),
             });
             graph.add_edge(function.name.clone(), format!("database.main.{table_name}"));
             match database.tables.get(&table_name) {
@@ -960,13 +1067,6 @@ fn analyze_function(
                     ));
                 }
                 Some(table) => {
-                    if known_return(function).is_some_and(|declared| declared.name != table.model) {
-                        diagnostics.push(Diagnostic::error(
-                            "E5205",
-                            format!("Database operation on `{}` produces `{}`, but function `{}` declares `{}`.", table.name, table.model, function.name, function.declared_return().display()),
-                            function.span.clone(),
-                        ));
-                    }
                     if !write && !["require", "find"].contains(&method.as_str()) {
                         diagnostics.push(Diagnostic::error(
                             "E8204",
@@ -1016,16 +1116,6 @@ fn analyze_function(
                                 ),
                                 body[index].span.clone(),
                             ));
-                        }
-                        if assignments
-                            .iter()
-                            .any(|(_, value)| !safe_generated_expression(value))
-                        {
-                            diagnostics.push(Diagnostic::error(
-                                "E8204",
-                                "The certified Rust target cannot safely lower one or more INSERT value expressions.",
-                                body[index].span.clone(),
-                            ).with_hint("Use parameters or parameter fields as INSERT values in the v0.1 target."));
                         }
                     } else if write {
                         diagnostics.push(Diagnostic::error(
@@ -1109,7 +1199,7 @@ fn analyze_function(
         }
         index += 1;
     }
-    validate_return_contract(function, &locals, functions, database, diagnostics);
+    validate_return_contract(function, diagnostics);
     let _ = program;
 }
 
@@ -1121,31 +1211,16 @@ fn known_return(function: &Function) -> Option<TypeRef> {
     (!mentions_type_param(declared, &function.type_params)).then(|| declared.clone())
 }
 
-fn validate_return_contract(
-    function: &Function,
-    locals: &BTreeMap<String, TypeRef>,
-    functions: &BTreeMap<String, &Function>,
-    database: &DatabaseSchema,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+/// A declared non-`Unit` return needs a return expression. Whether the returned value has
+/// the declared type is the type checker's job.
+fn validate_return_contract(function: &Function, diagnostics: &mut Vec<Diagnostic>) {
     let Some(declared_return) = known_return(function) else {
         return;
     };
     if declared_return.name == "Unit" {
         return;
     }
-    let return_positions: Vec<_> = function
-        .body
-        .iter()
-        .enumerate()
-        .filter_map(|(index, token)| (token.text == "return").then_some(index + 1))
-        .collect();
-    let expression_positions = if return_positions.is_empty() && !function.body.is_empty() {
-        vec![0]
-    } else {
-        return_positions
-    };
-    if expression_positions.is_empty() {
+    if function.body.is_empty() {
         diagnostics.push(Diagnostic::error(
             "E2301",
             format!(
@@ -1155,24 +1230,6 @@ fn validate_return_contract(
             ),
             function.span.clone(),
         ));
-        return;
-    }
-    for position in expression_positions {
-        if let Some(actual) =
-            infer_expression(&function.body, position, locals, functions, database)
-            && !compatible(&declared_return, &actual)
-        {
-            diagnostics.push(Diagnostic::error(
-                "E2302",
-                format!(
-                    "Function `{}` declares `{}` but returns `{}`.",
-                    function.name,
-                    declared_return.display(),
-                    actual.display()
-                ),
-                function.body[position].span.clone(),
-            ));
-        }
     }
 }
 
@@ -1213,169 +1270,6 @@ fn insert_assignments(body: &[Token], brace_index: usize) -> Vec<(String, String
         }
     }
     result
-}
-
-fn safe_generated_expression(value: &str) -> bool {
-    let parts: Vec<_> = value.split('.').collect();
-    !parts.is_empty()
-        && parts.len() <= 2
-        && parts.iter().all(|part| {
-            !part.is_empty() && part.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
-        })
-}
-
-fn call_arguments_as_source(body: &[Token], open_index: usize) -> Vec<String> {
-    if body.get(open_index).is_none_or(|token| token.text != "(") {
-        return Vec::new();
-    }
-    let mut result = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0usize;
-    for token in body.iter().skip(open_index + 1) {
-        match token.text.as_str() {
-            "(" | "[" | "{" => {
-                depth += 1;
-                current.push_str(&token.text);
-            }
-            ")" if depth == 0 => {
-                if !current.is_empty() {
-                    result.push(current);
-                }
-                break;
-            }
-            ")" | "]" | "}" => {
-                depth = depth.saturating_sub(1);
-                current.push_str(&token.text);
-            }
-            "," if depth == 0 => {
-                result.push(current);
-                current = String::new();
-            }
-            _ => current.push_str(&token.text),
-        }
-    }
-    result
-}
-
-fn validate_call_arguments(
-    body: &[Token],
-    open_index: usize,
-    callee: &Function,
-    locals: &BTreeMap<String, TypeRef>,
-    functions: &BTreeMap<String, &Function>,
-    database: &DatabaseSchema,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    if body.get(open_index).is_none_or(|token| token.text != "(") {
-        return;
-    }
-    let mut arguments = Vec::new();
-    let mut start = open_index + 1;
-    let mut depth = 0;
-    let mut index = start;
-    while index < body.len() {
-        match body[index].text.as_str() {
-            "(" => depth += 1,
-            ")" if depth == 0 => {
-                if index > start {
-                    arguments.push((start, index));
-                }
-                break;
-            }
-            ")" => depth -= 1,
-            "," if depth == 0 => {
-                arguments.push((start, index));
-                start = index + 1;
-            }
-            _ => {}
-        }
-        index += 1;
-    }
-    if arguments.len() != callee.parameters.len() {
-        diagnostics.push(Diagnostic::error(
-            "E2201",
-            format!(
-                "Function `{}` expects {} argument(s), received {}.",
-                callee.name,
-                callee.parameters.len(),
-                arguments.len()
-            ),
-            body[open_index].span.clone(),
-        ));
-        return;
-    }
-    for ((start, _), parameter) in arguments.into_iter().zip(&callee.parameters) {
-        let Some(declared) = &parameter.type_ref else {
-            continue;
-        };
-        if mentions_type_param(declared, &callee.type_params) {
-            continue;
-        }
-        if let Some(actual) = infer_expression(body, start, locals, functions, database)
-            && !compatible(declared, &actual)
-        {
-            diagnostics.push(Diagnostic::error(
-                "E2202",
-                format!(
-                    "Argument `{}` of `{}` expects `{}`, received `{}`.",
-                    parameter.name,
-                    callee.name,
-                    declared.display(),
-                    actual.display()
-                ),
-                body[start].span.clone(),
-            ));
-        }
-    }
-}
-
-fn infer_expression(
-    body: &[Token],
-    index: usize,
-    locals: &BTreeMap<String, TypeRef>,
-    functions: &BTreeMap<String, &Function>,
-    database: &DatabaseSchema,
-) -> Option<TypeRef> {
-    let token = body.get(index)?;
-    if token.kind == TokenKind::String {
-        return Some(TypeRef::new("String"));
-    }
-    if token.kind == TokenKind::Number {
-        return Some(TypeRef::new(if token.text.contains('.') {
-            "Double"
-        } else {
-            "Int"
-        }));
-    }
-    if token.text == "true" || token.text == "false" {
-        return Some(TypeRef::new("Boolean"));
-    }
-    if token.text == "null" {
-        return Some(TypeRef {
-            name: "Nothing".into(),
-            nullable: true,
-        });
-    }
-    if let Some(local) = locals.get(&token.text) {
-        return Some(local.clone());
-    }
-    let function_name = if token.text == "server" && body.get(index + 1)?.text == "." {
-        &body.get(index + 2)?.text
-    } else {
-        &token.text
-    };
-    if let Some(function) = functions.get(function_name) {
-        return known_return(function);
-    }
-    if token.text == "db" && body.get(index + 1)?.text == "." {
-        let table = database.tables.get(&body.get(index + 2)?.text)?;
-        let method = body.get(index + 4)?.text.as_str();
-        return Some(TypeRef {
-            name: table.model.clone(),
-            nullable: ["find", "firstOrNull"].contains(&method),
-        });
-    }
-    None
 }
 
 fn compatible(expected: &TypeRef, actual: &TypeRef) -> bool {
@@ -1942,6 +1836,144 @@ server fun createCustomer(name: String): Customer effects [db.write] {
         let (root, config) = fixture(source, schema);
         let result = verify(&config, "aws-lambda");
         assert!(result.diagnostics.iter().any(|item| item.code == "E5303"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A certified aws-lambda fixture whose database URL comes from
+    /// `BIND_TEST_CERTIFIED_DATABASE_URL` (set here: `verify` requires it to be defined).
+    fn certified_fixture(source: &str, schema: &str) -> (PathBuf, ProjectConfig) {
+        static SET: std::sync::Once = std::sync::Once::new();
+        // SAFETY: the variable is only read through `std::env`, whose accesses are serialized
+        // with this write by the standard library's environment lock.
+        SET.call_once(|| unsafe {
+            env::set_var(
+                "BIND_TEST_CERTIFIED_DATABASE_URL",
+                "postgresql://bind@localhost/bind",
+            )
+        });
+        let (root, _) = fixture(source, schema);
+        fs::write(
+            root.join("bind.toml"),
+            r#"[project]
+name = "test"
+source = "app"
+[database.main]
+schema = "schema.csv"
+env = "BIND_TEST_CERTIFIED_DATABASE_URL"
+verification = "static"
+[target.aws-lambda]
+client = "elm"
+server = "rust"
+deployment = "aws-lambda"
+certified = true
+capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
+"#,
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        (root, config)
+    }
+
+    /// Declares the runtime database URL, read from `BIND_TEST_CERTIFIED_DATABASE_URL`.
+    const DATABASE_ENVIRONMENT: &str = "environment development {\n    runtime secret val databaseUrl: DatabaseUrl = env(\"BIND_TEST_CERTIFIED_DATABASE_URL\")\n}\n";
+
+    #[test]
+    fn certified_endpoints_reject_types_that_cannot_cross_the_wire() {
+        let cases = [
+            (
+                "server fun f(x: Int): (Int) -> Int effects [] = { y -> y }\n",
+                "Endpoint `f` uses `(Int) -> Int`, which cannot cross the wire in profile rust-elm-web-v2.",
+            ),
+            (
+                "server fun g(d: Duration): Int = 1\n",
+                "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-elm-web-v2.",
+            ),
+            (
+                "sealed class S { data class A(val n: Int) }\nserver fun h(): S = A(1)\n",
+                "Endpoint `h` uses `S`, which cannot cross the wire in profile rust-elm-web-v2.",
+            ),
+            (
+                "server fun r(): Result<Int, String> = Ok(1)\n",
+                "Endpoint `r` uses `Result<Int, String>`, which cannot cross the wire in profile rust-elm-web-v2.",
+            ),
+            (
+                "server fun s(xs: List<Duration>?): Int = 1\n",
+                "Endpoint `s` uses `List<Duration>?`, which cannot cross the wire in profile rust-elm-web-v2.",
+            ),
+        ];
+        for (source, message) in cases {
+            let (root, config) = certified_fixture(source, EMPTY_SCHEMA);
+            let result = verify(&config, "aws-lambda");
+            let found: Vec<_> = result
+                .diagnostics
+                .iter()
+                .filter(|item| item.code == "E8309")
+                .map(|item| item.message.as_str())
+                .collect();
+            assert_eq!(found, vec![message], "{source}: {:?}", result.diagnostics);
+            assert!(result.application.is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn certified_wire_types_and_helpers_with_functions_are_accepted() {
+        let source = "enum class Cor { Azul, Verde }\nsealed class Forma { data object Ponto }\ndata class Par(val a: Int, val cores: List<Cor>, val nota: String?)\nfun aplica(f: (Int) -> Int, x: Int): Int = f(x)\nfun espera(d: Duration): Duration = d\nserver fun usa(p: Par, xs: List<Int?>, f: Forma): Par effects [] {\n    val n = aplica({ y -> y + 1 }, p.a)\n    return Par(n, p.cores, p.nota)\n}\n";
+        let (root, config) = certified_fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn duration_columns_are_rejected_in_the_certified_profile() {
+        let source = format!(
+            "{DATABASE_ENVIRONMENT}distinct type TarefaId = UUID\nentity Tarefa(val id: TarefaId, val prazo: Duration)\nfun ler(id: TarefaId): Tarefa effects [db.read] = db.tarefas.require(id)\n"
+        );
+        let schema = format!(
+            "{EMPTY_SCHEMA}tarefas,Tarefa,id,id,TarefaId,false,true,true,postgresql\ntarefas,Tarefa,id,prazo,Duration,false,true,false,postgresql\n"
+        );
+        let (root, config) = certified_fixture(&source, &schema);
+        let result = verify(&config, "aws-lambda");
+        let found: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == "E8309")
+            .map(|item| item.message.as_str())
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                "Entity field `Tarefa.prazo` uses `Duration`, which has no database mapping in profile rust-elm-web-v2.",
+                "Column `tarefas.prazo` uses `Duration`, which has no database mapping in profile rust-elm-web-v2.",
+            ],
+            "{:?}",
+            result.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The endpoint of `tests/codegen/endpoint.bd`: a helper, a `when` and two database
+    /// operations in one endpoint.
+    pub(crate) const ENDPOINT_SOURCE: &str = include_str!("../tests/codegen/endpoint.bd");
+    pub(crate) const ENDPOINT_SCHEMA: &str = include_str!("../tests/codegen/endpoint.csv");
+
+    #[test]
+    fn certified_endpoint_with_helper_when_and_two_database_operations() {
+        let source = format!("{DATABASE_ENVIRONMENT}{ENDPOINT_SOURCE}");
+        let (root, config) = certified_fixture(&source, ENDPOINT_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(!has_errors(&result.diagnostics), "{:?}", result.diagnostics);
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        let endpoint = app
+            .core
+            .functions
+            .iter()
+            .find(|function| function.name == "cadastrar")
+            .unwrap();
+        assert!(endpoint.endpoint);
         fs::remove_dir_all(root).unwrap();
     }
 

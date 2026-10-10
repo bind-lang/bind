@@ -221,7 +221,7 @@ pub fn build(
     fs::write(
         &manifest,
         format!(
-            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n  \"npmLockSha256\": {},\n  \"elmJsonSha256\": {},\n  \"wireVersion\": \"bind-json-v1\",\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
+            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n  \"npmLockSha256\": {},\n  \"elmJsonSha256\": {},\n  \"wireVersion\": {},\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
             json(certified::profile_version()),
             mode == BuildMode::Certify,
             json(certification_state),
@@ -236,6 +236,7 @@ pub fn build(
                 .map(json)
                 .unwrap_or_else(|| "null".to_string()),
             json(&elm_json_hash),
+            json(certified::wire_version()),
             json_array(&app.unsafe_operations),
         ),
     )

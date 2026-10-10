@@ -19,11 +19,13 @@ pub const RUNTIME: &str = "crate::bind_runtime";
 
 /// The Rust type of `ty`. Type variables render as `T<id>`; inside a function the backend
 /// uses the function's positional generic names instead (see [`Layout::ty`]).
+#[cfg(test)]
 pub fn rust_type(ty: &Type, program: &CoreProgram) -> String {
     Layout::new(program).ty(ty, &BTreeMap::new())
 }
 
 /// Declarations of every program type (`Result` excluded: it is the runtime's `BindResult`).
+#[cfg(test)]
 pub fn type_declarations(program: &CoreProgram) -> String {
     super::indent(&Layout::new(program).declarations())
 }
@@ -508,7 +510,7 @@ fn markers(ty: &Type, output: &mut BTreeSet<String>) {
     }
 }
 
-fn field_line(visibility: &str, field: &str, ty: &str, serde: bool) -> String {
+pub(super) fn field_line(visibility: &str, field: &str, ty: &str, serde: bool) -> String {
     let ident = field_ident(field);
     let rename = if serde && ident.ends_with('_') && !field.ends_with('_') {
         format!("#[serde(rename = \"{field}\")]\n")

@@ -139,28 +139,45 @@ impl Ctx {
     /// The guard must be held only around a single query, after all of that query's arguments
     /// have been evaluated: the tokio `Mutex` is not re-entrant, so evaluating an argument
     /// that itself needs the transaction while the guard is held would deadlock.
-    pub async fn transaction(
+    ///
+    /// The future and the guard own their handle on the transaction (no borrow of `self`), so
+    /// generated code can hold the guard across a query inside a boxed `Send` future.
+    pub fn transaction(
         &self,
-    ) -> Result<
-        tokio::sync::MappedMutexGuard<'_, sqlx::Transaction<'static, sqlx::Postgres>>,
-        AppError,
-    > {
-        let shared = self.transaction.as_ref().ok_or_else(no_transaction)?;
-        tokio::sync::MutexGuard::try_map(shared.lock().await, |slot| slot.as_mut())
-            .map_err(|_| no_transaction())
+    ) -> impl std::future::Future<Output = Result<TransactionGuard, AppError>> + Send + 'static
+    {
+        let shared = self.transaction.clone();
+        async move {
+            let shared = shared.ok_or_else(no_transaction)?;
+            tokio::sync::OwnedMutexGuard::try_map(shared.lock_owned().await, |slot| slot.as_mut())
+                .map_err(|_| no_transaction())
+        }
     }
 
     /// Takes the transaction out of the context (for commit/rollback by the router),
     /// regardless of how many clones of the context exist. `Internal` when the context has
     /// no database or the transaction was already taken. Later `transaction()` calls on any
     /// clone fail with `Internal`.
-    pub async fn take_transaction(
+    pub fn take_transaction(
         &self,
-    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError> {
-        let shared = self.transaction.as_ref().ok_or_else(no_transaction)?;
-        shared.lock().await.take().ok_or_else(no_transaction)
+    ) -> impl std::future::Future<
+        Output = Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError>,
+    > + Send
+    + 'static {
+        let shared = self.transaction.clone();
+        async move {
+            let shared = shared.ok_or_else(no_transaction)?;
+            let taken = shared.lock_owned().await.take();
+            taken.ok_or_else(no_transaction)
+        }
     }
 }
+
+/// Exclusive access to the request's transaction (see [`Ctx::transaction`]).
+pub type TransactionGuard = tokio::sync::OwnedMappedMutexGuard<
+    Option<sqlx::Transaction<'static, sqlx::Postgres>>,
+    sqlx::Transaction<'static, sqlx::Postgres>,
+>;
 
 fn no_transaction() -> AppError {
     AppError::Internal("no database transaction available in this context".to_string())

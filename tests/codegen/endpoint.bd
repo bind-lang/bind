@@ -1,0 +1,41 @@
+distinct type CustomerId = UUID
+
+entity Customer(
+    val id: CustomerId,
+    val name: String,
+    val email: Email,
+    val balance: Money,
+    val visits: Int,
+    val nickname: String?
+)
+
+fun normalizar(nome: String) = when (nome) {
+    "" -> "sem nome"
+    outro -> outro
+}
+
+fun naoUsada(x: Int) = x + 1
+
+server fun cadastrar(nome: String, email: Email, saldo: Money): Customer
+    effects [db.read, db.write] {
+    val novo = db.customers.insert {
+        name = normalizar(nome)
+        email = email
+        balance = saldo
+        visits = 0
+    }
+    return db.customers.require(novo.id)
+}
+
+server fun procurar(id: CustomerId): Customer? effects [db.read] = db.customers.find(id)
+
+server fun falha(nome: String, email: Email, saldo: Money, outro: CustomerId): Customer
+    effects [db.read, db.write] {
+    val ignorado = db.customers.insert {
+        name = nome
+        email = email
+        balance = saldo
+        visits = 1
+    }
+    return db.customers.require(outro)
+}

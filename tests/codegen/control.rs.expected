@@ -19,6 +19,8 @@
     // `if (c) true else false`, identical branches, a `val` bound to a `return`, …) are the Bind
     // programmer's concern.
     clippy::bool_comparison,
+    // A `when` arm `"" ->` is a comparison with the empty string.
+    clippy::comparison_to_empty,
     clippy::diverging_sub_expression,
     clippy::double_comparisons,
     clippy::eq_op,

@@ -1,0 +1,7 @@
+table,model,primary_key,column,type,nullable,required,has_default,engine
+customers,Customer,id,id,CustomerId,false,true,true,postgresql
+customers,Customer,id,name,String,false,true,false,postgresql
+customers,Customer,id,email,Email,false,true,false,postgresql
+customers,Customer,id,balance,Money,false,true,false,postgresql
+customers,Customer,id,visits,Int,false,true,false,postgresql
+customers,Customer,id,nickname,String,true,false,false,postgresql

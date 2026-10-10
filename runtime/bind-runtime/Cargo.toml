@@ -16,3 +16,5 @@ bigdecimal = "=0.4.8"
 rust_decimal = { version = "=1.37.2", features = ["serde-str"] }
 chrono = { version = "=0.4.41", features = ["serde"] }
 futures = "=0.3.31"
+# Not used by the runtime itself: pins the version generated crates use for `Uuid`.
+uuid = { version = "=1.28.0", features = ["serde"] }
