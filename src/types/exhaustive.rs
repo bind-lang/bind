@@ -55,6 +55,9 @@ pub fn render(pat: &Pat) -> String {
         Pat::Lit(text) => text.clone(),
         Pat::Ctor(name, args) if name == "Some" => match args.first() {
             Some(Pat::Wild) | None => "<non-null value>".into(),
+            Some(inner @ Pat::Ctor(inner_name, _)) if inner_name == "null" || inner_name == "Some" => {
+                format!("Some({})", render(inner))
+            }
             Some(inner) => render(inner),
         },
         Pat::Ctor(name, args) if args.is_empty() => name.clone(),
@@ -120,6 +123,7 @@ fn useful(sig: &dyn Signatures, rows: &[Vec<Pat>], vector: &[Pat], types: &[Type
 fn constructor_args(sig: &dyn Signatures, ty: &Type, name: &str, arity: usize) -> Vec<Type> {
     sig.constructors(ty)
         .and_then(|all| all.into_iter().find(|ctor| ctor.name == name))
+        .filter(|ctor| ctor.args.len() == arity)
         .map_or_else(|| vec![Type::Error; arity], |ctor| ctor.args)
 }
 
@@ -138,7 +142,7 @@ fn head_constructors(rows: &[Vec<Pat>]) -> Vec<String> {
 fn specialize(rows: &[Vec<Pat>], name: &str, arity: usize) -> Vec<Vec<Pat>> {
     rows.iter()
         .filter_map(|row| match row.split_first()? {
-            (Pat::Ctor(other, args), rest) if other == name => Some(args.iter().chain(rest).cloned().collect()),
+            (Pat::Ctor(other, args), rest) if other == name && args.len() == arity => Some(args.iter().chain(rest).cloned().collect()),
             (Pat::Wild, rest) => Some(std::iter::repeat_n(Pat::Wild, arity).chain(rest.iter().cloned()).collect()),
             _ => None,
         })
@@ -269,5 +273,20 @@ mod tests {
         let report = check_match(&Fake, &int, &arms);
         assert_eq!(report.missing, None);
         assert_eq!(report.redundant, vec![1]);
+    }
+
+    #[test]
+    fn wrong_arity_constructor_does_not_panic() {
+        let arms = [ctor("Pago", vec![Pat::Wild, Pat::Wild])];
+        let report = check_match(&Fake, &pedido(), &arms);
+        assert!(report.missing.is_some());
+    }
+
+    #[test]
+    fn nested_options_render_the_inner_null() {
+        let option = Type::option(Type::option(Type::con("Int")));
+        let arms = [ctor("null", vec![]), ctor("Some", vec![ctor("Some", vec![Pat::Wild])])];
+        let report = check_match(&Fake, &option, &arms);
+        assert_eq!(report.missing.as_ref().map(render), Some("Some(null)".into()));
     }
 }
