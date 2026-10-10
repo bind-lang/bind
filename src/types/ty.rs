@@ -294,8 +294,17 @@ pub fn generalize(
 }
 
 pub fn instantiate(table: &mut TypeTable, scheme: &Scheme, level: u32) -> Type {
+    instantiate_with_rows(table, scheme, level).0
+}
+
+/// Like `instantiate`, also returning the fresh row variable made for each quantified one.
+pub fn instantiate_with_rows(
+    table: &mut TypeTable,
+    scheme: &Scheme,
+    level: u32,
+) -> (Type, BTreeMap<RowVarId, RowVarId>) {
     if scheme.vars.is_empty() && scheme.row_vars.is_empty() {
-        return scheme.ty.clone();
+        return (scheme.ty.clone(), BTreeMap::new());
     }
     let types: BTreeMap<TypeVarId, Type> = scheme
         .vars
@@ -306,7 +315,7 @@ pub fn instantiate(table: &mut TypeTable, scheme: &Scheme, level: u32) -> Type {
     for id in &scheme.row_vars {
         rows.insert(*id, table.fresh_row_var(level));
     }
-    substitute(&scheme.ty, &types, &rows)
+    (substitute(&scheme.ty, &types, &rows), rows)
 }
 
 pub fn substitute(

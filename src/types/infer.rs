@@ -67,6 +67,16 @@ struct Checker<'a> {
     context: Row,
     /// Where each effect of each function first comes from.
     effect_origins: BTreeMap<String, BTreeMap<Label, Origin>>,
+    /// Origins and calls of the bodies being checked: the function's, then one per enclosing
+    /// lambda. A lambda's record is kept apart until it is known to run (see `settle_origins`).
+    records: Vec<EffectRecord>,
+    /// Records of the lambdas of the current function, with their rows.
+    lambda_records: Vec<(Row, EffectRecord)>,
+    /// Row variables made by instantiating a local's scheme, mapped to the quantified variable
+    /// they stand for, so a `val` lambda that is called is recognized.
+    row_instances: Vec<(RowVarId, RowVarId)>,
+    /// Orders origins and calls across records, so merging keeps the first one.
+    sequence: usize,
     /// Effect variables of the signature whose body is being checked.
     effect_scope: BTreeMap<String, Row>,
     /// Domain of the body being checked (`Inferred` outside bodies).
@@ -92,6 +102,29 @@ impl Step {
             "{} ({}:{}:{})",
             self.name, self.span.file, self.span.line, self.span.column
         )
+    }
+}
+
+/// Origins and program calls of one body, each numbered in order of appearance.
+#[derive(Default)]
+struct EffectRecord {
+    origins: BTreeMap<Label, (usize, Origin)>,
+    calls: Vec<(usize, String, Span)>,
+}
+
+impl EffectRecord {
+    /// Adds `other`, keeping the earliest origin of each label and the calls in order.
+    fn merge(&mut self, other: EffectRecord) {
+        for (label, (order, origin)) in other.origins {
+            match self.origins.get(&label) {
+                Some((existing, _)) if *existing < order => {}
+                _ => {
+                    self.origins.insert(label, (order, origin));
+                }
+            }
+        }
+        self.calls.extend(other.calls);
+        self.calls.sort_by_key(|(order, _, _)| *order);
     }
 }
 
@@ -123,6 +156,10 @@ impl<'a> Checker<'a> {
             diagnostics: Vec::new(),
             context: Row::empty(),
             effect_origins: BTreeMap::new(),
+            records: Vec::new(),
+            lambda_records: Vec::new(),
+            row_instances: Vec::new(),
+            sequence: 0,
             effect_scope: BTreeMap::new(),
             domain: Domain::Inferred,
             function_domains: BTreeMap::new(),
@@ -624,6 +661,9 @@ impl<'a> Checker<'a> {
         } else {
             row.clone()
         };
+        self.records = vec![EffectRecord::default()];
+        self.lambda_records.clear();
+        self.row_instances.clear();
         let body = self.infer_block(block);
         let reason = if function.component {
             "a component body, which must end with a UI tree".to_string()
@@ -634,6 +674,7 @@ impl<'a> Checker<'a> {
         self.locals.clear();
         self.return_type = None;
         let context = std::mem::replace(&mut self.context, Row::empty());
+        self.settle_origins(&context);
         self.effect_scope.clear();
         self.domain = Domain::Inferred;
         Some(context)
@@ -709,10 +750,11 @@ impl<'a> Checker<'a> {
                     }
                 }
                 if let Some(Origin::Call { callee, span }) = origin {
-                    self.calls
-                        .entry(self.function.clone())
-                        .or_default()
-                        .push((callee, span));
+                    self.sequence += 1;
+                    let order = self.sequence;
+                    if let Some(record) = self.records.last_mut() {
+                        record.calls.push((order, callee, span));
+                    }
                 }
             }
             Err(_) => self.effect_mismatch(span),
@@ -730,11 +772,66 @@ impl<'a> Checker<'a> {
     }
 
     fn note_origin(&mut self, label: Label, origin: Origin) {
-        self.effect_origins
-            .entry(self.function.clone())
-            .or_default()
-            .entry(label)
-            .or_insert(origin);
+        self.sequence += 1;
+        let order = self.sequence;
+        if let Some(record) = self.records.last_mut() {
+            record.origins.entry(label).or_insert((order, origin));
+        }
+    }
+
+    /// At the end of a body: the records of the lambdas whose rows flowed into the body's row
+    /// (they were called, directly or through the functions they were passed to) join the
+    /// function's record; the others never run and leave no origin behind.
+    fn settle_origins(&mut self, context: &Row) {
+        let mut record = self.records.pop().unwrap_or_default();
+        let target = self.table.resolve_row(context).tail;
+        for (row, lambda) in std::mem::take(&mut self.lambda_records) {
+            if target.is_some() && self.reaches(&row, target) {
+                record.merge(lambda);
+            }
+        }
+        self.row_instances.clear();
+        self.records.clear();
+        self.effect_origins.insert(
+            self.function.clone(),
+            record
+                .origins
+                .into_iter()
+                .map(|(label, (_, origin))| (label, origin))
+                .collect(),
+        );
+        self.calls.insert(
+            self.function.clone(),
+            record
+                .calls
+                .into_iter()
+                .map(|(_, callee, span)| (callee, span))
+                .collect(),
+        );
+    }
+
+    /// Whether `row` (or an instance of it made by using a `val`) now ends in `target`.
+    fn reaches(&self, row: &Row, target: Option<RowVarId>) -> bool {
+        let Some(start) = self.table.resolve_row(row).tail else {
+            return false;
+        };
+        let mut seen = BTreeSet::from([start]);
+        let mut frontier = vec![start];
+        while let Some(current) = frontier.pop() {
+            if self.table.resolve_row(&Row::with_tail([], current)).tail == target {
+                return true;
+            }
+            for (instance, quantified) in &self.row_instances {
+                let quantified = self
+                    .table
+                    .resolve_row(&Row::with_tail([], *quantified))
+                    .tail;
+                if quantified == Some(current) && seen.insert(*instance) {
+                    frontier.push(*instance);
+                }
+            }
+        }
+        false
     }
 
     /// The origin to record for a call: program functions (non-local names) as calls,
@@ -1367,7 +1464,11 @@ impl<'a> Checker<'a> {
             .find(|(local, _)| local == name)
             .map(|(_, scheme)| scheme.clone())
         {
-            let ty = instantiate(&mut self.table, &scheme, self.level);
+            let (ty, rows) = instantiate_with_rows(&mut self.table, &scheme, self.level);
+            self.row_instances.extend(
+                rows.into_iter()
+                    .map(|(quantified, fresh)| (fresh, quantified)),
+            );
             return self.open_top(ty);
         }
         if let Some(scheme) = self.globals.get(name).cloned() {
@@ -1533,9 +1634,12 @@ impl<'a> Checker<'a> {
         let fresh = self.table.fresh_row(self.level);
         let saved = std::mem::replace(&mut self.context, fresh);
         self.lambda_depth += 1;
+        self.records.push(EffectRecord::default());
         let result = self.infer_block(body);
+        let record = self.records.pop().unwrap_or_default();
         self.lambda_depth -= 1;
         let row = std::mem::replace(&mut self.context, saved);
+        self.lambda_records.push((row.clone(), record));
         self.locals.truncate(mark);
         Type::Fun(param_types, Box::new(result), row)
     }
@@ -3795,5 +3899,39 @@ mod tests {
                 "`server.ler` is not a server endpoint; declare it `server fun`."
             );
         }
+    }
+
+    #[test]
+    fn origins_inside_uncalled_lambdas_are_not_recorded() {
+        let diagnostics = db_diagnostics(
+            "fun ler(id: ClienteId) = db.clientes.require(id)\nserver fun s(id: ClienteId): Cliente {\n    val f = { -> db.clientes.require(id) }\n    return ler(id)\n}\n",
+        );
+        let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7402"], "{diagnostics:?}");
+        let path = &diagnostics[0].path;
+        assert_eq!(path.len(), 3, "{path:?}");
+        assert!(path[1].starts_with("ler ("), "{path:?}");
+        assert!(
+            diagnostics[0]
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("the call to `ler`")),
+            "{:?}",
+            diagnostics[0].hint
+        );
+        // A lambda that is called still contributes its origin.
+        let called = db_diagnostics(
+            "server fun s(id: ClienteId): Cliente {\n    val f = { -> db.clientes.require(id) }\n    return f()\n}\n",
+        );
+        assert_eq!(called.len(), 1, "{called:?}");
+        assert!(
+            called[0]
+                .path
+                .last()
+                .unwrap()
+                .starts_with("db.clientes.require ("),
+            "{:?}",
+            called[0].path
+        );
     }
 }
