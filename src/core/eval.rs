@@ -86,6 +86,9 @@ fn join(values: &[Value]) -> String {
         .join(", ")
 }
 
+/// The canonical string escaping. The generated Rust renderer of Task 9 must replicate it
+/// exactly; it differs from `serde_json` for U+0008 and U+000C (here `\u0008` and `\u000c`,
+/// not `\b` and `\f`).
 fn json_string(text: &str) -> String {
     let mut out = String::from("\"");
     for c in text.chars() {
@@ -121,7 +124,7 @@ pub fn eval_function(
         match handle {
             Ok(handle) => handle
                 .join()
-                .unwrap_or_else(|_| Err(unsupported("evaluation thread panicked"))),
+                .unwrap_or_else(|payload| std::panic::resume_unwind(payload)),
             Err(error) => Err(unsupported(&format!("cannot spawn thread: {error}"))),
         }
     })
@@ -154,6 +157,14 @@ struct Interp<'p> {
 impl Interp<'_> {
     /// Calls a function value; a `Return` inside ends only this call.
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, EvalError> {
+        // Like the generated `ctx.enter()?`: only Bind functions and closures count.
+        let counts = matches!(callee, Value::Function(_) | Value::Closure { .. });
+        if !counts {
+            return match self.call_inner(callee, args) {
+                Ok(value) | Err(Signal::Return(value)) => Ok(value),
+                Err(Signal::Error(error)) => Err(error),
+            };
+        }
         if self.depth >= DEPTH_LIMIT {
             return Err(EvalError::RecursionLimit);
         }
@@ -385,7 +396,7 @@ fn literal_value(literal: &Literal) -> Result<Value, EvalError> {
 fn matches(pattern: &Pat, value: &Value) -> bool {
     match (pattern, value) {
         (Pat::Wild, _) => true,
-        (Pat::Lit(text), Value::Int(value)) => *text == value.to_string(),
+        (Pat::Lit(text), Value::Int(value)) => int_pattern(text).as_ref() == Some(value),
         (Pat::Lit(text), Value::Str(value)) => *text == format!("{value:?}"),
         (Pat::Ctor(name, _), Value::Bool(value)) => *name == value.to_string(),
         (Pat::Ctor(name, _), Value::None) => name == "null",
@@ -402,6 +413,25 @@ fn matches(pattern: &Pat, value: &Value) -> bool {
         }
         _ => false,
     }
+}
+
+/// The value of an integer literal pattern: optional sign, then decimal, `0x` or `0b` digits
+/// (underscores and a trailing `l` are accepted as in the lexer).
+fn int_pattern(text: &str) -> Option<BigInt> {
+    let cleaned = text.replace('_', "").to_ascii_lowercase();
+    let (negative, rest) = match cleaned.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
+    };
+    let (digits, radix) = if let Some(hex) = rest.strip_prefix("0x") {
+        (hex, 16)
+    } else if let Some(bin) = rest.strip_prefix("0b") {
+        (bin, 2)
+    } else {
+        (rest, 10)
+    };
+    let value = BigInt::parse_bytes(digits.trim_end_matches('l').as_bytes(), radix)?;
+    Some(if negative { -value } else { value })
 }
 
 fn follow(value: &Value, path: &[(String, usize)]) -> Result<Value, EvalError> {
@@ -638,6 +668,45 @@ mod tests {
             run(source, "loop", vec![int("10000")]).map(|v| v.render()),
             Err(EvalError::RecursionLimit)
         );
+    }
+
+    #[test]
+    fn builtins_do_not_count_toward_the_depth() {
+        let source = "fun loop(n: Int): Int = if (n == 0) length(listOf(1)) else loop(n - 1)";
+        // loop(9999) is exactly 10,000 function calls; the builtins at the bottom add none.
+        assert_eq!(
+            run(source, "loop", vec![int("9999")]).map(|v| v.render()),
+            Ok("1".into())
+        );
+        assert_eq!(
+            run(source, "loop", vec![int("10000")]).map(|v| v.render()),
+            Err(EvalError::RecursionLimit)
+        );
+    }
+
+    #[test]
+    fn closures_count_toward_the_depth() {
+        let source =
+            "fun g(n: Int): Int = if (n == 0) 0 else fold(listOf(1), 0, { s, x -> g(n - 1) })";
+        // g(n) is one call to g plus one to the closure per step: g(n) nests 2n + 1 calls
+        // (the last g(0) included), so the limit of 10,000 allows n = 4999 (9,999 calls)
+        // and fails at n = 5000 (10,001 calls).
+        assert_eq!(
+            run(source, "g", vec![int("4999")]).map(|v| v.render()),
+            Ok("0".into())
+        );
+        assert_eq!(
+            run(source, "g", vec![int("5000")]).map(|v| v.render()),
+            Err(EvalError::RecursionLimit)
+        );
+    }
+
+    #[test]
+    fn integer_patterns_compare_numerically() {
+        let source = "fun f(x: Int): Int = when (x) {\n    -0 -> 1\n    0x10 -> 3\n    _ -> 2\n}\n";
+        assert_eq!(rendered(source, vec![int("0")]), "1");
+        assert_eq!(rendered(source, vec![int("16")]), "3");
+        assert_eq!(rendered(source, vec![int("5")]), "2");
     }
 
     #[test]
