@@ -96,7 +96,8 @@ impl From<serde_json::Error> for AppError {
     }
 }
 
-type SharedTransaction = Arc<tokio::sync::Mutex<sqlx::Transaction<'static, sqlx::Postgres>>>;
+type SharedTransaction =
+    Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>;
 
 /// Call context: optional shared transaction plus the current call depth.
 #[derive(Clone)]
@@ -116,7 +117,7 @@ impl Ctx {
 
     pub fn with_transaction(tx: sqlx::Transaction<'static, sqlx::Postgres>) -> Ctx {
         Ctx {
-            transaction: Some(Arc::new(tokio::sync::Mutex::new(tx))),
+            transaction: Some(Arc::new(tokio::sync::Mutex::new(Some(tx)))),
             depth: 0,
         }
     }
@@ -132,24 +133,37 @@ impl Ctx {
         })
     }
 
+    /// Locks the shared transaction and returns a guard dereferencing to it. `Internal` when
+    /// the context has no database or the transaction was already taken.
+    ///
+    /// The guard must be held only around a single query, after all of that query's arguments
+    /// have been evaluated: the tokio `Mutex` is not re-entrant, so evaluating an argument
+    /// that itself needs the transaction while the guard is held would deadlock.
     pub async fn transaction(
         &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, sqlx::Transaction<'static, sqlx::Postgres>>, AppError>
-    {
-        match &self.transaction {
-            Some(shared) => Ok(shared.lock().await),
-            None => Err(AppError::Internal(
-                "no database transaction in this context".to_string(),
-            )),
-        }
+    ) -> Result<
+        tokio::sync::MappedMutexGuard<'_, sqlx::Transaction<'static, sqlx::Postgres>>,
+        AppError,
+    > {
+        let shared = self.transaction.as_ref().ok_or_else(no_transaction)?;
+        tokio::sync::MutexGuard::try_map(shared.lock().await, |slot| slot.as_mut())
+            .map_err(|_| no_transaction())
     }
 
-    /// Recovers the transaction for commit/rollback. Returns `None` when there is none or
-    /// other clones of the context are still alive.
-    pub fn into_transaction(self) -> Option<sqlx::Transaction<'static, sqlx::Postgres>> {
-        let shared = self.transaction?;
-        Arc::try_unwrap(shared).ok().map(|m| m.into_inner())
+    /// Takes the transaction out of the context (for commit/rollback by the router),
+    /// regardless of how many clones of the context exist. `Internal` when the context has
+    /// no database or the transaction was already taken. Later `transaction()` calls on any
+    /// clone fail with `Internal`.
+    pub async fn take_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError> {
+        let shared = self.transaction.as_ref().ok_or_else(no_transaction)?;
+        shared.lock().await.take().ok_or_else(no_transaction)
     }
+}
+
+fn no_transaction() -> AppError {
+    AppError::Internal("no database transaction available in this context".to_string())
 }
 
 /// Arbitrary-precision integer. JSON: canonical string. PostgreSQL: integral `numeric`.
@@ -219,11 +233,18 @@ impl fmt::Display for Int {
     }
 }
 
+/// Longest accepted `Int` JSON string, in digits (the optional '-' not counted). Bounds the
+/// cost of parsing untrusted input.
+pub const MAX_INT_DIGITS: usize = 1000;
+
 /// Canonical form: `-?[0-9]+`, no leading zeros except "0" itself, no "-0", no `+`/spaces.
 fn parse_canonical_int(text: &str) -> Option<num_bigint::BigInt> {
     let digits = text.strip_prefix('-').unwrap_or(text);
     let negative = digits.len() != text.len();
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty()
+        || digits.len() > MAX_INT_DIGITS
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     if digits.starts_with('0') && (digits.len() > 1 || negative) {
@@ -440,6 +461,20 @@ mod tests {
     }
 
     #[test]
+    fn int_digit_cap_and_negative_round_trip() {
+        let ok = format!("\"1{}\"", "0".repeat(MAX_INT_DIGITS - 1));
+        assert!(serde_json::from_str::<Int>(&ok).is_ok());
+        let too_long = format!("\"1{}\"", "0".repeat(MAX_INT_DIGITS));
+        assert!(serde_json::from_str::<Int>(&too_long).is_err());
+        let neg_ok = format!("\"-1{}\"", "0".repeat(MAX_INT_DIGITS - 1));
+        assert!(serde_json::from_str::<Int>(&neg_ok).is_ok());
+        let neg_big = int("-98765432109876543210987654321");
+        let json = serde_json::to_string(&neg_big).unwrap();
+        assert_eq!(json, "\"-98765432109876543210987654321\"");
+        assert_eq!(serde_json::from_str::<Int>(&json).unwrap(), neg_big);
+    }
+
+    #[test]
     fn int_from_parts() {
         let two_pow_32 = Int::from_parts(false, &[0, 1]);
         assert_eq!(two_pow_32, int("4294967296"));
@@ -481,6 +516,11 @@ mod tests {
         ));
         assert_eq!(decimal_add(&one, &one).unwrap(), Decimal::TWO);
         assert_eq!(decimal_neg(&one).unwrap(), -one);
+        let tiny = Decimal::new(1, 28);
+        assert!(matches!(
+            decimal_div_checked(&Decimal::MAX, &tiny),
+            Err(AppError::Overflow(_))
+        ));
         assert!(matches!(
             decimal_div_checked(&one, &Decimal::ZERO),
             Ok(None)
@@ -504,6 +544,59 @@ mod tests {
             duration_add(&chrono::TimeDelta::MAX, &one),
             Err(AppError::Overflow(_))
         ));
+        let neg_max = chrono::TimeDelta::MIN;
+        assert!(matches!(
+            duration_sub(&neg_max, &one),
+            Err(AppError::Overflow(_))
+        ));
+        assert_eq!(
+            duration_neg(&chrono::TimeDelta::MAX).unwrap(),
+            chrono::TimeDelta::MIN
+        );
+        // Negating MIN either succeeds or reports Overflow; it must never panic.
+        assert!(matches!(
+            duration_neg(&neg_max),
+            Ok(_) | Err(AppError::Overflow(_))
+        ));
+    }
+
+    #[test]
+    fn take_transaction_without_database_is_internal() {
+        let rt = runtime();
+        let ctx = Ctx::pure();
+        assert!(matches!(
+            rt.block_on(ctx.take_transaction()),
+            Err(AppError::Internal(_))
+        ));
+        assert!(matches!(
+            rt.block_on(ctx.transaction()),
+            Err(AppError::Internal(_))
+        ));
+    }
+
+    /// Needs a live PostgreSQL: runs only when `BIND_TEST_DATABASE_URL` is set.
+    #[test]
+    fn take_transaction_with_live_clone_then_again() {
+        let Ok(url) = std::env::var("BIND_TEST_DATABASE_URL") else {
+            return;
+        };
+        let rt = runtime();
+        rt.block_on(async {
+            let pool = sqlx::PgPool::connect(&url).await.unwrap();
+            let ctx = Ctx::with_transaction(pool.begin().await.unwrap());
+            let clone = ctx.enter().unwrap();
+            assert!(clone.transaction().await.is_ok());
+            let tx = ctx.take_transaction().await.unwrap();
+            tx.rollback().await.unwrap();
+            assert!(matches!(
+                ctx.take_transaction().await,
+                Err(AppError::Internal(_))
+            ));
+            assert!(matches!(
+                clone.transaction().await,
+                Err(AppError::Internal(_))
+            ));
+        });
     }
 
     #[test]
@@ -532,6 +625,8 @@ mod tests {
             assert!(!message.contains("hunter2") && !message.contains("db.internal"));
             assert!(!message.contains("invalid type"));
         }
+        let not_found = AppError::NotFound("user 42 secret".into()).public_message();
+        assert!(!not_found.contains("secret") && !not_found.contains("42"));
         assert_eq!(
             AppError::BadRequest("bad id".into()).public_message(),
             "bad id"
@@ -552,6 +647,7 @@ mod tests {
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .enable_all()
             .thread_stack_size(64 * 1024 * 1024)
             .build()
             .unwrap()
