@@ -393,14 +393,22 @@ impl<'p> Layout<'p> {
                         let ty = self.stored_type(name, index, field_ty, &none);
                         output.push_str(&field_line("pub ", field, &ty, serde));
                     }
+                    if let Some(phantom) = self.phantom(name) {
+                        let skip = if serde { "#[serde(skip)]\n" } else { "" };
+                        output.push_str(&format!("{skip}pub {PHANTOM_FIELD}: {phantom},\n"));
+                    }
                     output.push_str("}\n\n");
                 }
                 CoreType::Sum { variants, .. } => {
-                    if serde {
-                        output.push_str("#[serde(rename_all = \"camelCase\")]\n");
-                    }
                     output.push_str(&format!("pub enum {name}{generics} {{\n"));
                     for (variant, fields) in variants {
+                        if serde {
+                            // The `bind-json` name of a variant (as in the Elm codecs).
+                            output.push_str(&format!(
+                                "#[serde(rename = \"{}\")]\n",
+                                crate::certified::lower_camel(variant)
+                            ));
+                        }
                         if fields.is_empty() {
                             output.push_str(&format!("{variant},\n"));
                             continue;
@@ -411,6 +419,13 @@ impl<'p> Layout<'p> {
                             output.push_str(&field_line("", field, &ty, serde));
                         }
                         output.push_str("},\n");
+                    }
+                    if let Some(phantom) = self.phantom(name) {
+                        // Uninhabited: only gives the unused parameters a use.
+                        let skip = if serde { "#[serde(skip)]\n" } else { "" };
+                        output.push_str(&format!(
+                            "{skip}{PHANTOM_VARIANT}({phantom}, ::std::convert::Infallible),\n"
+                        ));
                     }
                     output.push_str("}\n\n");
                 }
@@ -424,6 +439,37 @@ impl<'p> Layout<'p> {
             }
         }
         output
+    }
+
+    /// `PhantomData<fn() -> (P, …)>` over the type parameters of `type_name` that no field
+    /// mentions (Rust rejects unused parameters, E0392); `None` when every one is used.
+    pub fn phantom(&self, type_name: &str) -> Option<String> {
+        let params = self.program.types.iter().find_map(|ty| match ty {
+            CoreType::Record { name, params, .. } | CoreType::Sum { name, params, .. }
+                if name == type_name && name != "Result" =>
+            {
+                Some(params)
+            }
+            _ => None,
+        })?;
+        let mut used = BTreeSet::new();
+        for ctor in self.ctors_of(type_name) {
+            for (_, field) in &ctor.fields {
+                markers(field, &mut used);
+            }
+        }
+        let unused: Vec<&String> = params
+            .iter()
+            .filter(|param| !used.contains(&format!("'{param}")))
+            .collect();
+        if unused.is_empty() {
+            return None;
+        }
+        let list: String = unused.iter().map(|param| format!("{param}, ")).collect();
+        Some(format!(
+            "::std::marker::PhantomData<fn() -> ({})>",
+            list.trim_end_matches(' ')
+        ))
     }
 
     /// The declared type of field `index` of `ctor`, boxed when it is recursive.
@@ -440,6 +486,25 @@ impl<'p> Layout<'p> {
         } else {
             rendered
         }
+    }
+}
+
+/// The hidden field of a record whose type parameters are not all used by its fields.
+pub const PHANTOM_FIELD: &str = "__phantom";
+/// The hidden, uninhabited variant of such a sum type.
+pub const PHANTOM_VARIANT: &str = "__Phantom";
+
+fn markers(ty: &Type, output: &mut BTreeSet<String>) {
+    match ty {
+        Type::Con(name, args) if args.is_empty() && name.starts_with('\'') => {
+            output.insert(name.clone());
+        }
+        Type::Con(_, args) => args.iter().for_each(|arg| markers(arg, output)),
+        Type::Fun(params, result, _) => {
+            params.iter().for_each(|param| markers(param, output));
+            markers(result, output);
+        }
+        Type::Var(_) | Type::Error => {}
     }
 }
 

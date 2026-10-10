@@ -1695,7 +1695,7 @@ fn pascal_case(value: &str) -> String {
     output
 }
 
-fn lower_camel(value: &str) -> String {
+pub(crate) fn lower_camel(value: &str) -> String {
     let pascal = pascal_case(value);
     let mut chars = pascal.chars();
     match chars.next() {

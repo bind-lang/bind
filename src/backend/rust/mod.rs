@@ -27,6 +27,9 @@ non_camel_case_types,
 clippy::let_and_return,
 clippy::let_unit_value,
 clippy::match_single_binding,
+// Function types are spelled out in full (`Arc<dyn Fn(Ctx, A) -> BoxFuture<…> + …>`), so a
+// function returning a function has a long type.
+clippy::type_complexity,
 // The generated code mirrors the logic of the Bind source; lints about that logic (`x == x`,
 // `if (c) true else false`, identical branches, a `val` bound to a `return`, …) are the Bind
 // programmer's concern.
@@ -254,6 +257,13 @@ mod tests {
             .split_once("[dependencies]")
             .map(|(_, rest)| rest)
             .unwrap();
+        // Generated types serialize `Arc<Vec<T>>` (lists), which needs serde's `rc` feature.
+        let serde = "serde = { version = \"=1.0.229\", features = [\"derive\"] }";
+        assert!(dependencies.contains(serde), "runtime serde line changed");
+        let dependencies = dependencies.replace(
+            serde,
+            "serde = { version = \"=1.0.229\", features = [\"derive\", \"rc\"] }",
+        );
         let crate_dir = root.join("target/bind-codegen-tests/snapshots");
         let src = crate_dir.join("src");
         fs::create_dir_all(&src).unwrap();
@@ -318,6 +328,19 @@ fn wire_shapes() {
         filho: Box::new(None),
     };
     assert_eq!(json(&config), r#"{"type":"t","match":"3","filho":null}"#);
+    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Arc::new(vec![]) };
+    assert_eq!(json(&tree), r#"{"nodo":{"v":"1","filhos":[]}}"#);
+    // Unused type parameters leave the JSON shape unchanged.
+    assert_eq!(json(&records::Opt::<Int>::Nada), r#""nada""#);
+    let back: records::Opt<Int> = serde_json::from_str(r#""nada""#).unwrap();
+    assert_eq!(back, records::Opt::Nada);
+    let marca = records::Marca::<Int> { nome: "x".to_string(), __phantom: std::marker::PhantomData };
+    assert_eq!(json(&marca), r#"{"nome":"x"}"#);
+    let back: records::Marca<Int> = serde_json::from_str(r#"{"nome":"x"}"#).unwrap();
+    assert_eq!(back, marca);
+    // Variant names as certified.rs's `lower_camel`.
+    assert_eq!(json(&records::Rotulo::Foo_bar), r#""fooBar""#);
+    assert_eq!(json(&records::Rotulo::HTTPError), r#""hTTPError""#);
 }
 
 #[test]
@@ -344,14 +367,30 @@ fn generated_functions_run() {
 ".to_string())).unwrap(),
         Int::from_i64(2)
     );
-    let mut deep = Ctx::pure();
-    for _ in 0..bind_codegen_snapshots::bind_runtime::MAX_DEPTH {
-        deep = deep.enter().unwrap();
-    }
-    assert!(matches!(
-        rt.block_on(control::bind_nada(deep)),
-        Err(AppError::RecursionLimit)
-    ));
+    let child = records::Arv::Nodo { v: Int::from_i64(2), filhos: Arc::new(vec![]) };
+    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Arc::new(vec![child.clone(), child]) };
+    assert_eq!(rt.block_on(records::bind_total(Ctx::pure(), tree)).unwrap(), Int::from_i64(5));
+    assert_eq!(rt.block_on(lambdas::bind_usaIgnora(Ctx::pure())).unwrap(), Int::from_i64(1));
+}
+
+/// Real recursion through generated code, on the runtime shape the server uses: worker
+/// threads with 64 MiB stacks (debug builds need at least 32 MiB for 10,000 levels).
+#[test]
+fn deep_recursion_reaches_the_limit_without_overflow() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let run = |n: i64| {
+        rt.block_on(async move { tokio::spawn(control::bind_loop(Ctx::pure(), Int::from_i64(n))).await })
+            .unwrap()
+    };
+    // loop(9999) is 10,000 nested calls: the limit itself.
+    assert_eq!(run(9999).unwrap(), Int::from_i64(0));
+    assert!(matches!(run(10_000), Err(AppError::RecursionLimit)));
+    assert!(matches!(run(100_000), Err(AppError::RecursionLimit)));
 }
 "##;
 }

@@ -12,6 +12,9 @@
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::match_single_binding,
+    // Function types are spelled out in full (`Arc<dyn Fn(Ctx, A) -> BoxFuture<…> + …>`), so a
+    // function returning a function has a long type.
+    clippy::type_complexity,
     // The generated code mirrors the logic of the Bind source; lints about that logic (`x == x`,
     // `if (c) true else false`, identical branches, a `val` bound to a `return`, …) are the Bind
     // programmer's concern.
@@ -25,13 +28,14 @@
 )]
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum Arvore {
+    #[serde(rename = "no")]
     No {
         esq: ::std::boxed::Box<Arvore>,
         valor: crate::bind_runtime::Int,
         dir: ::std::boxed::Box<Arvore>,
     },
+    #[serde(rename = "folha")]
     Folha,
 }
 

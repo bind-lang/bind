@@ -43,3 +43,36 @@ fun unicoInterno(u: Unico?): Int = when (u) {
     So(1) -> 1
     _ -> 0
 }
+
+sealed class Arv {
+    data class Nodo(val v: Int, val filhos: List<Arv>)
+}
+
+fun total(a: Arv): Int = when (a) {
+    Nodo(v, fs) -> fold(fs, v, { s, f -> s + total(f) })
+}
+
+sealed class Opt<T> {
+    data object Nada
+}
+
+data class Marca<T>(val nome: String)
+
+fun nada(): Opt<Int> = Nada
+
+fun ehNada(o: Opt<Int>): Boolean = when (o) {
+    Nada -> true
+}
+
+fun marca(): Marca<Int> = Marca("x")
+
+fun nomeMarca(m: Marca<Int>): String = when (m) {
+    Marca(n) -> n
+}
+
+sealed class Rotulo {
+    data object Foo_bar
+    data object HTTPError
+}
+
+fun rotulo(): Rotulo = HTTPError

@@ -40,3 +40,5 @@ fun saida(x: Int): Int {
     val y = return x
     y + 1
 }
+
+fun loop(n: Int): Int = if (n == 0) 0 else loop(n - 1)

@@ -19,7 +19,8 @@ use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 
 use super::types::{
-    ARC, BOX, CtorDef, CtorKind, Layout, OPTION, RESULT, RUNTIME, STRING, field_ident,
+    ARC, BOX, CtorDef, CtorKind, Layout, OPTION, PHANTOM_FIELD, PHANTOM_VARIANT, RESULT, RUNTIME,
+    STRING, field_ident,
 };
 
 /// One function in the uniform calling convention.
@@ -648,7 +649,16 @@ impl Generator<'_, '_> {
                 .join(", ")
         };
         atom(match def.kind {
-            CtorKind::Record => format!("{type_name}{type_args} {{ {} }}", fields()),
+            CtorKind::Record => {
+                let mut fields = fields();
+                if self.layout.phantom(type_name).is_some() {
+                    if !fields.is_empty() {
+                        fields.push_str(", ");
+                    }
+                    fields.push_str(&format!("{PHANTOM_FIELD}: ::std::marker::PhantomData"));
+                }
+                format!("{type_name}{type_args} {{ {fields} }}")
+            }
             CtorKind::Variant if def.fields.is_empty() => format!("{type_name}{type_args}::{ctor}"),
             CtorKind::Variant => format!("{type_name}{type_args}::{ctor} {{ {} }}", fields()),
             CtorKind::Distinct => format!("{type_name}({})", values.join(", ")),
@@ -965,6 +975,20 @@ impl Generator<'_, '_> {
             let body = self.block_contents(&arm.body, lets);
             output.push_str(&format!("{pattern} => {{\n{body}\n}}\n"));
         }
+        if let Type::Con(type_name, _) = ty
+            && self.layout.phantom(type_name).is_some()
+            && !self
+                .layout
+                .ctors_of(type_name)
+                .iter()
+                .any(|def| def.kind == CtorKind::Record)
+            && !arms.iter().any(|arm| arm.pattern == Pat::Wild)
+        {
+            // The hidden variant is uninhabited: the empty `match` needs no arm and no panic.
+            output.push_str(&format!(
+                "{type_name}::{PHANTOM_VARIANT}(_, never) => match *never {{}},\n"
+            ));
+        }
         output.push('}');
         output
     }
@@ -1009,7 +1033,10 @@ impl Generator<'_, '_> {
                                     .map(|(field, _)| format!("{}: {binder}", field_ident(field)))
                             })
                             .collect();
-                        if fields.len() < def.fields.len() {
+                        if fields.len() < def.fields.len()
+                            || (def.kind == CtorKind::Record
+                                && self.layout.phantom(type_name).is_some())
+                        {
                             fields.push("..".to_string());
                         }
                         format!("{prefix} {{ {} }}", fields.join(", "))
@@ -1186,7 +1213,8 @@ impl Generator<'_, '_> {
                             nested.push((index, sub, binder, child_path));
                         }
                         let pattern = self.ctor_pattern(ty, name, &binders);
-                        let single = self.layout.ctors_of(type_name).len() == 1;
+                        let single = self.layout.ctors_of(type_name).len() == 1
+                            && self.layout.phantom(type_name).is_none();
                         if binders.is_empty() && single {
                             // Always matches: nothing to test.
                         } else if binders.is_empty() {

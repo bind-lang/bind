@@ -12,6 +12,9 @@
     clippy::let_and_return,
     clippy::let_unit_value,
     clippy::match_single_binding,
+    // Function types are spelled out in full (`Arc<dyn Fn(Ctx, A) -> BoxFuture<…> + …>`), so a
+    // function returning a function has a long type.
+    clippy::type_complexity,
     // The generated code mirrors the logic of the Bind source; lints about that logic (`x == x`,
     // `if (c) true else false`, identical branches, a `val` bound to a `return`, …) are the Bind
     // programmer's concern.
@@ -113,5 +116,28 @@ pub fn bind_escolhe(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std
                 })
             }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>
         }).await
+    })
+}
+
+pub fn bind_ignora(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        ::std::result::Result::Ok({
+            let v0_x = v0_x.clone();
+            ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v1_y: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+                let v0_x = v0_x.clone();
+                ::std::boxed::Box::pin(async move {
+                    let ctx = ctx.enter()?;
+                    ::std::result::Result::Ok(v0_x.clone())
+                })
+            }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>
+        })
+    })
+}
+
+pub fn bind_usaIgnora(ctx: crate::bind_runtime::Ctx) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        bind_ignora(ctx.clone(), crate::bind_runtime::Int::from_i64(1)).await?(ctx.clone(), crate::bind_runtime::Int::from_i64(2)).await
     })
 }
