@@ -323,6 +323,17 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         };
     };
 
+    let (_typed, type_diagnostics) = crate::types::check(&program, &database);
+    let type_errors = has_errors(&type_diagnostics);
+    diagnostics.extend(type_diagnostics);
+    if type_errors {
+        return CompileResult {
+            application: None,
+            diagnostics,
+            module_count: files.len(),
+        };
+    }
+
     let mut graph = ApplicationGraph::default();
     let type_map: BTreeMap<_, _> = program
         .types
@@ -960,7 +971,9 @@ fn analyze_function(
                     ));
                 }
                 Some(table) => {
-                    if function.declared_return().name != table.model {
+                    if known_return(function)
+                        .is_some_and(|declared| declared.name != table.model)
+                    {
                         diagnostics.push(Diagnostic::error(
                             "E5205",
                             format!("Database operation on `{}` produces `{}`, but function `{}` declares `{}`.", table.name, table.model, function.name, function.declared_return().display()),
@@ -1133,6 +1146,14 @@ fn analyze_function(
     let _ = program;
 }
 
+/// Declared return type as far as the legacy pass can trust it: absent
+/// annotations and types mentioning the function's type parameters are
+/// unknown here (the type checker already verified them).
+fn known_return(function: &Function) -> Option<TypeRef> {
+    let declared = function.return_type.as_ref()?;
+    (!mentions_type_param(declared, &function.type_params)).then(|| declared.clone())
+}
+
 fn validate_return_contract(
     function: &Function,
     locals: &BTreeMap<String, TypeRef>,
@@ -1140,7 +1161,10 @@ fn validate_return_contract(
     database: &DatabaseSchema,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if function.declared_return().name == "Unit" {
+    let Some(declared_return) = known_return(function) else {
+        return;
+    };
+    if declared_return.name == "Unit" {
         return;
     }
     let return_positions: Vec<_> = function
@@ -1160,7 +1184,7 @@ fn validate_return_contract(
             format!(
                 "Function `{}` declares return type `{}` but has no return expression.",
                 function.name,
-                function.declared_return().display()
+                declared_return.display()
             ),
             function.span.clone(),
         ));
@@ -1169,14 +1193,14 @@ fn validate_return_contract(
     for position in expression_positions {
         if let Some(actual) =
             infer_expression(&function.body, position, locals, functions, database)
-            && !compatible(&function.declared_return(), &actual)
+            && !compatible(&declared_return, &actual)
         {
             diagnostics.push(Diagnostic::error(
                 "E2302",
                 format!(
                     "Function `{}` declares `{}` but returns `{}`.",
                     function.name,
-                    function.declared_return().display(),
+                    declared_return.display(),
                     actual.display()
                 ),
                 function.body[position].span.clone(),
@@ -1314,8 +1338,14 @@ fn validate_call_arguments(
         return;
     }
     for ((start, _), parameter) in arguments.into_iter().zip(&callee.parameters) {
+        let Some(declared) = &parameter.type_ref else {
+            continue;
+        };
+        if mentions_type_param(declared, &callee.type_params) {
+            continue;
+        }
         if let Some(actual) = infer_expression(body, start, locals, functions, database)
-            && !compatible(&parameter.declared_type(), &actual)
+            && !compatible(declared, &actual)
         {
             diagnostics.push(Diagnostic::error(
                 "E2202",
@@ -1323,7 +1353,7 @@ fn validate_call_arguments(
                     "Argument `{}` of `{}` expects `{}`, received `{}`.",
                     parameter.name,
                     callee.name,
-                    parameter.declared_type().display(),
+                    declared.display(),
                     actual.display()
                 ),
                 body[start].span.clone(),
@@ -1368,7 +1398,7 @@ fn infer_expression(
         &token.text
     };
     if let Some(function) = functions.get(function_name) {
-        return Some(function.declared_return());
+        return known_return(function);
     }
     if token.text == "db" && body.get(index + 1)?.text == "." {
         let table = database.tables.get(&body.get(index + 2)?.text)?;
@@ -1668,7 +1698,51 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
             "table,model,primary_key,column,type,nullable,required,has_default,engine\n",
         );
         let result = verify(&config, "aws-lambda");
-        assert!(result.diagnostics.iter().any(|item| item.code == "E2202"));
+        assert!(result.diagnostics.iter().any(|item| item.code == "E7101"), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn type_errors_abort_before_the_legacy_analysis() {
+        let (root, config) = fixture("pure fun f(): Int = \"texto\"\n", EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_none());
+        let codes: Vec<_> = result.diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7101"], "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn type_errors_are_ordered_by_file_and_line() {
+        let (root, config) = fixture("pure fun b(): Int = \"x\"\npure fun c(): Int = true\n", EMPTY_SCHEMA);
+        fs::write(root.join("app/zeta.bd"), "pure fun a(): Int = \"y\"\n").unwrap();
+        let result = verify(&config, "aws-lambda");
+        let positions: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|item| (item.span.file.clone(), item.span.line))
+            .collect();
+        assert_eq!(
+            positions,
+            vec![
+                ("app/main.bd".to_string(), 1),
+                ("app/main.bd".to_string(), 2),
+                ("app/zeta.bd".to_string(), 1)
+            ]
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inferred_and_generic_functions_pass_the_legacy_analysis() {
+        let source = "pure fun dobro(x) = x * 2\npure fun <T> ident(x: T): T = x\npure fun usa(): Int = dobro(ident(2))\n";
+        let (root, config) = fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let bad = result
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "E2202" || item.code == "E5205" || item.severity == Severity::Error);
+        assert!(!bad, "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }
 
