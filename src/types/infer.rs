@@ -98,6 +98,13 @@ impl<'a> Checker<'a> {
 
     fn install_environment(&mut self, program: &Program) {
         for declaration in &program.environment {
+            if program.functions.iter().any(|function| function.name == declaration.name) {
+                self.error(
+                    "E7110",
+                    format!("`{}` is declared both as an environment value and as a function.", declaration.name),
+                    &declaration.span,
+                );
+            }
             let base = self.lower_ref(&declaration.type_ref, &declaration.span, &BTreeMap::new(), true);
             let ty = if declaration.optional { Type::option(base) } else { base };
             self.globals.insert(declaration.name.clone(), Scheme::mono(ty));
@@ -566,6 +573,7 @@ impl<'a> Checker<'a> {
     fn infer_call(&mut self, callee: &Expr, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
         if let ExprKind::Name(name) = &callee.kind
             && !self.is_shadowed(name)
+            && !self.env.ctors.contains_key(name)
         {
             if UI_NODES.contains(&name.as_str()) {
                 return self.infer_ui(name, args, children, span);
@@ -685,7 +693,8 @@ impl<'a> Checker<'a> {
             && !self.is_shadowed(base)
         {
             if base == "server" {
-                return match self.globals.get(name).cloned() {
+                let declared = self.function_spans.contains_key(name);
+                return match self.globals.get(name).cloned().filter(|_| declared) {
                     Some(scheme) => instantiate(&mut self.table, &scheme, self.level),
                     None => {
                         self.error("E7103", format!("`server.{name}` does not name a function."), span);
@@ -944,13 +953,18 @@ impl<'a> Checker<'a> {
                 let ty = self.infer(arg);
                 let resolved = self.table.resolve(&ty);
                 if !self.env.is_displayable(&resolved) {
+                    let hint = if matches!(resolved, Type::Var(_)) {
+                        "Annotate the parameter's type, e.g. `label: String`."
+                    } else {
+                        "Display a String, number, Boolean, domain scalar or a distinct type over one of them."
+                    };
                     self.diagnostics.push(
                         Diagnostic::error(
                             "E7105",
                             format!("`Text` cannot display a value of type `{}`.", display(&resolved)),
                             arg.span.clone(),
                         )
-                        .with_hint("Display a String, number, Boolean, domain scalar or a distinct type over one of them."),
+                        .with_hint(hint),
                     );
                 }
             }
@@ -966,7 +980,15 @@ impl<'a> Checker<'a> {
                 Type::Con(type_name, type_args) if type_args.is_empty() && (type_name == "String" || type_name == "Int") => {}
                 other => {
                     let shown = self.shown(&other);
-                    self.error("E7101", format!("UI node arguments must be `String` or `Int`, found `{shown}`."), &arg.span);
+                    let mut diagnostic = Diagnostic::error(
+                        "E7101",
+                        format!("UI node arguments must be `String` or `Int`, found `{shown}`."),
+                        arg.span.clone(),
+                    );
+                    if matches!(other, Type::Var(_)) {
+                        diagnostic = diagnostic.with_hint("Annotate the parameter's type, e.g. `label: String`.");
+                    }
+                    self.diagnostics.push(diagnostic);
                 }
             }
         }
@@ -1525,9 +1547,24 @@ mod tests {
     }
 
     #[test]
+    fn server_only_names_program_functions_and_names_do_not_collide() {
+        assert_eq!(errors("fun f() = server.first"), vec!["E7103"]);
+        let env = "environment development {\n    secret val token: String = env(\"T\", default = \"x\")\n}\n";
+        assert_eq!(errors(&format!("{env}fun f() = server.token")), vec!["E7103"]);
+        assert_eq!(errors(&format!("{env}fun token(): Int = 1")), vec!["E7110"]);
+    }
+
+    #[test]
+    fn unannotated_ui_arguments_get_a_hint() {
+        assert_eq!(errors("client component P(x) {\n    UI { Text(x) }\n}"), vec!["E7003", "E7105"]);
+    }
+
+    #[test]
     fn user_names_shadow_bind_forms() {
         assert_eq!(scheme("fun Text(x: Int): Int = x\nfun f() = Text(1)", "f"), "() -> Int");
         assert_eq!(scheme("data class D(val clientes: Int)\nfun f(db: D) = db.clientes", "f"), "(D) -> Int");
+        assert_eq!(scheme("data class Item(val n: Int)\nfun f() = Item(1)", "f"), "() -> Item");
+        assert_eq!(scheme("data class Link(val u: Url)\nfun f(u: Url) = Link(u)", "f"), "(Url) -> Link");
         assert_eq!(scheme("data class S(val eco: Int)\nfun f(server: S) = server.eco", "f"), "(S) -> Int");
     }
 }
