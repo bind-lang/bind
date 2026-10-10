@@ -9,6 +9,9 @@ pub mod unify;
 #[cfg(test)]
 mod golden;
 
+#[cfg(test)]
+mod props;
+
 use crate::ast::{BodyKind, Domain, Program};
 use crate::diagnostic::Diagnostic;
 use crate::schema::DatabaseSchema;
