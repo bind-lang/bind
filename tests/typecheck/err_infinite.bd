@@ -1,0 +1,2 @@
+// expect: E7107
+fun auto(x) = x(x)

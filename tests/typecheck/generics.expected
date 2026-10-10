@@ -1,0 +1,4 @@
+primeiro : (List<'a>) -> 'a?
+mapear : (List<'a>, ('a) -> 'b) -> List<'b>
+tamanho : (List<String>) -> Int
+usa : () -> Int?

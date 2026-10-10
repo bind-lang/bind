@@ -1,0 +1,3 @@
+// expect: E7301
+fun g(x: Int): Int = x
+fun f(): Boolean = g == g

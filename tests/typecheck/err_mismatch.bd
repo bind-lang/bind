@@ -1,0 +1,5 @@
+// expect: E7101
+distinct type ClienteId = UUID
+distinct type PedidoId = UUID
+fun pedido(id: PedidoId): Unit {}
+fun errado(id: ClienteId): Unit { pedido(id) }

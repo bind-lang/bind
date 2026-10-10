@@ -6,6 +6,9 @@ pub mod infer;
 pub mod ty;
 pub mod unify;
 
+#[cfg(test)]
+mod golden;
+
 use crate::ast::{BodyKind, Domain, Program};
 use crate::diagnostic::Diagnostic;
 use crate::schema::DatabaseSchema;

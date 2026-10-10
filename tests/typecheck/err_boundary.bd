@@ -1,0 +1,2 @@
+// expect: E7003
+server fun buscar(id) = id

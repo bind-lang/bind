@@ -1,0 +1,2 @@
+// expect: E7109
+fun f(x: Double): Int = when (x) { 1.5 -> 1; _ -> 0 }

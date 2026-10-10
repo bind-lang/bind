@@ -1,0 +1,2 @@
+// expect: E7301
+fun f(a: Boolean, b: Boolean) = a + b

@@ -1,0 +1,9 @@
+// expect: ok
+fun ouZero(x: Int?): Int = x ?: 0
+fun descreve(x: Int?): String = when (x) {
+    null -> "nada"
+    n -> "algo"
+}
+data class Cliente(val nome: String, val apelido: String?)
+fun apelidoOuNome(c: Cliente?): String = c?.apelido ?: "anônimo"
+fun metade(x: Int) = x / 2

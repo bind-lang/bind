@@ -1,0 +1,6 @@
+// expect: E7108
+fun dobro(x: Int): Int = x * 2
+fun f(): Int {
+    dobro(1)
+    2
+}

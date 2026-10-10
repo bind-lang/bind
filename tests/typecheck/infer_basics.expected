@@ -1,0 +1,6 @@
+ident : ('a) -> 'a
+constante : ('a, 'b) -> 'a
+compose : (('a) -> 'b, ('c) -> 'a, 'c) -> 'b
+dobro : (Int) -> Int
+aplica : (('a) -> 'b, 'a) -> 'b
+concat : (String, String) -> String

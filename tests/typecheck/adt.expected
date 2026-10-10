@@ -1,0 +1,2 @@
+tamanho : (Arvore<'a>) -> Int
+soma : (Arvore<Int>) -> Int

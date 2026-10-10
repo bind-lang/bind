@@ -1,0 +1,2 @@
+// expect: E7103
+fun f() = naoExiste + 1

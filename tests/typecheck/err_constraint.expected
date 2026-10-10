@@ -1,0 +1,1 @@
+E7301 2:33 `Boolean` does not support `+` (accepted types: Int, Double, Float, Decimal, Money, Duration, String).

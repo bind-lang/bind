@@ -1,0 +1,3 @@
+// expect: E7104
+data class A(val x: Int)
+fun f(a: A): Int = a.y

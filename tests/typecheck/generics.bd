@@ -1,0 +1,5 @@
+// expect: ok
+fun <T> primeiro(xs: List<T>): T? = first(xs)
+fun <A, B> mapear(xs: List<A>, f: (A) -> B): List<B> = map(xs, f)
+fun tamanho(xs: List<String>): Int = length(xs)
+fun usa(): Int? = primeiro(listOf(1, 2, 3))

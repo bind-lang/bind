@@ -1,0 +1,11 @@
+// expect: E7202
+sealed class Pedido {
+    data class Pendente(val itens: Int)
+    data class Pago(val valor: Money)
+    data object Cancelado
+}
+fun rotulo(p: Pedido): String = when (p) {
+    Pendente(_) -> "pendente"
+    _ -> "outro"
+    Cancelado -> "cancelado"
+}

@@ -1,0 +1,22 @@
+// expect: ok
+distinct type ClienteId = UUID
+entity Cliente(val id: ClienteId, val nome: String, val email: Email)
+server fun buscar(id: ClienteId): Cliente effects [db.read] {
+    return db.clientes.require(id)
+}
+server fun talvez(id: ClienteId): Cliente? effects [db.read] = db.clientes.find(id)
+server fun criar(nome: String, email: Email): Cliente effects [db.write] {
+    return db.clientes.insert {
+        nome = nome
+        email = email
+    }
+}
+client component Pagina(id: ClienteId) {
+    val cliente = server.buscar(id)
+    UI {
+        Div("cartao") {
+            Text(cliente.nome)
+            Text(cliente.email)
+        }
+    }
+}

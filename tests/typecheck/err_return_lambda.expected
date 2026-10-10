@@ -1,0 +1,1 @@
+E7111 3:20 `return` is not allowed inside a lambda; the lambda's value is its last expression.

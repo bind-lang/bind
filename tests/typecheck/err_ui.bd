@@ -1,0 +1,4 @@
+// expect: E7105
+client component Tela(itens: List<String>) {
+    UI { Text(itens) }
+}

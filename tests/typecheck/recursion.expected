@@ -1,0 +1,3 @@
+par : (Int) -> Boolean
+impar : (Int) -> Boolean
+fatorial : (Int) -> Int

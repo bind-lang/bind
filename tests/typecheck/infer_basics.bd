@@ -1,0 +1,7 @@
+// expect: ok
+fun ident(x) = x
+fun constante(x, y) = x
+fun compose(f, g, x) = f(g(x))
+fun dobro(x) = x * 2
+fun aplica(f, x) = f(x)
+fun concat(a, b) = a + b + ""

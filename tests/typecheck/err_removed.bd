@@ -1,0 +1,7 @@
+// expect: E7001
+fun a(): Int {
+    var x = 1
+    x
+}
+fun b(x: Int?): Int = x!!
+fun c(nome: String): String = "Olá $nome"

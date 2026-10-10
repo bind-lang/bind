@@ -1,0 +1,15 @@
+// expect: ok
+sealed class Arvore<T> {
+    data class No(val esq: Arvore<T>, val valor: T, val dir: Arvore<T>)
+    data object Folha
+}
+
+fun tamanho(arvore) = when (arvore) {
+    Folha -> 0
+    No(esq, _, dir) -> tamanho(esq) + 1 + tamanho(dir)
+}
+
+fun soma(arvore: Arvore<Int>): Int = when (arvore) {
+    Folha -> 0
+    No(esq, valor, dir) -> soma(esq) + valor + soma(dir)
+}

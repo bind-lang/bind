@@ -1,0 +1,2 @@
+// expect: E7101
+fun metade(x: Int): Int = x / 2

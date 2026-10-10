@@ -1,0 +1,2 @@
+// expect: E7005
+fun f(x: Boolean): Int = if (x) 1

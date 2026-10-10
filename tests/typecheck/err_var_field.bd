@@ -1,0 +1,2 @@
+// expect: E7002
+data class Conta(var saldo: Int)

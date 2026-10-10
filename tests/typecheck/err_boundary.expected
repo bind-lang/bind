@@ -1,0 +1,2 @@
+E7003 2:1 Server function `buscar` must declare the type of parameter `id`.
+E7003 2:1 Server function `buscar` must declare its return type.

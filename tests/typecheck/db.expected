@@ -1,0 +1,4 @@
+buscar : (ClienteId) -> Cliente
+talvez : (ClienteId) -> Cliente?
+criar : (String, Email) -> Cliente
+Pagina : (ClienteId) -> Ui

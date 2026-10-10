@@ -1,0 +1,5 @@
+// expect: E7111
+fun f(): Int {
+    val g = { x -> return x }
+    g(1)
+}

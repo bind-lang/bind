@@ -1,0 +1,3 @@
+// expect: E7102
+fun soma2(a: Int, b: Int): Int = a + b
+fun usa(): Int = soma2(1)

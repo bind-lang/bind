@@ -1,0 +1,4 @@
+// expect: ok
+fun par(n) = if (n == 0) true else impar(n - 1)
+fun impar(n) = if (n == 0) false else par(n - 1)
+fun fatorial(n) = if (n <= 1) 1 else n * fatorial(n - 1)

@@ -1,0 +1,4 @@
+ouZero : (Int?) -> Int
+descreve : (Int?) -> String
+apelidoOuNome : (Cliente?) -> String
+metade : (Int) -> Int?
