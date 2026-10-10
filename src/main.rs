@@ -9,6 +9,7 @@ mod parser;
 mod pipeline;
 mod schema;
 mod syntax;
+mod types;
 
 fn main() {
     if let Err(error) = cli::run(std::env::args().skip(1).collect()) {
