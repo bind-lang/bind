@@ -944,7 +944,17 @@ impl<'a> Checker<'a> {
         }
         let key = match definition.columns.get(&definition.primary_key) {
             Some(column) => self.column_type(column, span),
-            None => Type::Error,
+            None => {
+                self.error(
+                    "E7104",
+                    format!(
+                        "Primary-key column `{}` is missing from table `{table}` in the database schema.",
+                        definition.primary_key
+                    ),
+                    span,
+                );
+                Type::Error
+            }
         };
         Some((key, Type::con(&definition.model)))
     }
@@ -1689,6 +1699,21 @@ mod tests {
         assert_eq!(with_db("server fun f(n: String): Cliente = db.clientes.insert { idade = n }"), Err(vec!["E7104".into()]));
         assert_eq!(with_db("server fun f(id: ClienteId): Cliente = db.clientes.delete(id)"), Err(vec!["E7004".into()]));
         assert_eq!(with_db("fun f(c: Cliente) = c.nome { x = 1 }"), Err(vec!["E7004".into()]));
+    }
+
+    #[test]
+    fn missing_primary_key_column_is_reported() {
+        let csv = "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Cliente,uid,id,ClienteId,false,true,true,postgresql\ncustomers,Cliente,uid,nome,String,false,true,false,postgresql\n";
+        let source = format!("{ENTIDADE}server fun f(id: ClienteId): Cliente = db.customers.require(id)");
+        assert_eq!(infer_with_schema(&source, &schema(csv)), Err(vec!["E7104".into()]));
+        let (tokens, _) = crate::lexer::lex("t.bd", &source);
+        let (program, _) = crate::parser::parse(tokens);
+        let (_, diagnostics) = crate::types::check(&program, &schema(csv));
+        let messages: Vec<&str> = diagnostics.iter().map(|item| item.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["Primary-key column `uid` is missing from table `customers` in the database schema."]
+        );
     }
 
     #[test]
