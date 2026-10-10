@@ -186,11 +186,14 @@ impl<'a> Checker<'a> {
             types.push(ty);
             scopes.push(scope);
         }
-        for ((function, ty), scope) in group.iter().zip(&types).zip(scopes) {
-            self.rigid = scope;
+        for ((function, ty), scope) in group.iter().zip(&types).zip(&scopes) {
+            self.rigid = scope.clone();
             self.check_body(function, ty);
         }
         self.rigid.clear();
+        for (function, scope) in group.iter().zip(&scopes) {
+            self.check_declared_generics(function, scope);
+        }
         for function in group {
             self.report_ambiguous(&function.name);
         }
@@ -199,6 +202,34 @@ impl<'a> Checker<'a> {
             let (scheme, ambiguous) = generalize(&self.table, self.level, ty);
             self.report_constraints(ambiguous, &function.span);
             self.globals.insert(function.name.clone(), scheme);
+        }
+    }
+
+    /// Declared type parameters of a partially annotated function are flexible during
+    /// inference, but the body must not specialize them or make two of them equal.
+    fn check_declared_generics(&mut self, function: &Function, scope: &BTreeMap<String, Type>) {
+        let mut seen: BTreeMap<TypeVarId, &str> = BTreeMap::new();
+        for name in &function.type_params {
+            let Some(var) = scope.get(name) else { continue };
+            let requirement = match self.table.shallow(var) {
+                Type::Error => continue,
+                Type::Var(id) => match seen.get(&id) {
+                    Some(other) => format!("it to equal `{other}`"),
+                    None => {
+                        seen.insert(id, name);
+                        continue;
+                    }
+                },
+                other => format!("`{}`", self.shown(&other)),
+            };
+            self.error(
+                "E7101",
+                format!(
+                    "Type parameter `{name}` of `{}` is declared generic, but the body requires {requirement}.",
+                    function.name
+                ),
+                &function.span,
+            );
         }
     }
 
@@ -215,6 +246,16 @@ impl<'a> Checker<'a> {
 
     fn check_body(&mut self, function: &Function, ty: &Type) {
         let Type::Fun(params, result) = ty else { return };
+        let mut names = BTreeSet::new();
+        for parameter in &function.parameters {
+            if !names.insert(parameter.name.as_str()) {
+                self.error(
+                    "E7113",
+                    format!("`{}` is declared more than once in the parameters of `{}`.", parameter.name, function.name),
+                    &function.span,
+                );
+            }
+        }
         let Some(block) = &function.expr else { return };
         self.function = function.name.clone();
         self.return_type = Some((**result).clone());
@@ -425,7 +466,12 @@ impl<'a> Checker<'a> {
             ExprKind::SafeField { target, name } => {
                 let receiver = self.infer(target);
                 let inner = self.fresh();
+                let reported = self.diagnostics.len();
                 self.unify_at(&Type::option(inner.clone()), &receiver, &target.span, Some("the receiver of `?.`".into()));
+                if self.diagnostics.len() > reported {
+                    self.record(expr.id, &Type::Error, &expr.span);
+                    return Type::Error;
+                }
                 let field = self.field_of(&inner, name, &expr.span);
                 match self.table.shallow(&field) {
                     Type::Con(option, _) if option == "Option" => field,
@@ -460,24 +506,7 @@ impl<'a> Checker<'a> {
                 then_ty
             }
             ExprKind::When { scrutinee, arms } => self.infer_when(scrutinee, arms, &expr.span),
-            ExprKind::Lambda { params, body } => {
-                let mark = self.locals.len();
-                let mut names = BTreeSet::new();
-                let mut param_types = Vec::new();
-                for (name, span) in params {
-                    if !names.insert(name.as_str()) {
-                        self.error("E7113", format!("`{name}` is bound more than once in this lambda."), span);
-                    }
-                    let ty = self.fresh();
-                    param_types.push(ty.clone());
-                    self.locals.push((name.clone(), Scheme::mono(ty)));
-                }
-                self.lambda_depth += 1;
-                let result = self.infer_block(body);
-                self.lambda_depth -= 1;
-                self.locals.truncate(mark);
-                Type::Fun(param_types, Box::new(result))
-            }
+            ExprKind::Lambda { params, body } => self.infer_lambda(params, body, None),
             ExprKind::Block(block) => self.infer_block(block),
             ExprKind::Return(value) => {
                 let found = self.infer(value);
@@ -529,21 +558,27 @@ impl<'a> Checker<'a> {
             self.error("E7004", "Only UI nodes accept a child block.", &block.span);
         }
         let callee_ty = self.infer(callee);
+        let shallow = self.table.shallow(&callee_ty);
+        // Arguments are checked left to right against the parameters, so a lambda argument
+        // sees the parameter types fixed by the arguments before it (as in `map(xs, { p -> p.x })`).
+        if let Type::Fun(params, result) = &shallow
+            && params.len() == args.len()
+        {
+            let reason = self.parameter_reason(callee);
+            for (param, arg) in params.iter().zip(args) {
+                let arg_ty = self.infer_argument(arg, param);
+                self.unify_at(param, &arg_ty, &arg.span, reason.clone());
+            }
+            return (**result).clone();
+        }
         let arg_types: Vec<Type> = args.iter().map(|arg| self.infer(arg)).collect();
-        match self.table.shallow(&callee_ty) {
+        match shallow {
             Type::Fun(params, result) => {
-                if params.len() != args.len() {
-                    self.error(
-                        "E7102",
-                        format!("This function expects {} argument(s), but {} were given.", params.len(), args.len()),
-                        span,
-                    );
-                    return *result;
-                }
-                let reason = self.parameter_reason(callee);
-                for ((param, arg_ty), arg) in params.iter().zip(&arg_types).zip(args) {
-                    self.unify_at(param, arg_ty, &arg.span, reason.clone());
-                }
+                self.error(
+                    "E7102",
+                    format!("This function expects {} argument(s), but {} were given.", params.len(), args.len()),
+                    span,
+                );
                 *result
             }
             Type::Error => Type::Error,
@@ -559,6 +594,42 @@ impl<'a> Checker<'a> {
                 Type::Error
             }
         }
+    }
+
+    /// A lambda passed where a function of the same arity is expected takes its parameter
+    /// types from that function; any other argument is inferred on its own.
+    fn infer_argument(&mut self, arg: &Expr, expected: &Type) -> Type {
+        if let ExprKind::Lambda { params, body } = &arg.kind
+            && let Type::Fun(seed, _) = self.table.shallow(expected)
+            && seed.len() == params.len()
+        {
+            let ty = self.infer_lambda(params, body, Some(&seed));
+            self.record(arg.id, &ty, &arg.span);
+            return ty;
+        }
+        self.infer(arg)
+    }
+
+    fn infer_lambda(&mut self, params: &[(String, Span)], body: &Block, seed: Option<&[Type]>) -> Type {
+        let mark = self.locals.len();
+        let mut names = BTreeSet::new();
+        let mut param_types = Vec::new();
+        for (index, (name, span)) in params.iter().enumerate() {
+            if !names.insert(name.as_str()) {
+                self.error("E7113", format!("`{name}` is bound more than once in this lambda."), span);
+            }
+            let ty = match seed.and_then(|types| types.get(index)) {
+                Some(ty) => ty.clone(),
+                None => self.fresh(),
+            };
+            param_types.push(ty.clone());
+            self.locals.push((name.clone(), Scheme::mono(ty)));
+        }
+        self.lambda_depth += 1;
+        let result = self.infer_block(body);
+        self.lambda_depth -= 1;
+        self.locals.truncate(mark);
+        Type::Fun(param_types, Box::new(result))
     }
 
     fn parameter_reason(&self, callee: &Expr) -> Option<String> {
@@ -809,6 +880,10 @@ impl<'a> Checker<'a> {
                     let (_, result) = self.env.instantiate_ctor(name, &mut self.table, self.level);
                     self.unify_at(ty, &result, span, None);
                     return Pat::Ctor(name.clone(), Vec::new());
+                }
+                if name.chars().next().is_some_and(char::is_uppercase) {
+                    self.error("E7103", format!("Unknown constructor `{name}`."), span);
+                    return Pat::Wild;
                 }
                 if !bound.insert(name.clone()) {
                     self.error("E7113", format!("`{name}` is bound more than once in this pattern."), span);
@@ -1135,6 +1210,39 @@ mod tests {
         assert_eq!(errors("fun f() = nada"), vec!["E7103"]);
         assert_eq!(errors("fun f(x: Nada) = x"), vec!["E7103"]);
         assert_eq!(errors("fun f() = naoExiste.campo + 1"), vec!["E7103"]);
+    }
+
+    #[test]
+    fn declared_type_parameters_stay_generic_in_inferred_functions() {
+        assert_eq!(scheme("fun <T> ident(x: T) = x", "ident"), "('a) -> 'a");
+        assert_eq!(errors("fun <T> f(x: T) = x + 1"), vec!["E7101"]);
+        assert_eq!(errors("fun <A, B> f(x: A, y: B) = if (true) x else y"), vec!["E7101"]);
+    }
+
+    #[test]
+    fn duplicate_parameters_are_errors() {
+        assert_eq!(errors("fun f(x, x) = x"), vec!["E7113"]);
+    }
+
+    #[test]
+    fn lambda_arguments_see_the_expected_parameter_types() {
+        let records = "data class A(val valor: Int)\ndata class B(val valor: Int)\n";
+        let mapped = format!("{records}fun f(xs: List<A>): List<Int> = map(xs, {{ p -> p.valor }})");
+        assert_eq!(scheme(&mapped, "f"), "(List<A>) -> List<Int>");
+        let folded = "fun f(xs: List<Double>): Double = fold(xs, 1.0, { acc, x -> acc / x })";
+        assert_eq!(scheme(folded, "f"), "(List<Double>) -> Double");
+    }
+
+    #[test]
+    fn unknown_uppercase_pattern_names_are_not_bindings() {
+        let sealed = "sealed class P {\n    data object Um\n    data object Dois\n}\n";
+        assert_eq!(errors(&format!("{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; Doiss -> 2 }}")), vec!["E7103"]);
+        assert_eq!(scheme(&format!("{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; outro -> 2 }}"), "f"), "(P) -> Int");
+    }
+
+    #[test]
+    fn safe_field_on_non_nullable_does_not_cascade() {
+        assert_eq!(errors("fun f(p: Int) = p?.x"), vec!["E7101"]);
     }
 
     #[test]
