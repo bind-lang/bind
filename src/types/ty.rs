@@ -349,9 +349,72 @@ pub fn display(ty: &Type) -> String {
 }
 
 /// Renders several types with shared variable names (for "expected X, found Y").
+///
+/// A row variable that occurs exactly once, in a positive position (a function's own row or
+/// the row of a returned function), stands for "whatever further effects" and constrains
+/// nothing visible, so it is not shown: `(Int) -> Int`, not `(Int) -> Int ! 'e`. A row
+/// variable in a parameter position is always shown.
 pub fn display_all(types: &[&Type]) -> Vec<String> {
+    let mut occurrences = BTreeMap::new();
+    for ty in types {
+        row_occurrences(ty, true, &mut occurrences);
+    }
+    let hidden: BTreeSet<RowVarId> = occurrences
+        .into_iter()
+        .filter(|(_, (count, positive))| *count == 1 && *positive)
+        .map(|(tail, _)| tail)
+        .collect();
     let mut names = Names::default();
-    types.iter().map(|ty| render(ty, &mut names)).collect()
+    types
+        .iter()
+        .map(|ty| render(&without_tails(ty, &hidden), &mut names))
+        .collect()
+}
+
+fn without_tails(ty: &Type, hidden: &BTreeSet<RowVarId>) -> Type {
+    match ty {
+        Type::Fun(params, result, row) => {
+            let mut row = row.clone();
+            if row.tail.is_some_and(|tail| hidden.contains(&tail)) {
+                row.tail = None;
+            }
+            Type::Fun(
+                params
+                    .iter()
+                    .map(|param| without_tails(param, hidden))
+                    .collect(),
+                Box::new(without_tails(result, hidden)),
+                row,
+            )
+        }
+        Type::Con(name, args) => Type::Con(
+            name.clone(),
+            args.iter().map(|arg| without_tails(arg, hidden)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Counts row-variable occurrences and whether all of them are in positive positions
+/// (function results flip nothing; parameters flip polarity; type arguments count as negative).
+pub fn row_occurrences(ty: &Type, positive: bool, output: &mut BTreeMap<RowVarId, (usize, bool)>) {
+    match ty {
+        Type::Fun(params, result, row) => {
+            params
+                .iter()
+                .for_each(|param| row_occurrences(param, !positive, output));
+            row_occurrences(result, positive, output);
+            if let Some(tail) = row.tail {
+                let entry = output.entry(tail).or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= positive;
+            }
+        }
+        Type::Con(_, args) => args
+            .iter()
+            .for_each(|arg| row_occurrences(arg, false, output)),
+        Type::Var(_) | Type::Error => {}
+    }
 }
 
 #[derive(Default)]

@@ -513,7 +513,19 @@ mod tests {
             Box::new(int()),
             Row::with_tail([read(), write()], e),
         );
-        assert_eq!(display(&both), "() -> Int ! {db.read, db.write | 'e}");
+        // A lone tail in a positive position constrains nothing visible and is hidden; a tail
+        // shared with a parameter is shown.
+        assert_eq!(display(&both), "() -> Int ! {db.read, db.write}");
+        let callback = Type::Fun(vec![], Box::new(int()), Row::with_tail([], e));
+        let shared = Type::Fun(
+            vec![callback],
+            Box::new(int()),
+            Row::with_tail([read(), write()], e),
+        );
+        assert_eq!(
+            display(&shared),
+            "(() -> Int ! 'e) -> Int ! {db.read, db.write | 'e}"
+        );
         let vars: Vec<Type> = (0..5).map(Type::Var).collect();
         let five = Type::Fun(vars, Box::new(int()), Row::empty());
         assert_eq!(display(&five), "('a, 'b, 'c, 'd, 'f) -> Int");

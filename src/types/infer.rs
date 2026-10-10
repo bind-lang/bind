@@ -343,12 +343,21 @@ impl<'a> Checker<'a> {
             scopes.push(scope);
             effect_scopes.push(effects);
         }
+        // Declared effects are compared only after every body of the group is checked: the
+        // members share rows through their calls, and closing one member's row earlier would
+        // reject a sibling whose effects are not inferred yet.
+        let mut produced = Vec::new();
         for (((function, ty), scope), effects) in
             group.iter().zip(&types).zip(&scopes).zip(effect_scopes)
         {
             self.rigid = scope.clone();
             self.effect_scope = effects;
-            self.check_body(function, ty);
+            produced.push(self.check_body(function, ty));
+        }
+        for ((function, ty), context) in group.iter().zip(&types).zip(produced) {
+            if let (Some(context), Type::Fun(_, _, declared)) = (context, ty) {
+                self.check_declared_effects(function, declared, &context);
+            }
         }
         self.rigid.clear();
         for (function, scope) in group.iter().zip(&scopes) {
@@ -359,7 +368,7 @@ impl<'a> Checker<'a> {
         }
         self.level -= 1;
         for ty in &types {
-            self.close_positive_rows(ty);
+            self.close_top_row(ty);
         }
         for (function, ty) in group.iter().zip(&types) {
             let (scheme, ambiguous) = generalize(&self.table, self.level, ty);
@@ -431,15 +440,19 @@ impl<'a> Checker<'a> {
             .collect();
         let ty = self.signature(function, &rigid, &effects, false);
         self.effect_scope = effects;
-        self.check_body(function, &ty);
+        if let (Some(context), Type::Fun(_, _, declared)) = (self.check_body(function, &ty), &ty) {
+            self.check_declared_effects(function, declared, &context);
+        }
         self.report_ambiguous(&function.name);
         self.rigid.clear();
         self.level -= 1;
     }
 
-    fn check_body(&mut self, function: &Function, ty: &Type) {
+    /// Checks a body. For a function whose effects are declared, returns the row the body
+    /// produced, to be compared with the declaration by the caller.
+    fn check_body(&mut self, function: &Function, ty: &Type) -> Option<Row> {
         let Type::Fun(params, result, row) = ty else {
-            return;
+            return None;
         };
         let mut names = BTreeSet::new();
         for parameter in &function.parameters {
@@ -454,7 +467,7 @@ impl<'a> Checker<'a> {
                 );
             }
         }
-        let Some(block) = &function.expr else { return };
+        let block = function.expr.as_ref()?;
         self.function = function.name.clone();
         self.return_type = Some((**result).clone());
         self.locals.clear();
@@ -475,13 +488,11 @@ impl<'a> Checker<'a> {
             format!("the declared result of `{}`", function.name)
         };
         self.unify_at(result, &body, &result_span(block), Some(reason));
-        if declared {
-            self.check_declared_effects(function, row);
-        }
         self.locals.clear();
         self.return_type = None;
-        self.context = Row::empty();
+        let context = std::mem::replace(&mut self.context, Row::empty());
         self.effect_scope.clear();
+        declared.then_some(context)
     }
 
     fn finish(&self, program: &Program) -> TypedProgram {
@@ -572,7 +583,7 @@ impl<'a> Checker<'a> {
     fn effect_error(&mut self, error: UnifyError, span: &Span) {
         let message = match error {
             UnifyError::Ceiling { label, .. } => format!("This code cannot perform `{label}`."),
-            other => format!("Effect mismatch: {other:?}."),
+            _ => format!("The effects of `{}` are inconsistent here.", self.function),
         };
         self.error("E7401", message, span);
     }
@@ -591,29 +602,30 @@ impl<'a> Checker<'a> {
         Type::Fun(params, result, Row::with_tail(row.labels, tail))
     }
 
-    /// Before generalization, a row variable that occurs exactly once, in a positive position
-    /// (the function's own row, or the row of a function it returns), stands for nothing more:
-    /// close it, so schemes read `! {db.read}` instead of `! {db.read | 'e}`. Variables that
-    /// occur in parameters or inside type arguments are left open (closing them would make the
-    /// function less general).
-    fn close_positive_rows(&mut self, ty: &Type) {
+    /// Before generalization, a row variable that occurs only in the function's own row stands
+    /// for nothing more: close it, so schemes read `! {db.read}` instead of `! {db.read | 'e}`.
+    /// Rows of returned functions stay open (a caller may still join them with other effects,
+    /// e.g. two branches returning different closures); the display hides them when they are
+    /// unconstrained. Variables in parameters are never closed (that would lose generality).
+    fn close_top_row(&mut self, ty: &Type) {
         let resolved = self.table.resolve(ty);
+        let Type::Fun(_, _, row) = &resolved else {
+            return;
+        };
         let mut occurrences: BTreeMap<RowVarId, (usize, bool)> = BTreeMap::new();
         row_occurrences(&resolved, true, &mut occurrences);
-        for (tail, (count, positive)) in occurrences {
-            if count == 1
-                && positive
-                && let RowState::Unbound { level, .. } = self.table.row_state(tail).clone()
-                && level > self.level
-            {
-                self.table.set_row(tail, RowState::Link(Row::empty()));
-            }
+        if let Some(tail) = row.tail
+            && occurrences.get(&tail).is_some_and(|(count, _)| *count == 1)
+            && let RowState::Unbound { level, .. } = self.table.row_state(tail).clone()
+            && level > self.level
+        {
+            self.table.set_row(tail, RowState::Link(Row::empty()));
         }
     }
 
     /// `effects [...]` must equal what the body performs.
-    fn check_declared_effects(&mut self, function: &Function, declared: &Row) {
-        let produced = self.table.resolve_row(&self.context);
+    fn check_declared_effects(&mut self, function: &Function, declared: &Row, produced: &Row) {
+        let produced = self.table.resolve_row(produced);
         let declared = self.table.resolve_row(declared);
         let listed: Vec<String> = declared.labels.iter().map(Label::to_string).collect();
         for label in produced.labels.difference(&declared.labels) {
@@ -736,7 +748,7 @@ impl<'a> Checker<'a> {
     }
 
     fn shown(&self, ty: &Type) -> String {
-        shown(&[&self.table.resolve(ty)]).remove(0)
+        display(&self.table.resolve(ty))
     }
 
     fn is_local(&self, name: &str) -> bool {
@@ -769,7 +781,7 @@ impl<'a> Checker<'a> {
                 span.clone(),
             ),
             UnifyError::Infinite { var, ty } => {
-                let names = shown(&[&Type::Var(var), &ty]);
+                let names = display_all(&[&Type::Var(var), &ty]);
                 Diagnostic::error(
                     "E7107",
                     format!(
@@ -800,7 +812,7 @@ impl<'a> Checker<'a> {
             "E7301",
             format!(
                 "`{}` does not support {}.",
-                shown(&[ty]).remove(0),
+                display(ty),
                 constraint.describe()
             ),
             span.clone(),
@@ -1220,8 +1232,15 @@ impl<'a> Checker<'a> {
                 let declared = self.function_spans.contains_key(name);
                 return match self.globals.get(name).cloned().filter(|_| declared) {
                     Some(scheme) => match instantiate(&mut self.table, &scheme, self.level) {
+                        // Open, like any instantiated function, so it fits where more
+                        // effects are allowed.
                         Type::Fun(params, result, _) => {
-                            Type::Fun(params, result, Row::closed([Label::of(SERVER_CALL)]))
+                            let tail = self.table.fresh_row_var(self.level, None);
+                            Type::Fun(
+                                params,
+                                result,
+                                Row::with_tail([Label::of(SERVER_CALL)], tail),
+                            )
                         }
                         other => other,
                     },
@@ -1578,7 +1597,7 @@ impl<'a> Checker<'a> {
                             "E7105",
                             format!(
                                 "`Text` cannot display a value of type `{}`.",
-                                shown(&[&resolved]).remove(0)
+                                display(&resolved)
                             ),
                             arg.span.clone(),
                         )
@@ -1911,7 +1930,7 @@ fn mismatch_error(
     span: &Span,
     reason: Option<String>,
 ) -> Diagnostic {
-    let names = shown(&[expected, found]);
+    let names = display_all(&[expected, found]);
     let diagnostic = Diagnostic::error(
         "E7101",
         format!(
@@ -1950,70 +1969,6 @@ fn builtin(
         vars: ids,
         row_vars: row_vars.clone(),
         ty: build(&vars, &row_vars),
-    }
-}
-
-/// Counts row-variable occurrences and whether all of them are in positive positions
-/// (function results flip nothing; parameters flip polarity; type arguments count as negative).
-fn row_occurrences(ty: &Type, positive: bool, output: &mut BTreeMap<RowVarId, (usize, bool)>) {
-    match ty {
-        Type::Fun(params, result, row) => {
-            params
-                .iter()
-                .for_each(|param| row_occurrences(param, !positive, output));
-            row_occurrences(result, positive, output);
-            if let Some(tail) = row.tail {
-                let entry = output.entry(tail).or_insert((0, true));
-                entry.0 += 1;
-                entry.1 &= positive;
-            }
-        }
-        Type::Con(_, args) => args
-            .iter()
-            .for_each(|arg| row_occurrences(arg, false, output)),
-        Type::Var(_) | Type::Error => {}
-    }
-}
-
-/// Resolved types as diagnostics show them. A row variable that occurs only once among them
-/// stands for "whatever further effects" (typically the tail added when a function is
-/// instantiated) and constrains nothing visible, so it is left out: `(Int) -> Int`, not
-/// `(Int) -> Int ! 'e`.
-fn shown(types: &[&Type]) -> Vec<String> {
-    let mut occurrences = BTreeMap::new();
-    for ty in types {
-        row_occurrences(ty, true, &mut occurrences);
-    }
-    let lone: BTreeSet<RowVarId> = occurrences
-        .into_iter()
-        .filter(|(_, (count, _))| *count == 1)
-        .map(|(tail, _)| tail)
-        .collect();
-    let stripped: Vec<Type> = types.iter().map(|ty| without_tails(ty, &lone)).collect();
-    display_all(&stripped.iter().collect::<Vec<_>>())
-}
-
-fn without_tails(ty: &Type, lone: &BTreeSet<RowVarId>) -> Type {
-    match ty {
-        Type::Fun(params, result, row) => {
-            let mut row = row.clone();
-            if row.tail.is_some_and(|tail| lone.contains(&tail)) {
-                row.tail = None;
-            }
-            Type::Fun(
-                params
-                    .iter()
-                    .map(|param| without_tails(param, lone))
-                    .collect(),
-                Box::new(without_tails(result, lone)),
-                row,
-            )
-        }
-        Type::Con(name, args) => Type::Con(
-            name.clone(),
-            args.iter().map(|arg| without_tails(arg, lone)).collect(),
-        ),
-        other => other.clone(),
     }
 }
 
@@ -3096,6 +3051,57 @@ mod tests {
         assert_eq!(
             scheme_in(&schemes, "b"),
             "(Int, ClienteId) -> Int ! {db.read}"
+        );
+    }
+
+    #[test]
+    fn mixed_groups_check_declared_effects_after_all_bodies() {
+        let a = "fun a(n: Int, id: ClienteId): Int = if (n == 0) length(listOf(db.clientes.require(id))) else b(n - 1, id)\n";
+        let b = "fun b(n: Int, id: ClienteId) effects [db.read] = a(n, id)\n";
+        for source in [format!("{b}{a}"), format!("{a}{b}")] {
+            let schemes = db_schemes(&source);
+            assert_eq!(
+                scheme_in(&schemes, "a"),
+                "(Int, ClienteId) -> Int ! {db.read}"
+            );
+            assert_eq!(
+                scheme_in(&schemes, "b"),
+                "(Int, ClienteId) -> Int ! {db.read}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_of_returned_functions_stay_open() {
+        let schemes = db_schemes(
+            "fun gravar(nome: String) = db.clientes.insert { nome = nome }\nfun criar(id: ClienteId) = { -> db.clientes.require(id) }\nfun outro() = { -> gravar(\"x\") }\nfun pick(c: Boolean, id: ClienteId) = if (c) criar(id) else outro()\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "criar"),
+            "(ClienteId) -> (() -> Cliente ! {db.read})"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "pick"),
+            "(Boolean, ClienteId) -> (() -> Cliente ! {db.read, db.write})"
+        );
+    }
+
+    #[test]
+    fn row_variables_in_parameters_are_displayed() {
+        assert_eq!(
+            scheme("fun k(f: () -> Int ! [e]) = 1", "k"),
+            "(() -> Int ! 'e) -> Int"
+        );
+    }
+
+    #[test]
+    fn server_functions_as_values_can_gain_effects() {
+        let schemes = db_schemes(
+            "server fun buscar(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)\nfun h(f: (ClienteId) -> Cliente ! [server.call, db.read], id: ClienteId) = f(id)\nclient fun t(id: ClienteId) = h(server.buscar, id).nome\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "t"),
+            "(ClienteId) -> String ! {db.read, server.call}"
         );
     }
 }
