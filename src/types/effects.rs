@@ -46,6 +46,11 @@ impl Label {
         self.resource.starts_with('\'')
     }
 
+    /// The name of a rigid effect variable (`e` for the label made by `rigid("e")`).
+    pub fn rigid_name(&self) -> Option<&str> {
+        self.resource.strip_prefix('\'')
+    }
+
     /// `resource.operation` with exactly one dot.
     pub fn parse(text: &str) -> Option<Label> {
         let (resource, operation) = text.split_once('.')?;

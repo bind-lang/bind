@@ -385,15 +385,28 @@ impl<'a> Checker<'a> {
         let mut types = Vec::new();
         let mut scopes = Vec::new();
         let mut effect_scopes = Vec::new();
+        let mut rigid_names = BTreeSet::new();
         for function in group {
             let mut scope = BTreeMap::new();
             for name in &function.type_params {
                 scope.insert(name.clone(), self.fresh());
             }
-            // Effect variables of an inferred function are flexible, like its type parameters.
+            // Effect variables are flexible, like type parameters, unless the function's effects
+            // are declared: then, as in annotated bodies, each one only equals itself inside the
+            // body (so the body cannot add concrete labels to it), and it is released into a
+            // generic row variable once the group is checked.
+            let rigid = effects_known(function);
             let effects: BTreeMap<String, Row> = effect_variable_names(function)
                 .into_iter()
-                .map(|name| (name, self.table.fresh_row(self.level)))
+                .map(|name| {
+                    let row = if rigid {
+                        rigid_names.insert(name.clone());
+                        Row::closed([Label::rigid(&name)])
+                    } else {
+                        self.table.fresh_row(self.level)
+                    };
+                    (name, row)
+                })
                 .collect();
             let ty = self.signature(function, &scope, &effects, true);
             self.globals
@@ -425,6 +438,18 @@ impl<'a> Checker<'a> {
         for function in group {
             self.report_ambiguous(&function.name);
         }
+        let generic: BTreeMap<String, RowVarId> = rigid_names
+            .into_iter()
+            .map(|name| (name, self.table.fresh_row_var(self.level)))
+            .collect();
+        let types: Vec<Type> = if generic.is_empty() {
+            types
+        } else {
+            types
+                .iter()
+                .map(|ty| self.release_rigid(ty, &generic))
+                .collect()
+        };
         self.level -= 1;
         for ty in &types {
             self.close_top_row(ty);
@@ -434,6 +459,60 @@ impl<'a> Checker<'a> {
             self.report_constraints(ambiguous, &function.span);
             self.globals.insert(function.name.clone(), scheme);
         }
+    }
+
+    /// Replaces each rigid effect variable of a checked group by its generic row variable, so
+    /// the published scheme is polymorphic in it. A row that ends up naming several variables
+    /// (or a variable and another tail) joins them, which is less general but sound.
+    fn release_rigid(&mut self, ty: &Type, generic: &BTreeMap<String, RowVarId>) -> Type {
+        match self.table.resolve(ty) {
+            Type::Fun(params, result, row) => {
+                let params = params
+                    .iter()
+                    .map(|param| self.release_rigid(param, generic))
+                    .collect();
+                let result = self.release_rigid(&result, generic);
+                let row = self.release_row(&row, generic);
+                Type::Fun(params, Box::new(result), row)
+            }
+            Type::Con(name, args) => Type::Con(
+                name,
+                args.iter()
+                    .map(|arg| self.release_rigid(arg, generic))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    fn release_row(&mut self, row: &Row, generic: &BTreeMap<String, RowVarId>) -> Row {
+        let row = self.table.resolve_row(row);
+        let mut labels = BTreeSet::new();
+        let mut tails = Vec::new();
+        for label in row.labels {
+            match label.rigid_name().and_then(|name| generic.get(name)) {
+                Some(var) => tails.push(*var),
+                None => {
+                    labels.insert(label);
+                }
+            }
+        }
+        let Some(&first) = tails.first() else {
+            return Row {
+                labels,
+                tail: row.tail,
+            };
+        };
+        tails.extend(row.tail);
+        for other in &tails[1..] {
+            // Two open rows without labels always unify.
+            let _ = unify_rows(
+                &mut self.table,
+                &Row::with_tail([], first),
+                &Row::with_tail([], *other),
+            );
+        }
+        self.table.resolve_row(&Row::with_tail(labels, first))
     }
 
     /// Declared type parameters of a partially annotated function are flexible during
@@ -3621,5 +3700,43 @@ mod tests {
             endpoint.hint.as_deref(),
             Some("Call it through `server.x(...)`.")
         );
+    }
+
+    #[test]
+    fn declared_effect_variables_are_enforced_without_a_full_signature() {
+        let reads = "fun ap(id: ClienteId, f: () -> Int ! [e]) effects [e] = f() + length(listOf(db.clientes.require(id).nome))\n";
+        let diagnostics = db_diagnostics(reads);
+        let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7402"], "{diagnostics:?}");
+        assert_eq!(diagnostics[0].path.len(), 2, "{:?}", diagnostics[0].path);
+        assert!(
+            diagnostics[0].path[1].starts_with("db.clientes.require ("),
+            "{:?}",
+            diagnostics[0].path
+        );
+        assert_eq!(
+            db_errors("fun ap(x: Int, f: () -> Int ! [e]) effects [e] = x\n"),
+            vec!["E7403"]
+        );
+        // The fully annotated versions behave the same.
+        assert_eq!(
+            db_errors(
+                "fun ap(id: ClienteId, f: () -> Int ! [e]): Int effects [e] = f() + length(listOf(db.clientes.require(id).nome))\n"
+            ),
+            vec!["E7402"]
+        );
+        assert_eq!(
+            db_errors("fun ap(x: Int, f: () -> Int ! [e]): Int effects [e] = x\n"),
+            vec!["E7403"]
+        );
+        // A variable used exactly stays generic in the published scheme.
+        let schemes = db_schemes(
+            "fun ap(x, f: () -> Int ! [e]) effects [e] = f() + x\nfun usa(id: ClienteId) = ap(1, { -> length(listOf(db.clientes.require(id))) })\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "ap"),
+            "(Int, () -> Int ! 'e) -> Int ! 'e"
+        );
+        assert_eq!(scheme_in(&schemes, "usa"), "(ClienteId) -> Int ! {db.read}");
     }
 }
