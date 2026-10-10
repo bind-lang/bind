@@ -323,7 +323,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         };
     };
 
-    let (_typed, type_diagnostics) = crate::types::check(&program, &database);
+    let (typed, type_diagnostics) = crate::types::check(&program, &database);
     let type_errors = has_errors(&type_diagnostics);
     diagnostics.extend(type_diagnostics);
     if type_errors {
@@ -361,6 +361,11 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             }
             _ => {}
         }
+        for label in typed.effects.get(&function.name).into_iter().flatten() {
+            if label != "server.call" {
+                required_capabilities.insert(label.clone());
+            }
+        }
         analyze_function(
             function,
             &program,
@@ -368,7 +373,6 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             &function_map,
             &database,
             &mut graph,
-            &mut required_capabilities,
             &mut database_operations,
             &mut diagnostics,
             &mut pending_database_errors,
@@ -827,7 +831,6 @@ fn analyze_function(
     functions: &BTreeMap<String, &Function>,
     database: &DatabaseSchema,
     graph: &mut ApplicationGraph,
-    required_capabilities: &mut BTreeSet<String>,
     operations: &mut Vec<DatabaseOperation>,
     diagnostics: &mut Vec<Diagnostic>,
     pending_database_errors: &mut Vec<(String, String, Diagnostic)>,
@@ -841,7 +844,6 @@ fn analyze_function(
                 .map(|type_ref| (item.name.clone(), type_ref))
         })
         .collect();
-    let mut inferred_effects = BTreeSet::new();
     let body = &function.body;
     let mut index = 0;
     while index < body.len() {
@@ -860,51 +862,25 @@ fn analyze_function(
                 locals.insert(name, value_type);
             }
         }
-        let (call_name, call_start, prefixed) =
-            if body.get(index).is_some_and(|token| token.text == "server")
-                && body.get(index + 1).is_some_and(|token| token.text == ".")
-            {
-                (
-                    body.get(index + 2).map(|token| token.text.clone()),
-                    index + 2,
-                    true,
-                )
-            } else if body.get(index + 1).is_some_and(|token| token.text == "(")
-                && functions.contains_key(&body[index].text)
-                && !(index >= 2 && body[index - 2].text == "server" && body[index - 1].text == ".")
-            {
-                (Some(body[index].text.clone()), index, false)
-            } else {
-                (None, index, false)
-            };
+        let (call_name, call_start) = if body.get(index).is_some_and(|token| token.text == "server")
+            && body.get(index + 1).is_some_and(|token| token.text == ".")
+        {
+            (
+                body.get(index + 2).map(|token| token.text.clone()),
+                index + 2,
+            )
+        } else if body.get(index + 1).is_some_and(|token| token.text == "(")
+            && functions.contains_key(&body[index].text)
+            && !(index >= 2 && body[index - 2].text == "server" && body[index - 1].text == ".")
+        {
+            (Some(body[index].text.clone()), index)
+        } else {
+            (None, index)
+        };
         if let Some(call_name) = call_name
             && let Some(callee) = functions.get(&call_name)
         {
             graph.add_edge(function.name.clone(), call_name.clone());
-            if function.domain == Domain::Pure
-                && !matches!(callee.domain, Domain::Pure | Domain::Inferred)
-            {
-                diagnostics.push(Diagnostic::error(
-                    "E6102",
-                    format!(
-                        "Pure function `{}` cannot call {} function `{}`.",
-                        function.name,
-                        callee.domain.as_str(),
-                        callee.name
-                    ),
-                    body[call_start].span.clone(),
-                ));
-            }
-            if function.domain == Domain::Client && callee.domain == Domain::Server && !prefixed {
-                diagnostics.push(Diagnostic::error(
-                    "E6201",
-                    format!(
-                        "Client/server call `{}` must use the explicit `server.{}` boundary.",
-                        callee.name, callee.name
-                    ),
-                    body[call_start].span.clone(),
-                ));
-            }
             validate_call_arguments(
                 body,
                 call_start + 1,
@@ -934,8 +910,6 @@ fn analyze_function(
                 Vec::new()
             };
             let arguments = call_arguments_as_source(body, index + 5);
-            inferred_effects.insert(effect.clone());
-            required_capabilities.insert(effect.clone());
             operations.push(DatabaseOperation {
                 function: function.name.clone(),
                 table: table_name.clone(),
@@ -945,16 +919,6 @@ fn analyze_function(
                 assignments: assignments.clone(),
             });
             graph.add_edge(function.name.clone(), format!("database.main.{table_name}"));
-            if function.domain == Domain::Client {
-                diagnostics.push(Diagnostic::error(
-                    "E6101",
-                    format!(
-                        "Client function `{}` cannot execute `{effect}` directly.",
-                        function.name
-                    ),
-                    body[index].span.clone(),
-                ));
-            }
             match database.tables.get(&table_name) {
                 None => {
                     let hint = closest(&table_name, database.tables.keys())
@@ -1122,26 +1086,6 @@ fn analyze_function(
             }
         }
         index += 1;
-    }
-    for effect in &inferred_effects {
-        if !function.effects.contains(effect) {
-            diagnostics.push(
-                Diagnostic::error(
-                    "E6001",
-                    format!(
-                        "Function `{}` performs effect `{effect}` but does not declare it.",
-                        function.name
-                    ),
-                    function.span.clone(),
-                )
-                .with_hint(format!(
-                    "Add `effects [{effect}]` to the function declaration."
-                )),
-            );
-        }
-    }
-    for effect in &function.effects {
-        required_capabilities.insert(effect.clone());
     }
     validate_return_contract(function, &locals, functions, database, diagnostics);
     let _ = program;
@@ -1629,6 +1573,65 @@ client component CustomerPage(id: CustomerId) {
 
     const EMPTY_SCHEMA: &str =
         "table,model,primary_key,column,type,nullable,required,has_default,engine\n";
+
+    fn codes(result: &CompileResult) -> Vec<&'static str> {
+        result.diagnostics.iter().map(|item| item.code).collect()
+    }
+
+    #[test]
+    fn effect_rules_come_from_the_type_checker() {
+        let cases = [
+            (
+                "pure fun p(id: CustomerId): String = db.customers.require(id).name\n",
+                "E7401",
+            ),
+            (
+                "server fun eco(x: Int): Int = x\nclient fun usa(): Int = eco(1)\n",
+                "E7404",
+            ),
+            (
+                "server fun f(id: CustomerId): Customer = db.customers.require(id)\n",
+                "E7402",
+            ),
+        ];
+        for (body, expected) in cases {
+            let source = format!(
+                "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\n{body}"
+            );
+            let (root, config) = fixture(&source, SCHEMA);
+            let result = verify(&config, "aws-lambda");
+            let found = codes(&result);
+            assert!(found.contains(&expected), "{body}: {found:?}");
+            assert!(
+                !found.iter().any(|code| code.starts_with("E6")),
+                "{body}: {found:?}"
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn capabilities_come_from_typed_effects() {
+        let (root, config) = fixture(SOURCE, SCHEMA);
+        let app = verify(&config, "aws-lambda")
+            .application
+            .expect("application");
+        let expected: BTreeSet<String> = ["db.read", "server.http", "ui.dom"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(app.required_capabilities, expected);
+        fs::remove_dir_all(root).unwrap();
+
+        let helper = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nfun ler(id: CustomerId) = db.customers.require(id)\nserver fun getCustomer(id: CustomerId): Customer effects [db.read] = ler(id)\n";
+        let (root, config) = fixture(helper, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert!(app.required_capabilities.contains("db.read"));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn legacy_validation_skips_type_parameters_and_function_types() {
