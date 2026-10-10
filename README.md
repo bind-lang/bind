@@ -106,6 +106,7 @@ Neither command is run automatically because both require the user's cloud accou
 
 ## What v0.1 proves
 
+- Hindley-Milner type inference in the OCaml model, with algebraic data types, exhaustive `when`, no exceptions and no mutation (see [type system](docs/type-system.md));
 - nominal and nullable types across Bind, Rust, JSON, Elm, and PostgreSQL;
 - declared function returns and argument compatibility;
 - effect declarations and client/server domain rules;
