@@ -557,7 +557,7 @@ server fun cadastrar(nome: String, email: Email, saldo: Money): Customer
 ```kotlin
 server fun falha(nome: String, email: Email, saldo: Money, outro: CustomerId): Customer
     effects [db.read, db.write] {
-    val _ = db.customers.insert { name = nome  email = email  balance = saldo }
+    val _ = db.customers.insert { name = nome; email = email; balance = saldo }
     return db.customers.require(outro)
 }
 ```
