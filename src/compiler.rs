@@ -443,7 +443,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
     if target_config.server == "rust" {
-        validate_rust_server_surface(&program, &database, &mut diagnostics);
+        validate_rust_server_surface(&program, &database, &database_operations, &mut diagnostics);
     }
     if target_config.certified {
         validate_certified_surface(&program, &database_operations, config, &mut diagnostics);
@@ -762,6 +762,7 @@ fn validate_certified_surface(
 fn validate_rust_server_surface(
     program: &Program,
     database: &DatabaseSchema,
+    operations: &[DatabaseOperation],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for function in &program.functions {
@@ -819,11 +820,25 @@ fn validate_rust_server_surface(
             }
         }
     }
-    for table in database.tables.values() {
+    // Only the tables the program uses: one mapped to a declared model or named by a database
+    // operation.
+    let used = database.tables.values().filter(|table| {
+        program.types.iter().any(|item| item.name == table.model)
+            || operations
+                .iter()
+                .any(|operation| operation.table == table.name)
+    });
+    for table in used {
         for column in table.columns.values() {
-            let Some(parsed) =
-                parse_declared_type(&column.type_name, &Span::default(), diagnostics)
-            else {
+            let Ok(parsed) = parse_type_text(&column.type_name, &Span::default()) else {
+                diagnostics.push(Diagnostic::error(
+                    "E5101",
+                    format!(
+                        "Column `{}.{}` has type `{}`, which cannot be parsed as a type.",
+                        table.name, column.name, column.type_name
+                    ),
+                    Span::default(),
+                ));
                 continue;
             };
             if mentions_duration(&parsed, program, 0) {
@@ -861,12 +876,20 @@ fn rust_server_diagnostics(
                     .iter()
                     .find(|item| item.name == *function)
                     .map(|item| item.span.clone()),
-                ServerProblem::UnmappedColumn { model, column, .. } => program
-                    .types
-                    .iter()
-                    .find(|item| item.name == *model)
-                    .and_then(|item| item.fields.iter().find(|field| field.name == *column))
-                    .map(|field| field.span.clone()),
+                ServerProblem::Database(error) => {
+                    let model = error
+                        .model
+                        .as_ref()
+                        .and_then(|model| program.types.iter().find(|item| item.name == *model));
+                    let field = model
+                        .zip(error.column.as_ref())
+                        .and_then(|(model, column)| {
+                            model.fields.iter().find(|field| field.name == *column)
+                        });
+                    field
+                        .map(|field| field.span.clone())
+                        .or_else(|| model.map(|model| model.span.clone()))
+                }
                 ServerProblem::Internal(_) => None,
             };
             let code = match problem {
@@ -2098,6 +2121,63 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         // A table no endpoint uses does not matter.
         let unused = "enum class Cor { Azul, Verde }\ndistinct type ItemId = UUID\nentity Item(val id: ItemId, val cor: Cor)\nserver fun nada(): Int = 1\n";
         assert!(e8310(unused, &schema).is_empty());
+    }
+
+    #[test]
+    fn database_operations_the_model_cannot_back_are_rejected() {
+        // (a) An inserted column the model does not declare.
+        let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun f(n: String): CustomerId effects [db.write] {\n    val c = db.customers.insert {\n        name = n\n        extra = n\n    }\n    return c.id\n}\n";
+        let schema =
+            format!("{SCHEMA}customers,Customer,id,extra,String,false,false,false,postgresql\n");
+        assert_eq!(
+            e8310(source, &schema),
+            vec![
+                "Column `customers.extra` is assigned by an insert, but model `Customer` declares no field `extra`, so the generated server cannot use it in profile rust-elm-web-v2."
+            ]
+        );
+        // (b) A primary key the model does not declare.
+        let source = "distinct type CustomerId = UUID\nentity Customer(val name: String)\nserver fun g(id: CustomerId): String effects [db.read] = db.customers.require(id).name\n";
+        assert_eq!(
+            e8310(source, SCHEMA),
+            vec![
+                "Column `customers.id` is the primary key of the table, but model `Customer` declares no field `id`, so the generated server cannot use it in profile rust-elm-web-v2."
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoints_using_environment_values_directly_are_named() {
+        let source = "environment development {\n    public val appName: String = env(\"BIND_TEST_APP_NAME\", default = \"x\")\n}\nserver fun a(): String = appName\n";
+        assert_eq!(
+            e8310(source, EMPTY_SCHEMA),
+            vec![
+                "Endpoint `a` uses an `environment` value, which the generated server does not support in profile rust-elm-web-v2."
+            ]
+        );
+    }
+
+    #[test]
+    fn unused_schema_tables_are_not_checked_for_the_server() {
+        let source = "server fun f(): Int = 1\n";
+        let schema = format!(
+            "{EMPTY_SCHEMA}esperas,Espera,id,prazo,Duration,false,true,false,postgresql\nruins,Ruim,id,x,List<,false,true,false,postgresql\n"
+        );
+        let (root, config) = fixture(source, &schema);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+
+        // In a table the program uses, a malformed column type is a schema error, not E9001.
+        let source =
+            "distinct type RuimId = UUID\nentity Ruim(val id: RuimId)\nserver fun f(): Int = 1\n";
+        let schema = format!(
+            "{EMPTY_SCHEMA}ruins,Ruim,id,id,RuimId,false,true,true,postgresql\nruins,Ruim,id,x,List<,false,true,false,postgresql\n"
+        );
+        let (root, config) = fixture(source, &schema);
+        let result = verify(&config, "aws-lambda");
+        let found = codes(&result);
+        assert_eq!(found, vec!["E5101"], "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// The endpoint of `tests/codegen/endpoint.bd`: a helper, a `when` and two database

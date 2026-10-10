@@ -109,48 +109,30 @@ fn model<'p>(
         })
 }
 
-fn field_type<'p>(model: &Model<'p>, column: &str) -> Result<&'p Type, String> {
-    model
-        .fields
-        .iter()
-        .find(|(name, _)| name == column)
-        .map(|(_, ty)| ty)
-        .ok_or_else(|| format!("Model `{}` has no field `{column}`", model.name))
-}
-
-/// The model fields, in the tables `keys` use, whose type has no column mapping:
-/// `(table, column, model, type)`. `Err` when a table has no record model (the checker
-/// rejects that).
-pub fn unmapped_columns(
-    keys: &BTreeSet<DbKey>,
-    program: &CoreProgram,
-    database: &DatabaseSchema,
-) -> Result<Vec<(String, String, String, Type)>, String> {
-    let layout = Layout::new(program);
-    let tables: BTreeSet<&str> = keys.iter().map(DbKey::table).collect();
-    let mut output = Vec::new();
-    for table in tables {
-        let model = model(program, database, table)?;
-        for (field, ty) in model.fields {
-            if column(ty, &layout).is_err() {
-                output.push((
-                    table.to_string(),
-                    field.clone(),
-                    model.name.to_string(),
-                    ty.clone(),
-                ));
-            }
-        }
-    }
-    Ok(output)
+/// Why the database layer of a verified program cannot be generated. `verify` reports each
+/// one (E8310) by building the same [`DbPlan`] the backend uses.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DbError {
+    pub table: String,
+    /// The table's model, when it is a record.
+    pub model: Option<String>,
+    /// The column concerned, if any.
+    pub column: Option<String>,
+    pub message: String,
 }
 
 impl DbPlan {
+    /// The functions for `keys`, or every reason they cannot be generated: a table without a
+    /// record model, a primary key or inserted column the model does not declare, a model
+    /// field whose type has no column mapping.
     pub fn new(
         keys: &BTreeSet<DbKey>,
         program: &CoreProgram,
         database: &DatabaseSchema,
-    ) -> Result<DbPlan, String> {
+    ) -> Result<DbPlan, Vec<DbError>> {
+        let profile = crate::certified::profile_version();
+        let layout = Layout::new(program);
+        let mut errors = Vec::new();
         // Inserts into one table with different column lists get numbered names.
         let mut insert_lists: BTreeMap<&str, usize> = BTreeMap::new();
         for key in keys {
@@ -158,13 +140,61 @@ impl DbPlan {
                 *insert_lists.entry(table).or_default() += 1;
             }
         }
+        let mut checked_tables = BTreeSet::new();
         let mut numbers: BTreeMap<&str, usize> = BTreeMap::new();
         let mut functions = BTreeMap::new();
         let mut tables = BTreeSet::new();
         for key in keys {
             let table = key.table();
-            let model = model(program, database, table)?;
+            let error = |model: Option<&str>, column: Option<&str>, message: String| DbError {
+                table: table.to_string(),
+                model: model.map(str::to_string),
+                column: column.map(str::to_string),
+                message,
+            };
+            let model = match model(program, database, table) {
+                Ok(model) => model,
+                Err(message) => {
+                    if checked_tables.insert(table) {
+                        errors.push(error(None, None, format!("{message}, so the generated server cannot access it in profile {profile}.")));
+                    }
+                    continue;
+                }
+            };
+            if checked_tables.insert(table) {
+                // Every field is read back (selected and decoded) by every operation.
+                for (field, ty) in model.fields {
+                    if column(ty, &layout).is_err() {
+                        errors.push(error(
+                            Some(model.name),
+                            Some(field),
+                            format!(
+                                "Column `{table}.{field}` has type `{}`, which has no database mapping in profile {profile}.",
+                                crate::types::ty::display(ty)
+                            ),
+                        ));
+                    }
+                }
+            }
             let definition = &database.tables[table];
+            let mut field = |column: &str, role: &str| -> Option<Type> {
+                let found = model
+                    .fields
+                    .iter()
+                    .find(|(name, _)| name == column)
+                    .map(|(_, ty)| ty.clone());
+                if found.is_none() {
+                    errors.push(error(
+                        Some(model.name),
+                        Some(column),
+                        format!(
+                            "Column `{table}.{column}` is {role}, but model `{}` declares no field `{column}`, so the generated server cannot use it in profile {profile}.",
+                            model.name
+                        ),
+                    ));
+                }
+                found
+            };
             let (name, params) = match key {
                 DbKey::Require(_) | DbKey::Find(_) => {
                     let verb = if matches!(key, DbKey::Require(_)) {
@@ -172,14 +202,21 @@ impl DbPlan {
                     } else {
                         "find"
                     };
-                    let key_type = field_type(&model, &definition.primary_key)?.clone();
+                    let Some(key_type) =
+                        field(&definition.primary_key, "the primary key of the table")
+                    else {
+                        continue;
+                    };
                     (format!("db_{verb}_{}", identifier(table)), vec![key_type])
                 }
                 DbKey::Insert(_, columns) => {
-                    let params = columns
+                    let params: Vec<Option<Type>> = columns
                         .iter()
-                        .map(|column| field_type(&model, column).cloned())
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|column| field(column, "assigned by an insert"))
+                        .collect();
+                    let Some(params) = params.into_iter().collect::<Option<Vec<_>>>() else {
+                        continue;
+                    };
                     let name = if insert_lists[table] > 1 {
                         let number = numbers.entry(table).or_default();
                         *number += 1;
@@ -193,7 +230,11 @@ impl DbPlan {
             tables.insert(table.to_string());
             functions.insert(key.clone(), DbFunction { name, params });
         }
-        Ok(DbPlan { functions, tables })
+        if errors.is_empty() {
+            Ok(DbPlan { functions, tables })
+        } else {
+            Err(errors)
+        }
     }
 
     /// The database functions and the row decoders they use.

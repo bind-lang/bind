@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::compiler::VerifiedApplication;
 use crate::core::ir::{CoreFunction, CoreProgram, Expr, ExprKind};
 use crate::schema::DatabaseSchema;
-use crate::types::ty::Type;
 
 /// Inner attributes opening every generated module. Each allowed lint is inherent to uniform
 /// code generation; none of the denied ones (`unwrap_used`, `expect_used`, `panic`,
@@ -107,7 +106,14 @@ pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<Strin
         return Err(problem.message());
     }
     let functions = reachable(program, &endpoints);
-    let plan = db::DbPlan::new(&db::operations(&functions), program, database)?;
+    let plan =
+        db::DbPlan::new(&db::operations(&functions), program, database).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })?;
     let names = endpoints::input_names(&endpoints, &layout);
 
     let mut output = String::from(CRATE_HEADER);
@@ -172,13 +178,8 @@ pub enum ServerProblem {
         endpoint: String,
         what: &'static str,
     },
-    /// A field of a table's model whose type has no column mapping (E8310).
-    UnmappedColumn {
-        table: String,
-        column: String,
-        model: String,
-        ty: Type,
-    },
+    /// The database layer cannot be generated (E8310): the same check as the backend's.
+    Database(db::DbError),
     /// An inconsistency the checker should have rejected (E9001).
     Internal(String),
 }
@@ -191,15 +192,17 @@ impl ServerProblem {
                 function,
                 endpoint,
                 what,
+            } if function == endpoint => format!(
+                "Endpoint `{endpoint}` uses {what}, which the generated server does not support in profile {profile}."
+            ),
+            ServerProblem::Unsupported {
+                function,
+                endpoint,
+                what,
             } => format!(
                 "Function `{function}` is reachable from endpoint `{endpoint}` but uses {what}, which the generated server does not support in profile {profile}."
             ),
-            ServerProblem::UnmappedColumn {
-                table, column, ty, ..
-            } => format!(
-                "Column `{table}.{column}` has type `{}`, which has no database mapping in profile {profile}.",
-                crate::types::ty::display(ty)
-            ),
+            ServerProblem::Database(error) => error.message.clone(),
             ServerProblem::Internal(message) => {
                 format!("Internal compiler error: {message}. This is a bug in bindc.")
             }
@@ -249,16 +252,8 @@ pub fn server_problems(program: &CoreProgram, database: &DatabaseSchema) -> Vec<
             what,
         });
     }
-    match db::unmapped_columns(&db::operations(&functions), program, database) {
-        Ok(columns) => problems.extend(columns.into_iter().map(|(table, column, model, ty)| {
-            ServerProblem::UnmappedColumn {
-                table,
-                column,
-                model,
-                ty,
-            }
-        })),
-        Err(message) => problems.push(ServerProblem::Internal(message)),
+    if let Err(errors) = db::DbPlan::new(&db::operations(&functions), program, database) {
+        problems.extend(errors.into_iter().map(ServerProblem::Database));
     }
     problems
 }
