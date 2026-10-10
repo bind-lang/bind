@@ -194,8 +194,9 @@ impl Signatures for CoreSignatures<'_> {
     }
 }
 
-/// Structural equality ignoring effect rows. `Type::Error` equals anything: rule 1 reports it
-/// once, without cascades.
+/// Structural equality ignoring effect rows. `Type::Error` equals anything, so an error-typed
+/// node does not cascade into mismatches. This is sound only together with rule 1 (`closed`),
+/// which reports every `Type::Error` it meets; weakening rule 1 would let these pass silently.
 fn same(a: &Type, b: &Type) -> bool {
     match (a, b) {
         (Type::Error, _) | (_, Type::Error) => true,

@@ -29,7 +29,7 @@ pub fn lower(program: &Program, typed: &TypedProgram, schema: &DatabaseSchema) -
     let functions = program
         .functions
         .iter()
-        .filter_map(|function| {
+        .map(|function| {
             let mut lowerer = Lowerer {
                 typed,
                 schema,
@@ -479,8 +479,11 @@ struct Lowerer<'a> {
 }
 
 impl Lowerer<'_> {
-    fn function(&mut self, function: &Function) -> Option<CoreFunction> {
-        let block = function.expr.as_ref()?;
+    /// A function without a body (`BodyKind::Absent`, e.g. `external fun g(x: Int): Unit`) is
+    /// lowered like any other, with the body `Lit(Unit)` typed `Unit`: the legacy semantics,
+    /// where the declared return defaults to `Unit`. A body-less function with another return
+    /// type is rejected (E2301) before lowering runs.
+    fn function(&mut self, function: &Function) -> CoreFunction {
         let signature = self
             .typed
             .signatures
@@ -523,7 +526,10 @@ impl Lowerer<'_> {
                 (local, parameter.name.clone(), ty)
             })
             .collect();
-        let mut body = self.block(block);
+        let mut body = match &function.expr {
+            Some(block) => self.block(block),
+            None => expr(Type::con("Unit"), ExprKind::Lit(Literal::Unit)),
+        };
         let mut specializer = Specializer {
             generics: &self.generics,
             effect_rows,
@@ -535,7 +541,7 @@ impl Lowerer<'_> {
         let default = |ty: &Type| default_vars(ty, &generics);
         map_types(&mut body, &default);
         let domain = domain(&function.domain);
-        Some(CoreFunction {
+        CoreFunction {
             name: function.name.clone(),
             endpoint: domain == Domain::Server && !function.component,
             domain,
@@ -552,7 +558,7 @@ impl Lowerer<'_> {
                 .unwrap_or_default(),
             body,
             generics,
-        })
+        }
     }
 
     /// Replaces the rigid markers of an annotated generic body by the scheme's variables.

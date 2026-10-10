@@ -337,26 +337,6 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             module_count: files.len(),
         };
     }
-    // Every type-correct program is lowered to the core IR and validated. An inconsistent IR is
-    // a compiler bug: it stops verification before any code is generated.
-    let core = crate::core::lower::lower(&program, &typed, &database);
-    let problems = crate::core::validate::validate(&core);
-    if !problems.is_empty() {
-        diagnostics.push(Diagnostic::error(
-            "E9001",
-            format!(
-                "Internal compiler error: the core IR is inconsistent ({}). This is a bug in bindc.",
-                problems.join("; ")
-            ),
-            Span::default(),
-        ));
-        return CompileResult {
-            application: None,
-            diagnostics,
-            module_count: files.len(),
-        };
-    }
-
     let mut graph = ApplicationGraph::default();
     let type_map: BTreeMap<_, _> = program
         .types
@@ -485,25 +465,43 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             path: format!("/api/{}", function.name),
         })
         .collect();
-    let application = if has_errors(&diagnostics) {
+    // A program that passes every user-facing check is lowered to the core IR and validated.
+    // This runs last so user diagnostics are never masked: an inconsistent IR is a compiler bug
+    // (E9001) and stops verification before any code is generated.
+    let core = if has_errors(&diagnostics) {
         None
     } else {
-        Some(VerifiedApplication {
-            project_name: config.name.clone(),
-            project_version: config.version.clone(),
-            target: target.into(),
-            source_hash: stable_hash(&source_canonical),
-            program,
-            graph,
-            environment,
-            database,
-            database_operations,
-            rpc_contracts,
-            required_capabilities,
-            unsafe_operations: Vec::new(),
-            core,
-        })
+        let core = crate::core::lower::lower(&program, &typed, &database);
+        let problems = crate::core::validate::validate(&core);
+        if problems.is_empty() {
+            Some(core)
+        } else {
+            diagnostics.push(Diagnostic::error(
+                "E9001",
+                format!(
+                    "Internal compiler error: the core IR is inconsistent ({}). This is a bug in bindc.",
+                    problems.join("; ")
+                ),
+                Span::default(),
+            ));
+            None
+        }
     };
+    let application = core.map(|core| VerifiedApplication {
+        project_name: config.name.clone(),
+        project_version: config.version.clone(),
+        target: target.into(),
+        source_hash: stable_hash(&source_canonical),
+        program,
+        graph,
+        environment,
+        database,
+        database_operations,
+        rpc_contracts,
+        required_capabilities,
+        unsafe_operations: Vec::new(),
+        core,
+    });
     CompileResult {
         application,
         diagnostics,
@@ -1771,7 +1769,7 @@ client component CustomerPage(id: CustomerId) {
     fn effectful_generalized_val_used_at_two_types_is_an_internal_error() {
         // The checker accepts it, but the lowering cannot copy an effectful value per instance,
         // so the IR is inconsistent and `verify` stops with E9001 instead of generating code.
-        let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun f(id: CustomerId): Int effects [db.read] {\n    val xs = if (db.customers.require(id).name == \"a\") emptyList() else emptyList()\n    val a = length(map(xs, { x -> x + 1 }))\n    return length(map(xs, { x -> x == \"b\" }))\n}\n";
+        let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nfun load(id: CustomerId): Customer effects [db.read] = db.customers.require(id)\nserver fun f(id: CustomerId): Int effects [db.read] {\n    val xs = if (load(id).name == \"a\") emptyList() else emptyList()\n    val a = length(map(xs, { x -> x + 1 }))\n    return length(map(xs, { x -> x == \"b\" }))\n}\n";
         let (root, config) = fixture(source, SCHEMA);
         let result = verify(&config, "aws-lambda");
         assert!(result.application.is_none());
@@ -1784,6 +1782,39 @@ client component CustomerPage(id: CustomerId) {
             "{}",
             result.diagnostics[0].message
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn body_less_functions_are_lowered_and_user_errors_come_first() {
+        let (root, config) = fixture("fun g(x: Int): Unit\nfun f() = g(1)\n", EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(
+            !codes(&result).contains(&"E9001"),
+            "{:?}",
+            result.diagnostics
+        );
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert!(
+            app.core
+                .functions
+                .iter()
+                .any(|function| function.name == "g")
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        // A body-less function with another return type is a user error, never masked by E9001.
+        let (root, config) = fixture(
+            "external fun g(x: Int): Int\nfun f(): Int = g(1)\n",
+            EMPTY_SCHEMA,
+        );
+        let result = verify(&config, "aws-lambda");
+        let found = codes(&result);
+        assert!(found.contains(&"E2301"), "{found:?}");
+        assert!(!found.contains(&"E9001"), "{found:?}");
+        assert!(result.application.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 
