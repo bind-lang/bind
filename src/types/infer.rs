@@ -1032,7 +1032,12 @@ impl<'a> Checker<'a> {
     fn check_declared_effects(&mut self, function: &Function, declared: &Row, produced: &Row) {
         let produced = self.table.resolve_row(produced);
         let declared = self.table.resolve_row(declared);
-        let listed: Vec<String> = declared.labels.iter().map(Label::to_string).collect();
+        // As written in the clause, including labels dropped for exceeding the ceiling.
+        let listed: Vec<String> = if function.effects_declared {
+            function.effects.clone()
+        } else {
+            Vec::new()
+        };
         let ceiling = ceiling(&function.domain);
         let outside = |label: &Label| {
             ceiling
@@ -1051,18 +1056,30 @@ impl<'a> Checker<'a> {
                     .iter()
                     .map(Step::render),
             );
-            self.diagnostics.push(
-                Diagnostic::error(
-                    "E7402",
+            let message = match label.rigid_name() {
+                Some(name) => {
+                    let what = match parameter_with_effect_variable(function, name) {
+                        Some(parameter) => {
+                            format!("the effects of `{parameter}` (effect variable `{name}`)")
+                        }
+                        None => format!("effect variable `{name}`"),
+                    };
                     format!(
-                        "`{}` performs `{label}`, but its effects declare only [{}].",
+                        "`{}` performs {what}, but declares only [{}].",
                         function.name,
                         listed.join(", ")
-                    ),
-                    function.span.clone(),
-                )
-                .with_path(path)
-                .with_hint(self.add_effect_hint(&function.name, label)),
+                    )
+                }
+                None => format!(
+                    "`{}` performs `{label}`, but its effects declare only [{}].",
+                    function.name,
+                    listed.join(", ")
+                ),
+            };
+            self.diagnostics.push(
+                Diagnostic::error("E7402", message, function.span.clone())
+                    .with_path(path)
+                    .with_hint(self.add_effect_hint(&function.name, label)),
             );
         }
         for label in declared.labels.difference(&produced.labels) {
@@ -2362,6 +2379,15 @@ fn effect_variable_names(function: &Function) -> BTreeSet<String> {
     names
 }
 
+/// The first parameter whose declared type names the effect variable `name`.
+fn parameter_with_effect_variable<'f>(function: &'f Function, name: &str) -> Option<&'f str> {
+    function.parameters.iter().find_map(|parameter| {
+        let mut names = BTreeSet::new();
+        type_effect_variables(parameter.type_ref.as_ref()?, &function.span, &mut names);
+        names.contains(name).then_some(parameter.name.as_str())
+    })
+}
+
 /// Effect variables named in the parameter types of a function.
 fn parameter_effect_variables(function: &Function) -> BTreeSet<String> {
     let mut names = BTreeSet::new();
@@ -2402,10 +2428,26 @@ fn mismatch_error(
     reason: Option<String>,
 ) -> Diagnostic {
     let names = display_all(&[expected, found]);
+    let mut rigid = BTreeSet::new();
+    rigid_effect_names(expected, &mut rigid);
+    rigid_effect_names(found, &mut rigid);
+    let rigid: Vec<String> = rigid.into_iter().map(|name| format!("`{name}`")).collect();
+    // A rigid effect variable renders as its bare name, which a reader could take for a label
+    // or for a row variable such as `'e`: say what it is.
+    let note = match rigid.as_slice() {
+        [] => String::new(),
+        [one] => format!(
+            " (where {one} is an effect variable of the signature, which only equals itself)"
+        ),
+        [init @ .., last] => format!(
+            " (where {} and {last} are effect variables of the signature, which only equal themselves)",
+            init.join(", ")
+        ),
+    };
     let diagnostic = Diagnostic::error(
         "E7101",
         format!(
-            "Type mismatch: expected `{}`, found `{}`.",
+            "Type mismatch: expected `{}`, found `{}`{note}.",
             names[0], names[1]
         ),
         span.clone(),
@@ -2413,6 +2455,25 @@ fn mismatch_error(
     match reason {
         Some(reason) => diagnostic.with_hint(format!("`{}` is required by {reason}.", names[0])),
         None => diagnostic,
+    }
+}
+
+/// Names of the rigid effect variables in the rows of a resolved type.
+fn rigid_effect_names(ty: &Type, names: &mut BTreeSet<String>) {
+    match ty {
+        Type::Fun(params, result, row) => {
+            params
+                .iter()
+                .for_each(|param| rigid_effect_names(param, names));
+            rigid_effect_names(result, names);
+            names.extend(
+                row.labels
+                    .iter()
+                    .filter_map(|label| label.rigid_name().map(str::to_string)),
+            );
+        }
+        Type::Con(_, args) => args.iter().for_each(|arg| rigid_effect_names(arg, names)),
+        Type::Var(_) | Type::Error => {}
     }
 }
 
@@ -3932,6 +3993,39 @@ mod tests {
                 .starts_with("db.clientes.require ("),
             "{:?}",
             called[0].path
+        );
+    }
+
+    #[test]
+    fn rigid_effect_variables_read_as_effect_variables() {
+        let undeclared = db_diagnostics("fun <A> chama(f: () -> A ! [e]): A effects [] = f()\n");
+        assert_eq!(undeclared.len(), 1, "{undeclared:?}");
+        assert_eq!(
+            undeclared[0].message,
+            "`chama` performs the effects of `f` (effect variable `e`), but declares only []."
+        );
+        let mismatch = db_diagnostics(
+            "fun chama(f: () -> Int ! [e]): Int effects [e] {\n    val g: () -> Int = f\n    return f()\n}\n",
+        );
+        assert_eq!(mismatch.len(), 1, "{mismatch:?}");
+        assert_eq!(
+            mismatch[0].message,
+            "Type mismatch: expected `() -> Int`, found `() -> Int ! {e}` (where `e` is an effect variable of the signature, which only equals itself)."
+        );
+    }
+
+    #[test]
+    fn undeclared_effects_list_the_clause_as_written() {
+        let diagnostics = db_diagnostics(
+            "server fun f(id: ClienteId): Cliente effects [server.call] = db.clientes.require(id)\n",
+        );
+        let undeclared = diagnostics
+            .iter()
+            .find(|item| item.code == "E7402")
+            .unwrap_or_else(|| panic!("{diagnostics:?}"));
+        assert_eq!(
+            undeclared.message,
+            "`f` performs `db.read`, but its effects declare only [server.call]."
         );
     }
 }
