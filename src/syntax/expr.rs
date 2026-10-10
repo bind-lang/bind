@@ -7,8 +7,15 @@ pub type NodeId = usize;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypeExpr {
-    Named { name: String, args: Vec<TypeExpr>, span: Span },
-    Function { params: Vec<TypeExpr>, result: Box<TypeExpr> },
+    Named {
+        name: String,
+        args: Vec<TypeExpr>,
+        span: Span,
+    },
+    Function {
+        params: Vec<TypeExpr>,
+        result: Box<TypeExpr>,
+    },
     Nullable(Box<TypeExpr>),
 }
 
@@ -30,19 +37,52 @@ pub enum ExprKind {
     Bool(bool),
     Null,
     Name(String),
-    Call { callee: Box<Expr>, args: Vec<Expr>, children: Option<Block> },
-    Field { target: Box<Expr>, name: String },
-    SafeField { target: Box<Expr>, name: String },
-    Unary { op: UnaryOp, operand: Box<Expr> },
-    Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr> },
-    Elvis { value: Box<Expr>, fallback: Box<Expr> },
-    If { condition: Box<Expr>, then_branch: Box<Expr>, else_branch: Box<Expr> },
-    When { scrutinee: Box<Expr>, arms: Vec<Arm> },
-    Lambda { params: Vec<(String, Span)>, body: Block },
+    Call {
+        callee: Box<Expr>,
+        args: Vec<Expr>,
+        children: Option<Block>,
+    },
+    Field {
+        target: Box<Expr>,
+        name: String,
+    },
+    SafeField {
+        target: Box<Expr>,
+        name: String,
+    },
+    Unary {
+        op: UnaryOp,
+        operand: Box<Expr>,
+    },
+    Binary {
+        op: BinaryOp,
+        left: Box<Expr>,
+        right: Box<Expr>,
+    },
+    Elvis {
+        value: Box<Expr>,
+        fallback: Box<Expr>,
+    },
+    If {
+        condition: Box<Expr>,
+        then_branch: Box<Expr>,
+        else_branch: Box<Expr>,
+    },
+    When {
+        scrutinee: Box<Expr>,
+        arms: Vec<Arm>,
+    },
+    Lambda {
+        params: Vec<(String, Span)>,
+        body: Block,
+    },
     Block(Block),
     Return(Box<Expr>),
     /// `target { field = value ... }`, used by `db.<table>.insert`.
-    Builder { target: Box<Expr>, fields: Vec<FieldInit> },
+    Builder {
+        target: Box<Expr>,
+        fields: Vec<FieldInit>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,7 +137,12 @@ pub struct Block {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
-    Val { name: String, annotation: Option<TypeExpr>, value: Expr, span: Span },
+    Val {
+        name: String,
+        annotation: Option<TypeExpr>,
+        value: Expr,
+        span: Span,
+    },
     Expr(Expr),
 }
 
@@ -113,7 +158,11 @@ pub enum Pattern {
     Wildcard,
     /// A binding or a field-less constructor; the type checker decides.
     Name(String, Span),
-    Constructor { name: String, args: Vec<Pattern>, span: Span },
+    Constructor {
+        name: String,
+        args: Vec<Pattern>,
+        span: Span,
+    },
     Int(String, Span),
     Str(String, Span),
     Bool(bool, Span),
@@ -139,7 +188,11 @@ pub fn render_expr(expr: &Expr) -> String {
         ExprKind::Bool(value) => value.to_string(),
         ExprKind::Null => "null".into(),
         ExprKind::Name(name) => name.clone(),
-        ExprKind::Call { callee, args, children } => {
+        ExprKind::Call {
+            callee,
+            args,
+            children,
+        } => {
             let mut text = format!("{}({})", render_expr(callee), join(args, render_expr));
             if let Some(block) = children {
                 text.push(' ');
@@ -157,12 +210,21 @@ pub fn render_expr(expr: &Expr) -> String {
             format!("({symbol}{})", render_expr(operand))
         }
         ExprKind::Binary { op, left, right } => {
-            format!("({} {} {})", render_expr(left), op.symbol(), render_expr(right))
+            format!(
+                "({} {} {})",
+                render_expr(left),
+                op.symbol(),
+                render_expr(right)
+            )
         }
         ExprKind::Elvis { value, fallback } => {
             format!("({} ?: {})", render_expr(value), render_expr(fallback))
         }
-        ExprKind::If { condition, then_branch, else_branch } => format!(
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => format!(
             "(if ({}) {} else {})",
             render_expr(condition),
             render_expr(then_branch),
@@ -171,13 +233,27 @@ pub fn render_expr(expr: &Expr) -> String {
         ExprKind::When { scrutinee, arms } => {
             let arms: Vec<String> = arms
                 .iter()
-                .map(|arm| format!("{} -> {}", render_pattern(&arm.pattern), render_expr(&arm.body)))
+                .map(|arm| {
+                    format!(
+                        "{} -> {}",
+                        render_pattern(&arm.pattern),
+                        render_expr(&arm.body)
+                    )
+                })
                 .collect();
-            format!("when ({}) {{ {} }}", render_expr(scrutinee), arms.join("; "))
+            format!(
+                "when ({}) {{ {} }}",
+                render_expr(scrutinee),
+                arms.join("; ")
+            )
         }
         ExprKind::Lambda { params, body } => {
             let names: Vec<&str> = params.iter().map(|(name, _)| name.as_str()).collect();
-            let prefix = if names.is_empty() { String::new() } else { format!("{} ", names.join(", ")) };
+            let prefix = if names.is_empty() {
+                String::new()
+            } else {
+                format!("{} ", names.join(", "))
+            };
             format!("({{ {prefix}-> {} }})", render_stmts(&body.stmts))
         }
         ExprKind::Block(block) => render_block(block),
@@ -204,7 +280,9 @@ pub fn render_pattern(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Wildcard => "_".into(),
         Pattern::Name(name, _) => name.clone(),
-        Pattern::Constructor { name, args, .. } => format!("{name}({})", join(args, render_pattern)),
+        Pattern::Constructor { name, args, .. } => {
+            format!("{name}({})", join(args, render_pattern))
+        }
         Pattern::Int(text, _) | Pattern::Double(text, _) => text.clone(),
         Pattern::Str(text, _) => format!("{text:?}"),
         Pattern::Bool(value, _) => value.to_string(),
@@ -230,10 +308,20 @@ fn render_stmts(stmts: &[Stmt]) -> String {
     let rendered: Vec<String> = stmts
         .iter()
         .map(|stmt| match stmt {
-            Stmt::Val { name, annotation: Some(ty), value, .. } => {
+            Stmt::Val {
+                name,
+                annotation: Some(ty),
+                value,
+                ..
+            } => {
                 format!("val {name}: {} = {}", render_type(ty), render_expr(value))
             }
-            Stmt::Val { name, annotation: None, value, .. } => {
+            Stmt::Val {
+                name,
+                annotation: None,
+                value,
+                ..
+            } => {
                 format!("val {name} = {}", render_expr(value))
             }
             Stmt::Expr(expr) => render_expr(expr),

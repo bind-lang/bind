@@ -35,16 +35,20 @@ pub fn unify(table: &mut TypeTable, expected: &Type, found: &Type) -> Result<(),
             }
             unify(table, r1, r2).map_err(|error| widen(table, error, &a, &b))
         }
-        _ => Err(UnifyError::Mismatch { expected: table.resolve(&a), found: table.resolve(&b) }),
+        _ => Err(UnifyError::Mismatch {
+            expected: table.resolve(&a),
+            found: table.resolve(&b),
+        }),
     }
 }
 
 /// A nested mismatch is reported with the enclosing types, which is what the programmer wrote.
 fn widen(table: &TypeTable, error: UnifyError, expected: &Type, found: &Type) -> UnifyError {
     match error {
-        UnifyError::Mismatch { .. } => {
-            UnifyError::Mismatch { expected: table.resolve(expected), found: table.resolve(found) }
-        }
+        UnifyError::Mismatch { .. } => UnifyError::Mismatch {
+            expected: table.resolve(expected),
+            found: table.resolve(found),
+        },
         other => other,
     }
 }
@@ -54,7 +58,10 @@ fn bind(table: &mut TypeTable, var: TypeVarId, ty: &Type) -> Result<(), UnifyErr
         unreachable!("`shallow` never returns a linked variable")
     };
     if let Type::Var(other) = ty {
-        let VarState::Unbound { level: other_level, constraint: other_constraint } = table.state(*other).clone()
+        let VarState::Unbound {
+            level: other_level,
+            constraint: other_constraint,
+        } = table.state(*other).clone()
         else {
             unreachable!("`shallow` never returns a linked variable")
         };
@@ -62,12 +69,21 @@ fn bind(table: &mut TypeTable, var: TypeVarId, ty: &Type) -> Result<(), UnifyErr
             (Some(a), Some(b)) => Some(a.meet(b)),
             (a, b) => a.or(b),
         };
-        table.set(*other, VarState::Unbound { level: level.min(other_level), constraint: merged });
+        table.set(
+            *other,
+            VarState::Unbound {
+                level: level.min(other_level),
+                constraint: merged,
+            },
+        );
         table.set(var, VarState::Link(ty.clone()));
         return Ok(());
     }
     if occurs_and_adjust(table, var, level, ty).is_err() {
-        let error = UnifyError::Infinite { var, ty: table.resolve(ty) };
+        let error = UnifyError::Infinite {
+            var,
+            ty: table.resolve(ty),
+        };
         table.set(var, VarState::Link(Type::Error));
         return Err(error);
     }
@@ -84,22 +100,34 @@ fn bind(table: &mut TypeTable, var: TypeVarId, ty: &Type) -> Result<(), UnifyErr
     Ok(())
 }
 
-fn occurs_and_adjust(table: &mut TypeTable, var: TypeVarId, level: u32, ty: &Type) -> Result<(), ()> {
+fn occurs_and_adjust(
+    table: &mut TypeTable,
+    var: TypeVarId,
+    level: u32,
+    ty: &Type,
+) -> Result<(), ()> {
     match table.shallow(ty) {
         Type::Var(id) => {
             if id == var {
                 return Err(());
             }
-            if let VarState::Unbound { level: other_level, constraint } = table.state(id).clone()
+            if let VarState::Unbound {
+                level: other_level,
+                constraint,
+            } = table.state(id).clone()
                 && other_level > level
             {
                 table.set(id, VarState::Unbound { level, constraint });
             }
             Ok(())
         }
-        Type::Con(_, args) => args.iter().try_for_each(|arg| occurs_and_adjust(table, var, level, arg)),
+        Type::Con(_, args) => args
+            .iter()
+            .try_for_each(|arg| occurs_and_adjust(table, var, level, arg)),
         Type::Fun(params, result) => {
-            params.iter().try_for_each(|param| occurs_and_adjust(table, var, level, param))?;
+            params
+                .iter()
+                .try_for_each(|param| occurs_and_adjust(table, var, level, param))?;
             occurs_and_adjust(table, var, level, &result)
         }
         Type::Error => Ok(()),
@@ -107,19 +135,38 @@ fn occurs_and_adjust(table: &mut TypeTable, var: TypeVarId, level: u32, ty: &Typ
 }
 
 /// Requires `ty` to satisfy `constraint`; an unbound variable records it for later.
-pub fn constrain(table: &mut TypeTable, constraint: Constraint, ty: &Type) -> Result<(), UnifyError> {
-    let fail = |table: &TypeTable| UnifyError::Constraint { constraint, ty: table.resolve(ty) };
+pub fn constrain(
+    table: &mut TypeTable,
+    constraint: Constraint,
+    ty: &Type,
+) -> Result<(), UnifyError> {
+    let fail = |table: &TypeTable| UnifyError::Constraint {
+        constraint,
+        ty: table.resolve(ty),
+    };
     match table.shallow(ty) {
         Type::Error => Ok(()),
         Type::Var(id) => {
-            if let VarState::Unbound { level, constraint: existing } = table.state(id).clone() {
+            if let VarState::Unbound {
+                level,
+                constraint: existing,
+            } = table.state(id).clone()
+            {
                 let merged = existing.map_or(constraint, |existing| existing.meet(constraint));
-                table.set(id, VarState::Unbound { level, constraint: Some(merged) });
+                table.set(
+                    id,
+                    VarState::Unbound {
+                        level,
+                        constraint: Some(merged),
+                    },
+                );
             }
             Ok(())
         }
         Type::Con(name, args) => {
-            if !constraint.accepts(&name) || (constraint == Constraint::Eq && table.is_non_equatable(&name)) {
+            if !constraint.accepts(&name)
+                || (constraint == Constraint::Eq && table.is_non_equatable(&name))
+            {
                 return Err(fail(table));
             }
             if constraint == Constraint::Eq {
@@ -128,7 +175,11 @@ pub fn constrain(table: &mut TypeTable, constraint: Constraint, ty: &Type) -> Re
                 }
                 return Ok(());
             }
-            if args.is_empty() { Ok(()) } else { Err(fail(table)) }
+            if args.is_empty() {
+                Ok(())
+            } else {
+                Err(fail(table))
+            }
         }
         Type::Fun(..) => Err(fail(table)),
     }
@@ -154,10 +205,18 @@ mod tests {
     #[test]
     fn reports_mismatch_with_enclosing_types() {
         let mut table = TypeTable::default();
-        let error = unify(&mut table, &Type::list(int()), &Type::list(Type::con("String"))).unwrap_err();
+        let error = unify(
+            &mut table,
+            &Type::list(int()),
+            &Type::list(Type::con("String")),
+        )
+        .unwrap_err();
         assert_eq!(
             error,
-            UnifyError::Mismatch { expected: Type::list(int()), found: Type::list(Type::con("String")) }
+            UnifyError::Mismatch {
+                expected: Type::list(int()),
+                found: Type::list(Type::con("String"))
+            }
         );
     }
 
@@ -177,7 +236,13 @@ mod tests {
         let inner = table.fresh(3);
         unify(&mut table, &outer, &Type::list(inner.clone())).unwrap();
         let Type::Var(id) = inner else { unreachable!() };
-        assert_eq!(table.state(id), &VarState::Unbound { level: 1, constraint: None });
+        assert_eq!(
+            table.state(id),
+            &VarState::Unbound {
+                level: 1,
+                constraint: None
+            }
+        );
     }
 
     #[test]
@@ -259,7 +324,10 @@ mod tests {
         let ty = Type::Fun(vec![Type::Var(7), Type::Var(3)], Box::new(Type::Var(7)));
         assert_eq!(display(&ty), "('a, 'b) -> 'a");
         assert_eq!(display(&Type::option(Type::option(int()))), "Int??");
-        assert_eq!(display(&Type::option(Type::Fun(vec![], Box::new(int())))), "(() -> Int)?");
+        assert_eq!(
+            display(&Type::option(Type::Fun(vec![], Box::new(int())))),
+            "(() -> Int)?"
+        );
         let names = display_all(&[&Type::Var(4), &Type::list(Type::Var(4))]);
         assert_eq!(names, vec!["'a".to_string(), "List<'a>".to_string()]);
     }

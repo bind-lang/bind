@@ -972,9 +972,7 @@ fn analyze_function(
                     ));
                 }
                 Some(table) => {
-                    if known_return(function)
-                        .is_some_and(|declared| declared.name != table.model)
-                    {
+                    if known_return(function).is_some_and(|declared| declared.name != table.model) {
                         diagnostics.push(Diagnostic::error(
                             "E5205",
                             format!("Database operation on `{}` produces `{}`, but function `{}` declares `{}`.", table.name, table.model, function.name, function.declared_return().display()),
@@ -1699,7 +1697,11 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
             "table,model,primary_key,column,type,nullable,required,has_default,engine\n",
         );
         let result = verify(&config, "aws-lambda");
-        assert!(result.diagnostics.iter().any(|item| item.code == "E7101"), "{:?}", result.diagnostics);
+        assert!(
+            result.diagnostics.iter().any(|item| item.code == "E7101"),
+            "{:?}",
+            result.diagnostics
+        );
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1715,7 +1717,10 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
 
     #[test]
     fn type_errors_are_ordered_by_file_and_line() {
-        let (root, config) = fixture("pure fun b(): Int = \"x\"\npure fun c(): Int = true\n", EMPTY_SCHEMA);
+        let (root, config) = fixture(
+            "pure fun b(): Int = \"x\"\npure fun c(): Int = true\n",
+            EMPTY_SCHEMA,
+        );
         fs::write(root.join("app/zeta.bd"), "pure fun a(): Int = \"y\"\n").unwrap();
         let result = verify(&config, "aws-lambda");
         let positions: Vec<_> = result
@@ -1739,10 +1744,9 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
         let source = "pure fun dobro(x) = x * 2\npure fun <T> ident(x: T): T = x\npure fun usa(): Int = dobro(ident(2))\n";
         let (root, config) = fixture(source, EMPTY_SCHEMA);
         let result = verify(&config, "aws-lambda");
-        let bad = result
-            .diagnostics
-            .iter()
-            .any(|item| item.code == "E2202" || item.code == "E5205" || item.severity == Severity::Error);
+        let bad = result.diagnostics.iter().any(|item| {
+            item.code == "E2202" || item.code == "E5205" || item.severity == Severity::Error
+        });
         assert!(!bad, "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }

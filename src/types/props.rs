@@ -21,7 +21,11 @@ fn config() -> ProptestConfig {
 // ---- 1. unification produces a unifier ---------------------------------------------
 
 fn arb_type(vars: usize) -> impl Strategy<Value = Type> {
-    let leaf = prop_oneof![(0..vars).prop_map(Type::Var), Just(Type::con("Int")), Just(Type::con("String"))];
+    let leaf = prop_oneof![
+        (0..vars).prop_map(Type::Var),
+        Just(Type::con("Int")),
+        Just(Type::con("String"))
+    ];
     leaf.prop_recursive(3, 16, 2, |inner| {
         prop_oneof![
             inner.clone().prop_map(Type::list),
@@ -55,20 +59,65 @@ struct Entry {
 }
 
 const CORPUS: &[Entry] = &[
-    Entry { name: "ident", params: &["a"], body: "a" },
-    Entry { name: "constante", params: &["a", "b"], body: "a" },
-    Entry { name: "aplica", params: &["f", "x"], body: "f(x)" },
-    Entry { name: "compose", params: &["f", "g", "x"], body: "f(g(x))" },
-    Entry { name: "dobro", params: &["a"], body: "a * 2" },
-    Entry { name: "ouPadrao", params: &["a", "b"], body: "a ?: b" },
-    Entry { name: "cabeca", params: &["xs"], body: "first(xs)" },
-    Entry { name: "par", params: &["a", "b"], body: "listOf(a, b)" },
-    Entry { name: "troca", params: &["f", "a", "b"], body: "f(b, a)" },
-    Entry { name: "igualA", params: &["a", "b"], body: "a == b + 1" },
+    Entry {
+        name: "ident",
+        params: &["a"],
+        body: "a",
+    },
+    Entry {
+        name: "constante",
+        params: &["a", "b"],
+        body: "a",
+    },
+    Entry {
+        name: "aplica",
+        params: &["f", "x"],
+        body: "f(x)",
+    },
+    Entry {
+        name: "compose",
+        params: &["f", "g", "x"],
+        body: "f(g(x))",
+    },
+    Entry {
+        name: "dobro",
+        params: &["a"],
+        body: "a * 2",
+    },
+    Entry {
+        name: "ouPadrao",
+        params: &["a", "b"],
+        body: "a ?: b",
+    },
+    Entry {
+        name: "cabeca",
+        params: &["xs"],
+        body: "first(xs)",
+    },
+    Entry {
+        name: "par",
+        params: &["a", "b"],
+        body: "listOf(a, b)",
+    },
+    Entry {
+        name: "troca",
+        params: &["f", "a", "b"],
+        body: "f(b, a)",
+    },
+    Entry {
+        name: "igualA",
+        params: &["a", "b"],
+        body: "a == b + 1",
+    },
 ];
 
 fn source(entry: &Entry) -> String {
-    format!("fun {}({}) = {}\n", entry.name, entry.params.join(", "), entry.body)
+    format!(
+        "fun {}({}) = {}\n",
+        entry.name,
+        entry.params.join(", "),
+        entry.body
+    )
 }
 
 /// The signature of `name`, or `None` if the source does not parse or type-check.
@@ -91,11 +140,18 @@ fn to_source(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
     match ty {
         Type::Var(id) => {
             let next = names.len();
-            names.entry(*id).or_insert_with(|| format!("T{next}")).clone()
+            names
+                .entry(*id)
+                .or_insert_with(|| format!("T{next}"))
+                .clone()
         }
         Type::Con(name, args) if name == "Option" => {
             let inner = to_source(&args[0], names);
-            if matches!(args[0], Type::Fun(..)) { format!("({inner})?") } else { format!("{inner}?") }
+            if matches!(args[0], Type::Fun(..)) {
+                format!("({inner})?")
+            } else {
+                format!("{inner}?")
+            }
         }
         Type::Con(name, args) if args.is_empty() => name.clone(),
         Type::Con(name, args) => {
@@ -103,7 +159,8 @@ fn to_source(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
             format!("{name}<{}>", rendered.join(", "))
         }
         Type::Fun(params, result) => {
-            let rendered: Vec<String> = params.iter().map(|param| to_source(param, names)).collect();
+            let rendered: Vec<String> =
+                params.iter().map(|param| to_source(param, names)).collect();
             format!("({}) -> {}", rendered.join(", "), to_source(result, names))
         }
         Type::Error => "Unit".into(),
@@ -112,7 +169,9 @@ fn to_source(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
 
 /// The corpus entry annotated with the given function type.
 fn annotate(entry: &Entry, ty: &Type) -> String {
-    let Type::Fun(params, result) = ty else { unreachable!("corpus entries are functions") };
+    let Type::Fun(params, result) = ty else {
+        unreachable!("corpus entries are functions")
+    };
     let mut names = BTreeMap::new();
     let params: Vec<String> = entry
         .params
@@ -126,9 +185,21 @@ fn annotate(entry: &Entry, ty: &Type) -> String {
     } else {
         let mut ordered: Vec<&String> = names.values().collect();
         ordered.sort_by_key(|name| name[1..].parse::<usize>().unwrap_or(0));
-        format!("<{}> ", ordered.iter().map(|name| name.as_str()).collect::<Vec<_>>().join(", "))
+        format!(
+            "<{}> ",
+            ordered
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
     };
-    format!("fun {generics}{}({}): {result} = {}\n", entry.name, params.join(", "), entry.body)
+    format!(
+        "fun {generics}{}({}): {result} = {}\n",
+        entry.name,
+        params.join(", "),
+        entry.body
+    )
 }
 
 fn is_instance(general: &Type, specific: &Type) -> bool {
@@ -142,10 +213,14 @@ fn is_instance(general: &Type, specific: &Type) -> bool {
                 }
             },
             (Type::Con(a, xs), Type::Con(b, ys)) => {
-                a == b && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| matches(x, y, bound))
+                a == b
+                    && xs.len() == ys.len()
+                    && xs.iter().zip(ys).all(|(x, y)| matches(x, y, bound))
             }
             (Type::Fun(p, r), Type::Fun(q, s)) => {
-                p.len() == q.len() && p.iter().zip(q).all(|(x, y)| matches(x, y, bound)) && matches(r, s, bound)
+                p.len() == q.len()
+                    && p.iter().zip(q).all(|(x, y)| matches(x, y, bound))
+                    && matches(r, s, bound)
             }
             _ => false,
         }
@@ -176,16 +251,21 @@ fn arb_ground() -> impl Strategy<Value = Type> {
         Just(Type::con("Boolean")),
         Just(Type::list(Type::con("Int"))),
         Just(Type::option(Type::con("Int"))),
-        Just(Type::Fun(vec![Type::con("Int")], Box::new(Type::con("Int")))),
+        Just(Type::Fun(
+            vec![Type::con("Int")],
+            Box::new(Type::con("Int"))
+        )),
     ]
 }
 
 #[test]
 fn annotating_with_the_inferred_type_is_stable() {
     for entry in CORPUS {
-        let inferred = signature_of(&source(entry), entry.name).unwrap_or_else(|| panic!("{} must type-check", entry.name));
+        let inferred = signature_of(&source(entry), entry.name)
+            .unwrap_or_else(|| panic!("{} must type-check", entry.name));
         let annotated = annotate(entry, &inferred);
-        let again = signature_of(&annotated, entry.name).unwrap_or_else(|| panic!("annotated version rejected:\n{annotated}"));
+        let again = signature_of(&annotated, entry.name)
+            .unwrap_or_else(|| panic!("annotated version rejected:\n{annotated}"));
         assert_eq!(display(&inferred), display(&again), "{annotated}");
     }
 }
@@ -253,14 +333,19 @@ impl Universe {
         let mut types = Vec::new();
         for index in 0..count {
             if index == count - 1 {
-                types.push(vec![("Sim".to_string(), vec![]), ("Nao".to_string(), vec![])]);
+                types.push(vec![
+                    ("Sim".to_string(), vec![]),
+                    ("Nao".to_string(), vec![]),
+                ]);
                 continue;
             }
             let constructors = 1 + rng.below(3);
             let ctors = (0..constructors)
                 .map(|ctor| {
                     let arity = rng.below(3);
-                    let args = (0..arity).map(|_| index + 1 + rng.below(count - index - 1)).collect();
+                    let args = (0..arity)
+                        .map(|_| index + 1 + rng.below(count - index - 1))
+                        .collect();
                     (format!("C{index}_{ctor}"), args)
                 })
                 .collect();
@@ -275,7 +360,12 @@ impl Universe {
         }
         let ctors = &self.types[ty];
         let (name, args) = &ctors[rng.below(ctors.len())];
-        Pat::Ctor(name.clone(), args.iter().map(|arg| self.pattern(rng, *arg, depth - 1)).collect())
+        Pat::Ctor(
+            name.clone(),
+            args.iter()
+                .map(|arg| self.pattern(rng, *arg, depth - 1))
+                .collect(),
+        )
     }
 
     fn values(&self, ty: usize) -> Vec<Pat> {
@@ -295,7 +385,11 @@ impl Universe {
                     })
                     .collect();
             }
-            output.extend(partial.into_iter().map(|args| Pat::Ctor(name.clone(), args)));
+            output.extend(
+                partial
+                    .into_iter()
+                    .map(|args| Pat::Ctor(name.clone(), args)),
+            );
         }
         output
     }
@@ -310,7 +404,10 @@ impl Signatures for Universe {
                 .iter()
                 .map(|(ctor, args)| CtorSig {
                     name: ctor.clone(),
-                    args: args.iter().map(|arg| Type::con(&format!("T{arg}"))).collect(),
+                    args: args
+                        .iter()
+                        .map(|arg| Type::con(&format!("T{arg}")))
+                        .collect(),
                 })
                 .collect(),
         )
@@ -320,7 +417,9 @@ impl Signatures for Universe {
 fn matches_value(pattern: &Pat, value: &Pat) -> bool {
     match (pattern, value) {
         (Pat::Wild, _) => true,
-        (Pat::Ctor(a, xs), Pat::Ctor(b, ys)) => a == b && xs.iter().zip(ys).all(|(x, y)| matches_value(x, y)),
+        (Pat::Ctor(a, xs), Pat::Ctor(b, ys)) => {
+            a == b && xs.iter().zip(ys).all(|(x, y)| matches_value(x, y))
+        }
         _ => false,
     }
 }
@@ -353,7 +452,11 @@ proptest! {
 // ---- 5. parser round trip ------------------------------------------------------------
 
 fn node(kind: ExprKind) -> Expr {
-    Expr { id: 0, kind, span: Span::default() }
+    Expr {
+        id: 0,
+        kind,
+        span: Span::default(),
+    }
 }
 
 fn arb_name() -> impl Strategy<Value = String> {
@@ -370,16 +473,33 @@ fn arb_pattern() -> impl Strategy<Value = Pattern> {
         Just(Pattern::Null(Span::default())),
     ];
     leaf.prop_recursive(2, 8, 2, |inner| {
-        (prop::sample::select(vec!["Pago", "No"]), proptest::collection::vec(inner, 0..3)).prop_map(|(name, args)| {
-            Pattern::Constructor { name: name.to_string(), args, span: Span::default() }
-        })
+        (
+            prop::sample::select(vec!["Pago", "No"]),
+            proptest::collection::vec(inner, 0..3),
+        )
+            .prop_map(|(name, args)| Pattern::Constructor {
+                name: name.to_string(),
+                args,
+                span: Span::default(),
+            })
     })
 }
 
 fn arb_binary_op() -> impl Strategy<Value = BinaryOp> {
     prop::sample::select(vec![
-        BinaryOp::Add, BinaryOp::Sub, BinaryOp::Mul, BinaryOp::Div, BinaryOp::Rem, BinaryOp::Eq,
-        BinaryOp::NotEq, BinaryOp::Lt, BinaryOp::LtEq, BinaryOp::Gt, BinaryOp::GtEq, BinaryOp::And, BinaryOp::Or,
+        BinaryOp::Add,
+        BinaryOp::Sub,
+        BinaryOp::Mul,
+        BinaryOp::Div,
+        BinaryOp::Rem,
+        BinaryOp::Eq,
+        BinaryOp::NotEq,
+        BinaryOp::Lt,
+        BinaryOp::LtEq,
+        BinaryOp::Gt,
+        BinaryOp::GtEq,
+        BinaryOp::And,
+        BinaryOp::Or,
     ])
 }
 
@@ -394,36 +514,77 @@ fn arb_expr() -> impl Strategy<Value = Expr> {
     leaf.prop_recursive(4, 32, 3, |inner| {
         let boxed = |expr: Expr| Box::new(expr);
         prop_oneof![
-            (inner.clone(), inner.clone(), arb_binary_op())
-                .prop_map(move |(left, right, op)| node(ExprKind::Binary { op, left: boxed(left), right: boxed(right) })),
-            (inner.clone(), any::<bool>()).prop_map(move |(operand, negative)| node(ExprKind::Unary {
-                op: if negative { UnaryOp::Neg } else { UnaryOp::Not },
-                operand: boxed(operand),
-            })),
-            (inner.clone(), inner.clone())
-                .prop_map(move |(value, fallback)| node(ExprKind::Elvis { value: boxed(value), fallback: boxed(fallback) })),
-            (inner.clone(), arb_name()).prop_map(move |(target, name)| node(ExprKind::Field { target: boxed(target), name })),
-            (inner.clone(), arb_name()).prop_map(move |(target, name)| node(ExprKind::SafeField { target: boxed(target), name })),
-            (arb_name(), proptest::collection::vec(inner.clone(), 0..3)).prop_map(move |(name, args)| node(ExprKind::Call {
-                callee: boxed(node(ExprKind::Name(name))),
-                args,
-                children: None,
-            })),
-            (inner.clone(), inner.clone(), inner.clone()).prop_map(move |(condition, then_branch, else_branch)| node(ExprKind::If {
-                condition: boxed(condition),
-                then_branch: boxed(then_branch),
-                else_branch: boxed(else_branch),
-            })),
-            (proptest::collection::vec(arb_name(), 0..3), inner.clone()).prop_map(|(names, body)| node(ExprKind::Lambda {
-                params: names.into_iter().map(|name| (name, Span::default())).collect(),
-                body: Block { id: 0, stmts: vec![Stmt::Expr(body)], span: Span::default() },
-            })),
-            (inner.clone(), proptest::collection::vec((arb_pattern(), inner), 1..3)).prop_map(move |(scrutinee, arms)| {
-                node(ExprKind::When {
-                    scrutinee: boxed(scrutinee),
-                    arms: arms.into_iter().map(|(pattern, body)| Arm { pattern, body, span: Span::default() }).collect(),
+            (inner.clone(), inner.clone(), arb_binary_op()).prop_map(
+                move |(left, right, op)| node(ExprKind::Binary {
+                    op,
+                    left: boxed(left),
+                    right: boxed(right)
                 })
-            }),
+            ),
+            (inner.clone(), any::<bool>()).prop_map(move |(operand, negative)| node(
+                ExprKind::Unary {
+                    op: if negative { UnaryOp::Neg } else { UnaryOp::Not },
+                    operand: boxed(operand),
+                }
+            )),
+            (inner.clone(), inner.clone()).prop_map(move |(value, fallback)| node(
+                ExprKind::Elvis {
+                    value: boxed(value),
+                    fallback: boxed(fallback)
+                }
+            )),
+            (inner.clone(), arb_name()).prop_map(move |(target, name)| node(ExprKind::Field {
+                target: boxed(target),
+                name
+            })),
+            (inner.clone(), arb_name()).prop_map(move |(target, name)| node(ExprKind::SafeField {
+                target: boxed(target),
+                name
+            })),
+            (arb_name(), proptest::collection::vec(inner.clone(), 0..3)).prop_map(
+                move |(name, args)| node(ExprKind::Call {
+                    callee: boxed(node(ExprKind::Name(name))),
+                    args,
+                    children: None,
+                })
+            ),
+            (inner.clone(), inner.clone(), inner.clone()).prop_map(
+                move |(condition, then_branch, else_branch)| node(ExprKind::If {
+                    condition: boxed(condition),
+                    then_branch: boxed(then_branch),
+                    else_branch: boxed(else_branch),
+                })
+            ),
+            (proptest::collection::vec(arb_name(), 0..3), inner.clone()).prop_map(
+                |(names, body)| node(ExprKind::Lambda {
+                    params: names
+                        .into_iter()
+                        .map(|name| (name, Span::default()))
+                        .collect(),
+                    body: Block {
+                        id: 0,
+                        stmts: vec![Stmt::Expr(body)],
+                        span: Span::default()
+                    },
+                })
+            ),
+            (
+                inner.clone(),
+                proptest::collection::vec((arb_pattern(), inner), 1..3)
+            )
+                .prop_map(move |(scrutinee, arms)| {
+                    node(ExprKind::When {
+                        scrutinee: boxed(scrutinee),
+                        arms: arms
+                            .into_iter()
+                            .map(|(pattern, body)| Arm {
+                                pattern,
+                                body,
+                                span: Span::default(),
+                            })
+                            .collect(),
+                    })
+                }),
         ]
     })
 }
@@ -433,7 +594,10 @@ fn reparse(source: &str) -> Result<String, String> {
     if !lex_diagnostics.is_empty() {
         return Err(format!("{lex_diagnostics:?}"));
     }
-    let tokens: Vec<Token> = tokens.into_iter().filter(|token| token.kind != TokenKind::Eof).collect();
+    let tokens: Vec<Token> = tokens
+        .into_iter()
+        .filter(|token| token.kind != TokenKind::Eof)
+        .collect();
     let (block, diagnostics) = parse_expression_tokens(&tokens, &Span::default());
     if !diagnostics.is_empty() {
         return Err(format!("{diagnostics:?}"));

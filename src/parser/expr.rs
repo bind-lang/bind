@@ -52,7 +52,11 @@ pub fn parse_type_text(text: &str, span: &Span) -> Result<TypeExpr, Diagnostic> 
     match (parsed, parser.diagnostics.into_iter().next()) {
         (_, Some(diagnostic)) => Err(diagnostic),
         (Some(ty), None) if complete => Ok(ty),
-        _ => Err(Diagnostic::error("E7005", format!("Invalid type `{text}`."), span.clone())),
+        _ => Err(Diagnostic::error(
+            "E7005",
+            format!("Invalid type `{text}`."),
+            span.clone(),
+        )),
     }
 }
 
@@ -92,9 +96,18 @@ pub(crate) struct ExprParser {
 impl ExprParser {
     pub(crate) fn new(tokens: &[Token], fallback: &Span) -> Self {
         let mut tokens = tokens.to_vec();
-        if tokens.last().is_none_or(|token| token.kind != TokenKind::Eof) {
-            let span = tokens.last().map_or_else(|| fallback.clone(), |token| token.span.clone());
-            tokens.push(Token { kind: TokenKind::Eof, text: String::new(), span });
+        if tokens
+            .last()
+            .is_none_or(|token| token.kind != TokenKind::Eof)
+        {
+            let span = tokens
+                .last()
+                .map_or_else(|| fallback.clone(), |token| token.span.clone());
+            tokens.push(Token {
+                kind: TokenKind::Eof,
+                text: String::new(),
+                span,
+            });
         }
         Self {
             tokens,
@@ -150,7 +163,11 @@ impl ExprParser {
             return Some(());
         }
         let token = self.peek().clone();
-        self.error("E7005", format!("Expected `{text}`, found {}.", describe(&token)), token.span);
+        self.error(
+            "E7005",
+            format!("Expected `{text}`, found {}.", describe(&token)),
+            token.span,
+        );
         None
     }
 
@@ -165,7 +182,11 @@ impl ExprParser {
     }
 
     fn previous_line(&self) -> usize {
-        if self.index == 0 { 0 } else { self.tokens[self.index - 1].span.line }
+        if self.index == 0 {
+            0
+        } else {
+            self.tokens[self.index - 1].span.line
+        }
     }
 
     fn same_line(&self) -> bool {
@@ -178,7 +199,11 @@ impl ExprParser {
             self.advance();
             Some(token.text)
         } else {
-            self.error("E7005", format!("Expected a name, found {}.", describe(&token)), token.span);
+            self.error(
+                "E7005",
+                format!("Expected a name, found {}.", describe(&token)),
+                token.span,
+            );
             None
         }
     }
@@ -190,17 +215,28 @@ impl ExprParser {
     }
 
     fn node(&mut self, kind: ExprKind, span: Span) -> Expr {
-        Expr { id: self.next_id(), kind, span }
+        Expr {
+            id: self.next_id(),
+            kind,
+            span,
+        }
     }
 
     fn error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
-        self.diagnostics.push(Diagnostic::error(code, message, span));
+        self.diagnostics
+            .push(Diagnostic::error(code, message, span));
     }
 
     fn removed(&mut self, what: &str, span: Span) {
         let (message, hint) = match what {
-            "var" => ("`var` was removed: Bind values are immutable.", "Use `val`."),
-            "!!" => ("`!!` was removed: it can crash at runtime.", "Handle `null` with `when`, `?:` or `?.`."),
+            "var" => (
+                "`var` was removed: Bind values are immutable.",
+                "Use `val`.",
+            ),
+            "!!" => (
+                "`!!` was removed: it can crash at runtime.",
+                "Handle `null` with `when`, `?:` or `?.`.",
+            ),
             "throw" | "try" | "catch" => (
                 "Exceptions were removed: errors are values in Bind.",
                 "Return a `Result<T, E>` or a nullable value.",
@@ -214,7 +250,8 @@ impl ExprParser {
                 "Concatenate with `+`, e.g. `\"Hello, \" + name`.",
             ),
         };
-        self.diagnostics.push(Diagnostic::error("E7001", message, span).with_hint(hint));
+        self.diagnostics
+            .push(Diagnostic::error("E7001", message, span).with_hint(hint));
     }
 
     /// Runs `parse` one nesting level deeper, or reports E7004 (once) beyond `MAX_DEPTH`.
@@ -294,7 +331,10 @@ impl ExprParser {
             if precedence < min {
                 break;
             }
-            let crosses_lines = matches!(infix, Infix::Op(BinaryOp::And | BinaryOp::Or) | Infix::Elvis);
+            let crosses_lines = matches!(
+                infix,
+                Infix::Op(BinaryOp::And | BinaryOp::Or) | Infix::Elvis
+            );
             if !self.same_line() && !crosses_lines {
                 break;
             }
@@ -307,12 +347,23 @@ impl ExprParser {
                 self.advance();
             }
             // `?:` is right-associative (`a ?: b ?: c` is `a ?: (b ?: c)`); the rest are left-associative.
-            let next = if matches!(infix, Infix::Elvis) { precedence } else { precedence + 1 };
+            let next = if matches!(infix, Infix::Elvis) {
+                precedence
+            } else {
+                precedence + 1
+            };
             let right = self.binary(next)?;
             let span = left.span.clone();
             let kind = match infix {
-                Infix::Op(op) => ExprKind::Binary { op, left: Box::new(left), right: Box::new(right) },
-                Infix::Elvis => ExprKind::Elvis { value: Box::new(left), fallback: Box::new(right) },
+                Infix::Op(op) => ExprKind::Binary {
+                    op,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+                Infix::Elvis => ExprKind::Elvis {
+                    value: Box::new(left),
+                    fallback: Box::new(right),
+                },
             };
             left = self.node(kind, span);
         }
@@ -329,7 +380,13 @@ impl ExprParser {
         };
         let span = self.advance().span;
         let operand = self.nested(Self::unary)?;
-        Some(self.node(ExprKind::Unary { op, operand: Box::new(operand) }, span))
+        Some(self.node(
+            ExprKind::Unary {
+                op,
+                operand: Box::new(operand),
+            },
+            span,
+        ))
     }
 
     fn postfix(&mut self) -> Option<Expr> {
@@ -339,22 +396,47 @@ impl ExprParser {
                 let mut args = self.arguments()?;
                 let children = self.trailing(&mut args);
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::Call { callee: Box::new(expr), args, children }, span);
+                expr = self.node(
+                    ExprKind::Call {
+                        callee: Box::new(expr),
+                        args,
+                        children,
+                    },
+                    span,
+                );
             } else if self.is(".") {
                 self.advance();
                 let name = self.identifier()?;
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::Field { target: Box::new(expr), name }, span.clone());
+                expr = self.node(
+                    ExprKind::Field {
+                        target: Box::new(expr),
+                        name,
+                    },
+                    span.clone(),
+                );
                 if self.is("{") && self.same_line() && self.looks_like_builder() {
                     let fields = self.builder_fields()?;
-                    expr = self.node(ExprKind::Builder { target: Box::new(expr), fields }, span);
+                    expr = self.node(
+                        ExprKind::Builder {
+                            target: Box::new(expr),
+                            fields,
+                        },
+                        span,
+                    );
                 }
             } else if self.adjacent_pair("?", ".") {
                 self.advance();
                 self.advance();
                 let name = self.identifier()?;
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::SafeField { target: Box::new(expr), name }, span);
+                expr = self.node(
+                    ExprKind::SafeField {
+                        target: Box::new(expr),
+                        name,
+                    },
+                    span,
+                );
             } else if self.adjacent_pair("!", "!") && self.same_line() {
                 let span = self.advance().span;
                 self.advance();
@@ -363,7 +445,14 @@ impl ExprParser {
                 let mut args = Vec::new();
                 let children = self.trailing(&mut args);
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::Call { callee: Box::new(expr), args, children }, span);
+                expr = self.node(
+                    ExprKind::Call {
+                        callee: Box::new(expr),
+                        args,
+                        children,
+                    },
+                    span,
+                );
             } else {
                 break;
             }
@@ -381,7 +470,11 @@ impl ExprParser {
                 && self.peek_at(1).text == "="
             {
                 let span = self.peek().span.clone();
-                self.error("E7004", "Named arguments are not supported; pass arguments by position.", span);
+                self.error(
+                    "E7004",
+                    "Named arguments are not supported; pass arguments by position.",
+                    span,
+                );
                 self.advance();
                 self.advance();
             }
@@ -405,9 +498,15 @@ impl ExprParser {
             TokenKind::Number => {
                 self.advance();
                 match classify_number(&token.text) {
-                    Ok(NumberLiteral::Int(text)) => Some(self.node(ExprKind::Int(text), token.span)),
-                    Ok(NumberLiteral::Double(text)) => Some(self.node(ExprKind::Double(text), token.span)),
-                    Ok(NumberLiteral::Float(text)) => Some(self.node(ExprKind::Float(text), token.span)),
+                    Ok(NumberLiteral::Int(text)) => {
+                        Some(self.node(ExprKind::Int(text), token.span))
+                    }
+                    Ok(NumberLiteral::Double(text)) => {
+                        Some(self.node(ExprKind::Double(text), token.span))
+                    }
+                    Ok(NumberLiteral::Float(text)) => {
+                        Some(self.node(ExprKind::Float(text), token.span))
+                    }
                     Err(message) => {
                         self.error("E7004", message, token.span);
                         None
@@ -423,11 +522,19 @@ impl ExprParser {
             }
             TokenKind::Character => {
                 self.advance();
-                self.error("E7004", "Character literals are not supported; use a String.", token.span);
+                self.error(
+                    "E7004",
+                    "Character literals are not supported; use a String.",
+                    token.span,
+                );
                 None
             }
             TokenKind::Eof => {
-                self.error("E7005", "Expected an expression, found end of input.", token.span);
+                self.error(
+                    "E7005",
+                    "Expected an expression, found end of input.",
+                    token.span,
+                );
                 None
             }
             TokenKind::Identifier => match token.text.as_str() {
@@ -475,7 +582,11 @@ impl ExprParser {
                 None
             }
             TokenKind::Symbol => {
-                self.error("E7005", format!("Expected an expression, found `{}`.", token.text), token.span);
+                self.error(
+                    "E7005",
+                    format!("Expected an expression, found `{}`.", token.text),
+                    token.span,
+                );
                 None
             }
         }
@@ -491,7 +602,9 @@ impl ExprParser {
                 && (self.is(";")
                     || self.is("}")
                     || self.is(")")
-                    || (self.nesting == 0 && self.index > 0 && self.peek().span.line != self.previous_line()))
+                    || (self.nesting == 0
+                        && self.index > 0
+                        && self.peek().span.line != self.previous_line()))
             {
                 return;
             }
@@ -514,7 +627,11 @@ impl ExprParser {
             return;
         }
         let token = self.peek().clone();
-        self.error("E7005", format!("Expected a new line or `;` before {}.", describe(&token)), token.span);
+        self.error(
+            "E7005",
+            format!("Expected a new line or `;` before {}.", describe(&token)),
+            token.span,
+        );
         self.recover();
     }
 
@@ -544,10 +661,19 @@ impl ExprParser {
         if self.is("val") {
             let span = self.advance().span;
             let name = self.identifier()?;
-            let annotation = if self.consume(":") { Some(self.type_expr()?) } else { None };
+            let annotation = if self.consume(":") {
+                Some(self.type_expr()?)
+            } else {
+                None
+            };
             self.expect("=")?;
             let value = self.expression()?;
-            return Some(Stmt::Val { name, annotation, value, span });
+            return Some(Stmt::Val {
+                name,
+                annotation,
+                value,
+                span,
+            });
         }
         self.expression().map(Stmt::Expr)
     }
@@ -559,7 +685,11 @@ impl ExprParser {
         let stmts = self.statements(Some("}"));
         let _ = self.expect("}");
         self.nesting = saved;
-        Block { id: self.next_id(), stmts, span }
+        Block {
+            id: self.next_id(),
+            stmts,
+            span,
+        }
     }
 
     /// `{ x, y -> ... }` or `{ -> ... }`.
@@ -595,7 +725,11 @@ impl ExprParser {
         let stmts = self.statements(Some("}"));
         let closed = self.expect("}").is_some();
         self.nesting = saved;
-        let body = Block { id: self.next_id(), stmts, span: body_span };
+        let body = Block {
+            id: self.next_id(),
+            stmts,
+            span: body_span,
+        };
         if !closed {
             return None;
         }
@@ -679,7 +813,11 @@ impl ExprParser {
         let then_branch = self.branch()?;
         if !self.consume("else") {
             let token = self.peek().clone();
-            self.error("E7005", "`if` is an expression in Bind and requires an `else` branch.", token.span);
+            self.error(
+                "E7005",
+                "`if` is an expression in Bind and requires an `else` branch.",
+                token.span,
+            );
             return None;
         }
         let else_branch = self.branch()?;
@@ -696,7 +834,11 @@ impl ExprParser {
     fn when_expression(&mut self) -> Option<Expr> {
         let span = self.advance().span;
         if !self.is("(") {
-            self.error("E7004", "`when` without a subject is not supported; write `when (value) { ... }`.", span);
+            self.error(
+                "E7004",
+                "`when` without a subject is not supported; write `when (value) { ... }`.",
+                span,
+            );
             return None;
         }
         let scrutinee = self.parenthesized()?;
@@ -728,7 +870,13 @@ impl ExprParser {
         if !closed {
             return None;
         }
-        Some(self.node(ExprKind::When { scrutinee: Box::new(scrutinee), arms }, span))
+        Some(self.node(
+            ExprKind::When {
+                scrutinee: Box::new(scrutinee),
+                arms,
+            },
+            span,
+        ))
     }
 
     fn arm(&mut self) -> Option<Arm> {
@@ -736,7 +884,11 @@ impl ExprParser {
         let pattern = self.pattern()?;
         self.expect("->")?;
         let body = self.branch()?;
-        Some(Arm { pattern, body, span })
+        Some(Arm {
+            pattern,
+            body,
+            span,
+        })
     }
 
     fn pattern(&mut self) -> Option<Pattern> {
@@ -786,12 +938,20 @@ impl ExprParser {
                             }
                         }
                         self.expect(")")?;
-                        Some(Pattern::Constructor { name, args, span: token.span })
+                        Some(Pattern::Constructor {
+                            name,
+                            args,
+                            span: token.span,
+                        })
                     }
                 }
             }
             _ => {
-                self.error("E7005", format!("Expected a pattern, found {}.", describe(&token)), token.span);
+                self.error(
+                    "E7005",
+                    format!("Expected a pattern, found {}.", describe(&token)),
+                    token.span,
+                );
                 None
             }
         }
@@ -799,7 +959,9 @@ impl ExprParser {
 
     fn number_pattern(&mut self, token: &Token, sign: &str) -> Pattern {
         match classify_number(&token.text) {
-            Ok(NumberLiteral::Int(text)) => Pattern::Int(format!("{sign}{text}"), token.span.clone()),
+            Ok(NumberLiteral::Int(text)) => {
+                Pattern::Int(format!("{sign}{text}"), token.span.clone())
+            }
             Ok(NumberLiteral::Double(text) | NumberLiteral::Float(text)) => {
                 Pattern::Double(format!("{sign}{text}"), token.span.clone())
             }
@@ -830,11 +992,18 @@ impl ExprParser {
             self.expect(")")?;
             if self.consume("->") {
                 let result = self.type_expr()?;
-                TypeExpr::Function { params, result: Box::new(result) }
+                TypeExpr::Function {
+                    params,
+                    result: Box::new(result),
+                }
             } else if params.len() == 1 {
                 params.remove(0)
             } else {
-                self.error("E7005", "Expected `->` after the parameter types of a function type.", span);
+                self.error(
+                    "E7005",
+                    "Expected `->` after the parameter types of a function type.",
+                    span,
+                );
                 return None;
             }
         } else {
@@ -896,7 +1065,11 @@ fn classify_number(text: &str) -> Result<NumberLiteral, &'static str> {
         return Ok(NumberLiteral::Double(cleaned));
     }
     let digits = cleaned.trim_end_matches('l').trim_start_matches('0');
-    Ok(NumberLiteral::Int(if digits.is_empty() { "0".into() } else { digits.to_string() }))
+    Ok(NumberLiteral::Int(if digits.is_empty() {
+        "0".into()
+    } else {
+        digits.to_string()
+    }))
 }
 
 #[cfg(test)]
@@ -907,7 +1080,10 @@ mod tests {
     fn tokens(source: &str) -> Vec<Token> {
         let (tokens, diagnostics) = lex("t.bd", source);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        tokens.into_iter().filter(|token| token.kind != TokenKind::Eof).collect()
+        tokens
+            .into_iter()
+            .filter(|token| token.kind != TokenKind::Eof)
+            .collect()
     }
 
     fn expression(source: &str) -> String {
@@ -937,8 +1113,14 @@ mod tests {
     #[test]
     fn parses_calls_fields_and_safe_calls() {
         assert_eq!(expression("f(a, g(b))"), "{ f(a, g(b)) }");
-        assert_eq!(expression("server.getCustomer(id).name"), "{ server.getCustomer(id).name }");
-        assert_eq!(expression("cliente?.apelido ?: nome"), "{ (cliente?.apelido ?: nome) }");
+        assert_eq!(
+            expression("server.getCustomer(id).name"),
+            "{ server.getCustomer(id).name }"
+        );
+        assert_eq!(
+            expression("cliente?.apelido ?: nome"),
+            "{ (cliente?.apelido ?: nome) }"
+        );
         assert_eq!(expression("f(\n    a,\n    b\n)"), "{ f(a, b) }");
     }
 
@@ -1000,7 +1182,10 @@ mod tests {
 
     #[test]
     fn parses_statements_separated_by_newlines_and_semicolons() {
-        assert_eq!(block("val x = 1\nval y: Int = x + 1\ny"), "{ val x = 1; val y: Int = (x + 1); y }");
+        assert_eq!(
+            block("val x = 1\nval y: Int = x + 1\ny"),
+            "{ val x = 1; val y: Int = (x + 1); y }"
+        );
         assert_eq!(block("a; b"), "{ a; b }");
         assert_eq!(block(""), "{ }");
         assert_eq!(block_codes("a b"), vec!["E7005"]);
@@ -1014,7 +1199,10 @@ mod tests {
     #[test]
     fn parses_if_and_requires_else() {
         assert_eq!(block("if (c) 1 else 2"), "{ (if (c) 1 else 2) }");
-        assert_eq!(block("if (c) {\n    1\n} else {\n    2\n}"), "{ (if (c) { 1 } else { 2 }) }");
+        assert_eq!(
+            block("if (c) {\n    1\n} else {\n    2\n}"),
+            "{ (if (c) { 1 } else { 2 }) }"
+        );
         assert_eq!(block_codes("if (c) 1"), vec!["E7005"]);
     }
 
@@ -1025,7 +1213,9 @@ mod tests {
             "{ when (p) { Pago(v, _) -> v; Cancelado -> 0; _ -> 1 } }"
         );
         assert_eq!(
-            block("when (x) { null -> 0; -1 -> 1; \"a\" -> 2; true -> 3; Status.Ativo -> 4; n -> n }"),
+            block(
+                "when (x) { null -> 0; -1 -> 1; \"a\" -> 2; true -> 3; Status.Ativo -> 4; n -> n }"
+            ),
             "{ when (x) { null -> 0; -1 -> 1; \"a\" -> 2; true -> 3; Ativo -> 4; n -> n } }"
         );
         assert_eq!(block_codes("when { x -> 1 }"), vec!["E7004"]);
@@ -1033,9 +1223,15 @@ mod tests {
 
     #[test]
     fn parses_lambdas_and_trailing_blocks() {
-        assert_eq!(block("val f = { x, y -> x + y }"), "{ val f = ({ x, y -> (x + y) }) }");
+        assert_eq!(
+            block("val f = { x, y -> x + y }"),
+            "{ val f = ({ x, y -> (x + y) }) }"
+        );
         assert_eq!(block("val g = { -> 1 }"), "{ val g = ({ -> 1 }) }");
-        assert_eq!(block("map(xs) { x -> x + 1 }"), "{ map(xs, ({ x -> (x + 1) })) }");
+        assert_eq!(
+            block("map(xs) { x -> x + 1 }"),
+            "{ map(xs, ({ x -> (x + 1) })) }"
+        );
         assert_eq!(
             block("UI {\n    Div(\"card\") {\n        Text(\"a\")\n        Text(b.name)\n    }\n}"),
             "{ UI() { Div(\"card\") { Text(\"a\"); Text(b.name) } } }"
@@ -1071,9 +1267,19 @@ mod tests {
         assert_eq!(codes(&format!("{}x", "- ".repeat(2_000))), vec!["E7004"]);
         let whens = format!("{}x{}", "when (x) { _ -> ".repeat(300), " }".repeat(300));
         assert_eq!(codes(&whens), vec!["E7004"]);
-        let patterns = format!("when (x) {{ {}y{} -> 1 }}", "C(".repeat(300), ")".repeat(300));
+        let patterns = format!(
+            "when (x) {{ {}y{} -> 1 }}",
+            "C(".repeat(300),
+            ")".repeat(300)
+        );
         assert_eq!(codes(&patterns), vec!["E7004"]);
-        assert!(parse_type_text(&format!("{}Int{}", "List<".repeat(300), ">".repeat(300)), &Span::default()).is_err());
+        assert!(
+            parse_type_text(
+                &format!("{}Int{}", "List<".repeat(300), ">".repeat(300)),
+                &Span::default()
+            )
+            .is_err()
+        );
         assert!(codes(&nested(200)).is_empty());
     }
 

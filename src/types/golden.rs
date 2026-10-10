@@ -19,12 +19,19 @@ fn run_case(path: &Path) -> (String, Vec<String>) {
     let mut schemes = None;
     if !has_errors(&diagnostics) {
         let schema_path = path.with_extension("csv");
-        let schema = if schema_path.exists() { DatabaseSchema::load(&schema_path).unwrap() } else { DatabaseSchema::default() };
+        let schema = if schema_path.exists() {
+            DatabaseSchema::load(&schema_path).unwrap()
+        } else {
+            DatabaseSchema::default()
+        };
         let (typed, mut type_diagnostics) = super::check(&program, &schema);
         diagnostics.append(&mut type_diagnostics);
         schemes = Some(typed.schemes);
     }
-    let errors: Vec<_> = diagnostics.iter().filter(|item| item.severity == Severity::Error).collect();
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|item| item.severity == Severity::Error)
+        .collect();
     let mut lines = Vec::new();
     let mut codes: Vec<String> = errors.iter().map(|item| item.code.to_string()).collect();
     if errors.is_empty()
@@ -35,7 +42,10 @@ fn run_case(path: &Path) -> (String, Vec<String>) {
         }
     }
     for item in errors {
-        lines.push(format!("{} {}:{} {}", item.code, item.span.line, item.span.column, item.message));
+        lines.push(format!(
+            "{} {}:{} {}",
+            item.code, item.span.line, item.span.column, item.message
+        ));
     }
     codes.sort();
     codes.dedup();
@@ -44,8 +54,15 @@ fn run_case(path: &Path) -> (String, Vec<String>) {
 
 fn declared_codes(source: &str) -> Vec<String> {
     let first = source.lines().next().unwrap_or_default();
-    let list = first.strip_prefix("// expect:").expect("a golden case must start with `// expect:`").trim();
-    let mut codes: Vec<String> = if list == "ok" { Vec::new() } else { list.split_whitespace().map(str::to_string).collect() };
+    let list = first
+        .strip_prefix("// expect:")
+        .expect("a golden case must start with `// expect:`")
+        .trim();
+    let mut codes: Vec<String> = if list == "ok" {
+        Vec::new()
+    } else {
+        list.split_whitespace().map(str::to_string).collect()
+    };
     codes.sort();
     codes.dedup();
     codes
@@ -61,13 +78,20 @@ fn golden_cases() {
         .filter(|path| path.extension().is_some_and(|extension| extension == "bd"))
         .collect();
     cases.sort();
-    assert!(!cases.is_empty(), "no golden cases in {}", directory.display());
+    assert!(
+        !cases.is_empty(),
+        "no golden cases in {}",
+        directory.display()
+    );
     let mut failures = Vec::new();
     for case in cases {
         let expected_codes = declared_codes(&fs::read_to_string(&case).unwrap());
         let (output, codes) = run_case(&case);
         if codes != expected_codes {
-            failures.push(format!("{}: expected {expected_codes:?}, got {codes:?}\n{output}", case.display()));
+            failures.push(format!(
+                "{}: expected {expected_codes:?}, got {codes:?}\n{output}",
+                case.display()
+            ));
             continue;
         }
         let expected_path = case.with_extension("expected");
@@ -77,7 +101,10 @@ fn golden_cases() {
         }
         let expected = fs::read_to_string(&expected_path).unwrap_or_default();
         if expected != output {
-            failures.push(format!("{}: output differs\n--- expected\n{expected}--- actual\n{output}", case.display()));
+            failures.push(format!(
+                "{}: output differs\n--- expected\n{expected}--- actual\n{output}",
+                case.display()
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));

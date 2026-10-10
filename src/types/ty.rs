@@ -31,7 +31,9 @@ impl Type {
             Type::Error => true,
             Type::Var(_) => false,
             Type::Con(_, args) => args.iter().any(Type::contains_error),
-            Type::Fun(params, result) => params.iter().any(Type::contains_error) || result.contains_error(),
+            Type::Fun(params, result) => {
+                params.iter().any(Type::contains_error) || result.contains_error()
+            }
         }
     }
 }
@@ -59,7 +61,9 @@ impl Constraint {
     pub fn accepts(self, name: &str) -> bool {
         match self {
             Constraint::Num => NUMERIC.contains(&name),
-            Constraint::Sub => Constraint::Num.accepts(name) || matches!(name, "Money" | "Duration"),
+            Constraint::Sub => {
+                Constraint::Num.accepts(name) || matches!(name, "Money" | "Duration")
+            }
             Constraint::Add => Constraint::Sub.accepts(name) || name == "String",
             Constraint::Ord => {
                 Constraint::Add.accepts(name) || matches!(name, "Date" | "DateTime" | "Instant")
@@ -72,7 +76,9 @@ impl Constraint {
         match self {
             Constraint::Num => "`*` and `/` (accepted types: Int, Double, Float, Decimal)",
             Constraint::Sub => "`-` (accepted types: Int, Double, Float, Decimal, Money, Duration)",
-            Constraint::Add => "`+` (accepted types: Int, Double, Float, Decimal, Money, Duration, String)",
+            Constraint::Add => {
+                "`+` (accepted types: Int, Double, Float, Decimal, Money, Duration, String)"
+            }
             Constraint::Ord => {
                 "ordering comparisons (accepted types: Int, Double, Float, Decimal, Money, Duration, String, Date, DateTime, Instant)"
             }
@@ -83,7 +89,10 @@ impl Constraint {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VarState {
-    Unbound { level: u32, constraint: Option<Constraint> },
+    Unbound {
+        level: u32,
+        constraint: Option<Constraint>,
+    },
     Link(Type),
 }
 
@@ -105,7 +114,10 @@ impl TypeTable {
     }
 
     pub fn fresh(&mut self, level: u32) -> Type {
-        self.vars.push(VarState::Unbound { level, constraint: None });
+        self.vars.push(VarState::Unbound {
+            level,
+            constraint: None,
+        });
         Type::Var(self.vars.len() - 1)
     }
 
@@ -131,7 +143,9 @@ impl TypeTable {
     /// Follows every link.
     pub fn resolve(&self, ty: &Type) -> Type {
         match self.shallow(ty) {
-            Type::Con(name, args) => Type::Con(name, args.iter().map(|arg| self.resolve(arg)).collect()),
+            Type::Con(name, args) => {
+                Type::Con(name, args.iter().map(|arg| self.resolve(arg)).collect())
+            }
             Type::Fun(params, result) => Type::Fun(
                 params.iter().map(|param| self.resolve(param)).collect(),
                 Box::new(self.resolve(&result)),
@@ -149,7 +163,10 @@ pub struct Scheme {
 
 impl Scheme {
     pub fn mono(ty: Type) -> Scheme {
-        Scheme { vars: Vec::new(), ty }
+        Scheme {
+            vars: Vec::new(),
+            ty,
+        }
     }
 }
 
@@ -178,12 +195,19 @@ fn collect_vars(ty: &Type, output: &mut Vec<TypeVarId>) {
 
 /// Quantifies the variables created deeper than `level`. Constrained variables are never
 /// quantified: they are returned as ambiguous so the caller reports E7302.
-pub fn generalize(table: &TypeTable, level: u32, ty: &Type) -> (Scheme, Vec<(TypeVarId, Constraint)>) {
+pub fn generalize(
+    table: &TypeTable,
+    level: u32,
+    ty: &Type,
+) -> (Scheme, Vec<(TypeVarId, Constraint)>) {
     let resolved = table.resolve(ty);
     let mut vars = Vec::new();
     let mut ambiguous = Vec::new();
     for id in free_vars(table, &resolved) {
-        if let VarState::Unbound { level: var_level, constraint } = table.state(id)
+        if let VarState::Unbound {
+            level: var_level,
+            constraint,
+        } = table.state(id)
             && *var_level > level
         {
             match constraint {
@@ -199,17 +223,26 @@ pub fn instantiate(table: &mut TypeTable, scheme: &Scheme, level: u32) -> Type {
     if scheme.vars.is_empty() {
         return scheme.ty.clone();
     }
-    let mapping: BTreeMap<TypeVarId, Type> =
-        scheme.vars.iter().map(|id| (*id, table.fresh(level))).collect();
+    let mapping: BTreeMap<TypeVarId, Type> = scheme
+        .vars
+        .iter()
+        .map(|id| (*id, table.fresh(level)))
+        .collect();
     substitute(&scheme.ty, &mapping)
 }
 
 pub fn substitute(ty: &Type, mapping: &BTreeMap<TypeVarId, Type>) -> Type {
     match ty {
         Type::Var(id) => mapping.get(id).cloned().unwrap_or(Type::Var(*id)),
-        Type::Con(name, args) => Type::Con(name.clone(), args.iter().map(|arg| substitute(arg, mapping)).collect()),
+        Type::Con(name, args) => Type::Con(
+            name.clone(),
+            args.iter().map(|arg| substitute(arg, mapping)).collect(),
+        ),
         Type::Fun(params, result) => Type::Fun(
-            params.iter().map(|param| substitute(param, mapping)).collect(),
+            params
+                .iter()
+                .map(|param| substitute(param, mapping))
+                .collect(),
             Box::new(substitute(result, mapping)),
         ),
         Type::Error => Type::Error,
@@ -235,7 +268,11 @@ fn render(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
         }
         Type::Con(name, args) if name == "Option" && args.len() == 1 => {
             let inner = render(&args[0], names);
-            if matches!(args[0], Type::Fun(..)) { format!("({inner})?") } else { format!("{inner}?") }
+            if matches!(args[0], Type::Fun(..)) {
+                format!("({inner})?")
+            } else {
+                format!("{inner}?")
+            }
         }
         Type::Con(name, args) if args.is_empty() => name.clone(),
         Type::Con(name, args) => {
@@ -253,5 +290,9 @@ fn render(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
 
 fn var_name(index: usize) -> String {
     let letter = char::from(b'a' + (index % 26) as u8);
-    if index < 26 { format!("'{letter}") } else { format!("'{letter}{}", index / 26) }
+    if index < 26 {
+        format!("'{letter}")
+    } else {
+        format!("'{letter}{}", index / 26)
+    }
 }

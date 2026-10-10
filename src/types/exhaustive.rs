@@ -18,7 +18,10 @@ pub struct CtorSig {
 
 impl CtorSig {
     pub fn nullary(name: &str) -> CtorSig {
-        CtorSig { name: name.into(), args: Vec::new() }
+        CtorSig {
+            name: name.into(),
+            args: Vec::new(),
+        }
     }
 }
 
@@ -55,7 +58,9 @@ pub fn render(pat: &Pat) -> String {
         Pat::Lit(text) => text.clone(),
         Pat::Ctor(name, args) if name == "Some" => match args.first() {
             Some(Pat::Wild) | None => "<non-null value>".into(),
-            Some(inner @ Pat::Ctor(inner_name, _)) if inner_name == "null" || inner_name == "Some" => {
+            Some(inner @ Pat::Ctor(inner_name, _))
+                if inner_name == "null" || inner_name == "Some" =>
+            {
                 format!("Some({})", render(inner))
             }
             Some(inner) => render(inner),
@@ -69,7 +74,12 @@ pub fn render(pat: &Pat) -> String {
 }
 
 /// Returns a witness vector matched by `vector` and by no row of `rows`, or `None`.
-fn useful(sig: &dyn Signatures, rows: &[Vec<Pat>], vector: &[Pat], types: &[Type]) -> Option<Vec<Pat>> {
+fn useful(
+    sig: &dyn Signatures,
+    rows: &[Vec<Pat>],
+    vector: &[Pat],
+    types: &[Type],
+) -> Option<Vec<Pat>> {
     let Some((head, rest)) = vector.split_first() else {
         return rows.is_empty().then(Vec::new);
     };
@@ -80,8 +90,12 @@ fn useful(sig: &dyn Signatures, rows: &[Vec<Pat>], vector: &[Pat], types: &[Type
             let arg_types = constructor_args(sig, head_type, name, args.len());
             let specialized = specialize(rows, name, args.len());
             let vector: Vec<Pat> = args.iter().chain(rest).cloned().collect();
-            let types: Vec<Type> = arg_types.into_iter().chain(rest_types.iter().cloned()).collect();
-            useful(sig, &specialized, &vector, &types).map(|witness| rebuild(name, args.len(), witness))
+            let types: Vec<Type> = arg_types
+                .into_iter()
+                .chain(rest_types.iter().cloned())
+                .collect();
+            useful(sig, &specialized, &vector, &types)
+                .map(|witness| rebuild(name, args.len(), witness))
         }
         Pat::Lit(literal) => {
             let specialized = specialize_literal(rows, literal);
@@ -99,7 +113,9 @@ fn useful(sig: &dyn Signatures, rows: &[Vec<Pat>], vector: &[Pat], types: &[Type
             {
                 for ctor in all {
                     let specialized = specialize(rows, &ctor.name, ctor.args.len());
-                    let vector: Vec<Pat> = std::iter::repeat_n(Pat::Wild, ctor.args.len()).chain(rest.iter().cloned()).collect();
+                    let vector: Vec<Pat> = std::iter::repeat_n(Pat::Wild, ctor.args.len())
+                        .chain(rest.iter().cloned())
+                        .collect();
                     let types: Vec<Type> = ctor.args.iter().chain(rest_types).cloned().collect();
                     if let Some(witness) = useful(sig, &specialized, &vector, &types) {
                         return Some(rebuild(&ctor.name, ctor.args.len(), witness));
@@ -112,7 +128,9 @@ fn useful(sig: &dyn Signatures, rows: &[Vec<Pat>], vector: &[Pat], types: &[Type
                 let head = all
                     .as_ref()
                     .and_then(|all| all.iter().find(|ctor| !used.contains(&ctor.name)))
-                    .map_or(Pat::Wild, |ctor| Pat::Ctor(ctor.name.clone(), vec![Pat::Wild; ctor.args.len()]));
+                    .map_or(Pat::Wild, |ctor| {
+                        Pat::Ctor(ctor.name.clone(), vec![Pat::Wild; ctor.args.len()])
+                    });
                 witness.insert(0, head);
                 witness
             })
@@ -142,8 +160,14 @@ fn head_constructors(rows: &[Vec<Pat>]) -> Vec<String> {
 fn specialize(rows: &[Vec<Pat>], name: &str, arity: usize) -> Vec<Vec<Pat>> {
     rows.iter()
         .filter_map(|row| match row.split_first()? {
-            (Pat::Ctor(other, args), rest) if other == name && args.len() == arity => Some(args.iter().chain(rest).cloned().collect()),
-            (Pat::Wild, rest) => Some(std::iter::repeat_n(Pat::Wild, arity).chain(rest.iter().cloned()).collect()),
+            (Pat::Ctor(other, args), rest) if other == name && args.len() == arity => {
+                Some(args.iter().chain(rest).cloned().collect())
+            }
+            (Pat::Wild, rest) => Some(
+                std::iter::repeat_n(Pat::Wild, arity)
+                    .chain(rest.iter().cloned())
+                    .collect(),
+            ),
             _ => None,
         })
         .collect()
@@ -183,20 +207,34 @@ mod tests {
 
     impl Signatures for Fake {
         fn constructors(&self, ty: &Type) -> Option<Vec<CtorSig>> {
-            let Type::Con(name, args) = ty else { return None };
+            let Type::Con(name, args) = ty else {
+                return None;
+            };
             let boolean = || Type::con("Boolean");
             match name.as_str() {
                 "Boolean" => Some(vec![CtorSig::nullary("true"), CtorSig::nullary("false")]),
                 "Option" => Some(vec![
                     CtorSig::nullary("null"),
-                    CtorSig { name: "Some".into(), args: args.clone() },
+                    CtorSig {
+                        name: "Some".into(),
+                        args: args.clone(),
+                    },
                 ]),
                 "Pedido" => Some(vec![
-                    CtorSig { name: "Pendente".into(), args: vec![Type::con("Int")] },
-                    CtorSig { name: "Pago".into(), args: vec![boolean()] },
+                    CtorSig {
+                        name: "Pendente".into(),
+                        args: vec![Type::con("Int")],
+                    },
+                    CtorSig {
+                        name: "Pago".into(),
+                        args: vec![boolean()],
+                    },
                     CtorSig::nullary("Cancelado"),
                 ]),
-                "Par" => Some(vec![CtorSig { name: "Par".into(), args: vec![boolean(), boolean()] }]),
+                "Par" => Some(vec![CtorSig {
+                    name: "Par".into(),
+                    args: vec![boolean(), boolean()],
+                }]),
                 _ => None,
             }
         }
@@ -212,7 +250,11 @@ mod tests {
 
     #[test]
     fn complete_match_has_no_missing_case() {
-        let arms = [ctor("Pendente", vec![Pat::Wild]), ctor("Pago", vec![Pat::Wild]), ctor("Cancelado", vec![])];
+        let arms = [
+            ctor("Pendente", vec![Pat::Wild]),
+            ctor("Pago", vec![Pat::Wild]),
+            ctor("Cancelado", vec![]),
+        ];
         let report = check_match(&Fake, &pedido(), &arms);
         assert_eq!(report.missing, None);
         assert!(report.redundant.is_empty());
@@ -233,22 +275,35 @@ mod tests {
             ctor("Cancelado", vec![]),
         ];
         let report = check_match(&Fake, &pedido(), &arms);
-        assert_eq!(report.missing.as_ref().map(render), Some("Pago(false)".into()));
+        assert_eq!(
+            report.missing.as_ref().map(render),
+            Some("Pago(false)".into())
+        );
     }
 
     #[test]
     fn finds_the_classic_pair_witness() {
         let t = || ctor("true", vec![]);
-        let arms = [ctor("Par", vec![t(), Pat::Wild]), ctor("Par", vec![Pat::Wild, t()])];
+        let arms = [
+            ctor("Par", vec![t(), Pat::Wild]),
+            ctor("Par", vec![Pat::Wild, t()]),
+        ];
         let report = check_match(&Fake, &Type::con("Par"), &arms);
-        assert_eq!(report.missing.as_ref().map(render), Some("Par(false, false)".into()));
+        assert_eq!(
+            report.missing.as_ref().map(render),
+            Some("Par(false, false)".into())
+        );
     }
 
     #[test]
     fn reports_redundant_arms() {
         let arms = [Pat::Wild, ctor("Cancelado", vec![])];
         assert_eq!(check_match(&Fake, &pedido(), &arms).redundant, vec![1]);
-        let arms = [ctor("Cancelado", vec![]), ctor("Cancelado", vec![]), Pat::Wild];
+        let arms = [
+            ctor("Cancelado", vec![]),
+            ctor("Cancelado", vec![]),
+            Pat::Wild,
+        ];
         assert_eq!(check_match(&Fake, &pedido(), &arms).redundant, vec![1]);
     }
 
@@ -258,8 +313,15 @@ mod tests {
         let report = check_match(&Fake, &option, &[ctor("Some", vec![Pat::Wild])]);
         assert_eq!(report.missing.as_ref().map(render), Some("null".into()));
         let report = check_match(&Fake, &option, &[ctor("null", vec![])]);
-        assert_eq!(report.missing.as_ref().map(render), Some("<non-null value>".into()));
-        let report = check_match(&Fake, &option, &[ctor("null", vec![]), ctor("Some", vec![Pat::Wild])]);
+        assert_eq!(
+            report.missing.as_ref().map(render),
+            Some("<non-null value>".into())
+        );
+        let report = check_match(
+            &Fake,
+            &option,
+            &[ctor("null", vec![]), ctor("Some", vec![Pat::Wild])],
+        );
         assert_eq!(report.missing, None);
     }
 
@@ -285,8 +347,14 @@ mod tests {
     #[test]
     fn nested_options_render_the_inner_null() {
         let option = Type::option(Type::option(Type::con("Int")));
-        let arms = [ctor("null", vec![]), ctor("Some", vec![ctor("Some", vec![Pat::Wild])])];
+        let arms = [
+            ctor("null", vec![]),
+            ctor("Some", vec![ctor("Some", vec![Pat::Wild])]),
+        ];
         let report = check_match(&Fake, &option, &arms);
-        assert_eq!(report.missing.as_ref().map(render), Some("Some(null)".into()));
+        assert_eq!(
+            report.missing.as_ref().map(render),
+            Some("Some(null)".into())
+        );
     }
 }

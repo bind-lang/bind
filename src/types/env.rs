@@ -12,8 +12,26 @@ use super::ty::{Type, TypeTable};
 
 /// Built-in types without type arguments.
 pub const SCALARS: &[&str] = &[
-    "Unit", "String", "Int", "Long", "Float", "Double", "Decimal", "Boolean", "UUID", "Date",
-    "DateTime", "Instant", "Duration", "Money", "Email", "Url", "DatabaseUrl", "Port", "Secret", "Ui",
+    "Unit",
+    "String",
+    "Int",
+    "Long",
+    "Float",
+    "Double",
+    "Decimal",
+    "Boolean",
+    "UUID",
+    "Date",
+    "DateTime",
+    "Instant",
+    "Duration",
+    "Money",
+    "Email",
+    "Url",
+    "DatabaseUrl",
+    "Port",
+    "Secret",
+    "Ui",
 ];
 
 /// Built-in generic types and their arity. `Result` is registered as a sealed type instead.
@@ -21,9 +39,32 @@ pub const GENERICS: &[(&str, usize)] = &[("List", 1), ("Set", 1), ("Map", 2), ("
 
 /// UI nodes accepted by the certified Elm generator in `certified.rs`, plus `UI` and `Text`.
 pub const UI_NODES: &[&str] = &[
-    "UI", "Page", "Container", "Div", "Grid", "Stack", "Header", "Nav", "Main", "Section",
-    "Article", "Aside", "Footer", "Paragraph", "Span", "Strong", "Emphasis", "Small", "List",
-    "Item", "Pre", "Code", "Heading", "Link", "Rule", "Text",
+    "UI",
+    "Page",
+    "Container",
+    "Div",
+    "Grid",
+    "Stack",
+    "Header",
+    "Nav",
+    "Main",
+    "Section",
+    "Article",
+    "Aside",
+    "Footer",
+    "Paragraph",
+    "Span",
+    "Strong",
+    "Emphasis",
+    "Small",
+    "List",
+    "Item",
+    "Pre",
+    "Code",
+    "Heading",
+    "Link",
+    "Rule",
+    "Text",
 ];
 
 /// Types `Text(...)` can display, besides distinct types over them.
@@ -95,7 +136,11 @@ impl Env {
             }
             let constructors: Vec<(String, Vec<Field>, Span)> = match declaration.kind {
                 TypeKind::Data | TypeKind::Entity => {
-                    vec![(declaration.name.clone(), declaration.fields.clone(), declaration.span.clone())]
+                    vec![(
+                        declaration.name.clone(),
+                        declaration.fields.clone(),
+                        declaration.span.clone(),
+                    )]
                 }
                 TypeKind::Sealed | TypeKind::Enum => declaration
                     .cases
@@ -132,13 +177,19 @@ impl Env {
                         diagnostics.push(
                             Diagnostic::error(
                                 "E7002",
-                                format!("Field `{}` is declared with `var`; Bind values are immutable.", field.name),
+                                format!(
+                                    "Field `{}` is declared with `var`; Bind values are immutable.",
+                                    field.name
+                                ),
                                 field.span.clone(),
                             )
                             .with_hint("Use `val`."),
                         );
                     }
-                    lowered.push((field.name.clone(), parse_field_type(&field.type_ref, &field.span, diagnostics)));
+                    lowered.push((
+                        field.name.clone(),
+                        parse_field_type(&field.type_ref, &field.span, diagnostics),
+                    ));
                 }
                 names.push(name.clone());
                 env.ctors.insert(
@@ -188,9 +239,15 @@ impl Env {
                 if set.contains(name) {
                     continue;
                 }
-                let contains = info.ctors.iter().filter_map(|ctor| self.ctors.get(ctor)).any(|ctor| {
-                    ctor.fields.iter().any(|(_, field)| contains_non_equatable(field, &ctor.type_params, &set))
-                });
+                let contains = info
+                    .ctors
+                    .iter()
+                    .filter_map(|ctor| self.ctors.get(ctor))
+                    .any(|ctor| {
+                        ctor.fields.iter().any(|(_, field)| {
+                            contains_non_equatable(field, &ctor.type_params, &set)
+                        })
+                    });
                 if contains {
                     set.insert(name.clone());
                     changed = true;
@@ -203,7 +260,11 @@ impl Env {
     }
 
     fn install_result(&mut self) {
-        let param = |name: &str| TypeExpr::Named { name: name.into(), args: Vec::new(), span: Span::default() };
+        let param = |name: &str| TypeExpr::Named {
+            name: name.into(),
+            args: Vec::new(),
+            span: Span::default(),
+        };
         for (ctor, field, ty) in [("Ok", "value", "T"), ("Err", "error", "E")] {
             self.ctors.insert(
                 ctor.into(),
@@ -237,11 +298,19 @@ impl Env {
         self.types.get(name).map(|info| info.params.len())
     }
 
-    pub fn lower(&self, te: &TypeExpr, vars: &BTreeMap<String, Type>, diagnostics: &mut Vec<Diagnostic>) -> Type {
+    pub fn lower(
+        &self,
+        te: &TypeExpr,
+        vars: &BTreeMap<String, Type>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Type {
         match te {
             TypeExpr::Nullable(inner) => Type::option(self.lower(inner, vars, diagnostics)),
             TypeExpr::Function { params, result } => {
-                let params = params.iter().map(|param| self.lower(param, vars, diagnostics)).collect();
+                let params = params
+                    .iter()
+                    .map(|param| self.lower(param, vars, diagnostics))
+                    .collect();
                 Type::Fun(params, Box::new(self.lower(result, vars, diagnostics)))
             }
             TypeExpr::Named { name, args, span } => {
@@ -260,18 +329,30 @@ impl Env {
                     return var.clone();
                 }
                 let Some(arity) = self.type_arity(name) else {
-                    diagnostics.push(Diagnostic::error("E7103", format!("Unknown type `{name}`."), span.clone()));
+                    diagnostics.push(Diagnostic::error(
+                        "E7103",
+                        format!("Unknown type `{name}`."),
+                        span.clone(),
+                    ));
                     return Type::Error;
                 };
                 if arity != args.len() {
                     diagnostics.push(Diagnostic::error(
                         "E7102",
-                        format!("Type `{name}` expects {arity} type argument(s), found {}.", args.len()),
+                        format!(
+                            "Type `{name}` expects {arity} type argument(s), found {}.",
+                            args.len()
+                        ),
                         span.clone(),
                     ));
                     return Type::Error;
                 }
-                Type::Con(name.clone(), args.iter().map(|arg| self.lower(arg, vars, diagnostics)).collect())
+                Type::Con(
+                    name.clone(),
+                    args.iter()
+                        .map(|arg| self.lower(arg, vars, diagnostics))
+                        .collect(),
+                )
             }
         }
     }
@@ -280,7 +361,12 @@ impl Env {
         self.lower(te, vars, &mut Vec::new())
     }
 
-    pub fn instantiate_ctor(&self, name: &str, table: &mut TypeTable, level: u32) -> (Vec<Type>, Type) {
+    pub fn instantiate_ctor(
+        &self,
+        name: &str,
+        table: &mut TypeTable,
+        level: u32,
+    ) -> (Vec<Type>, Type) {
         let Some(ctor) = self.ctors.get(name) else {
             return (Vec::new(), Type::Error);
         };
@@ -291,13 +377,23 @@ impl Env {
             vars.insert(param.clone(), var.clone());
             args.push(var);
         }
-        let fields = ctor.fields.iter().map(|(_, field)| self.lower_quiet(field, &vars)).collect();
+        let fields = ctor
+            .fields
+            .iter()
+            .map(|(_, field)| self.lower_quiet(field, &vars))
+            .collect();
         (fields, Type::Con(ctor.type_name.clone(), args))
     }
 
     pub fn instantiate_record(&self, type_name: &str, table: &mut TypeTable, level: u32) -> Type {
-        let arity = self.types.get(type_name).map_or(0, |info| info.params.len());
-        Type::Con(type_name.into(), (0..arity).map(|_| table.fresh(level)).collect())
+        let arity = self
+            .types
+            .get(type_name)
+            .map_or(0, |info| info.params.len());
+        Type::Con(
+            type_name.into(),
+            (0..arity).map(|_| table.fresh(level)).collect(),
+        )
     }
 
     pub fn field_type(&self, type_name: &str, args: &[Type], field: &str) -> Option<Type> {
@@ -306,8 +402,16 @@ impl Env {
             return None;
         }
         let ctor = self.ctors.get(type_name)?;
-        let vars: BTreeMap<String, Type> = ctor.type_params.iter().cloned().zip(args.iter().cloned()).collect();
-        ctor.fields.iter().find(|(name, _)| name == field).map(|(_, te)| self.lower_quiet(te, &vars))
+        let vars: BTreeMap<String, Type> = ctor
+            .type_params
+            .iter()
+            .cloned()
+            .zip(args.iter().cloned())
+            .collect();
+        ctor.fields
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, te)| self.lower_quiet(te, &vars))
     }
 
     pub fn records_with_field(&self, field: &str) -> Vec<String> {
@@ -315,7 +419,9 @@ impl Env {
             .iter()
             .filter(|(_, info)| matches!(info.kind, TypeKind::Data | TypeKind::Entity))
             .filter(|(name, _)| {
-                self.ctors.get(*name).is_some_and(|ctor| ctor.fields.iter().any(|(other, _)| other == field))
+                self.ctors
+                    .get(*name)
+                    .is_some_and(|ctor| ctor.fields.iter().any(|(other, _)| other == field))
             })
             .map(|(name, _)| name.clone())
             .collect()
@@ -334,7 +440,10 @@ impl Env {
                         && self.types.get(name).is_some_and(|info| {
                             info.kind == TypeKind::Distinct
                                 && info.underlying.as_ref().is_some_and(|underlying| {
-                                    self.displayable(&self.lower_quiet(underlying, &BTreeMap::new()), depth + 1)
+                                    self.displayable(
+                                        &self.lower_quiet(underlying, &BTreeMap::new()),
+                                        depth + 1,
+                                    )
                                 })
                         }))
             }
@@ -345,23 +454,37 @@ impl Env {
 
 impl Signatures for Env {
     fn constructors(&self, ty: &Type) -> Option<Vec<CtorSig>> {
-        let Type::Con(name, args) = ty else { return None };
+        let Type::Con(name, args) = ty else {
+            return None;
+        };
         match name.as_str() {
             "Boolean" => Some(vec![CtorSig::nullary("true"), CtorSig::nullary("false")]),
             "Option" => Some(vec![
                 CtorSig::nullary("null"),
-                CtorSig { name: "Some".into(), args: vec![args.first().cloned().unwrap_or(Type::Error)] },
+                CtorSig {
+                    name: "Some".into(),
+                    args: vec![args.first().cloned().unwrap_or(Type::Error)],
+                },
             ]),
             _ => {
                 let info = self.types.get(name)?;
-                let vars: BTreeMap<String, Type> = info.params.iter().cloned().zip(args.iter().cloned()).collect();
+                let vars: BTreeMap<String, Type> = info
+                    .params
+                    .iter()
+                    .cloned()
+                    .zip(args.iter().cloned())
+                    .collect();
                 Some(
                     info.ctors
                         .iter()
                         .filter_map(|ctor| self.ctors.get(ctor))
                         .map(|ctor| CtorSig {
                             name: ctor.name.clone(),
-                            args: ctor.fields.iter().map(|(_, field)| self.lower_quiet(field, &vars)).collect(),
+                            args: ctor
+                                .fields
+                                .iter()
+                                .map(|(_, field)| self.lower_quiet(field, &vars))
+                                .collect(),
                         })
                         .collect(),
                 )
@@ -376,20 +499,33 @@ fn contains_non_equatable(te: &TypeExpr, params: &[String], set: &BTreeSet<Strin
         TypeExpr::Nullable(inner) => contains_non_equatable(inner, params, set),
         TypeExpr::Named { name, args, .. } => {
             (!params.contains(name) && set.contains(name))
-                || args.iter().any(|arg| contains_non_equatable(arg, params, set))
+                || args
+                    .iter()
+                    .any(|arg| contains_non_equatable(arg, params, set))
         }
     }
 }
 
 /// Type parameters inside the body of an annotated function: they only equal themselves.
 pub fn rigid_vars(params: &[String]) -> BTreeMap<String, Type> {
-    params.iter().map(|param| (param.clone(), Type::con(&format!("'{param}")))).collect()
+    params
+        .iter()
+        .map(|param| (param.clone(), Type::con(&format!("'{param}"))))
+        .collect()
 }
 
-fn parse_field_type(type_ref: &TypeRef, span: &Span, diagnostics: &mut Vec<Diagnostic>) -> TypeExpr {
+fn parse_field_type(
+    type_ref: &TypeRef,
+    span: &Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TypeExpr {
     parse_type_text(&type_ref.display(), span).unwrap_or_else(|diagnostic| {
         diagnostics.push(diagnostic);
-        TypeExpr::Named { name: ERROR_TYPE.into(), args: Vec::new(), span: span.clone() }
+        TypeExpr::Named {
+            name: ERROR_TYPE.into(),
+            args: Vec::new(),
+            span: span.clone(),
+        }
     })
 }
 
@@ -428,7 +564,9 @@ mod tests {
         let (env, _) = build(TREE);
         let mut table = TypeTable::default();
         let (fields, result) = env.instantiate_ctor("No", &mut table, 1);
-        let Type::Con(name, args) = &result else { unreachable!() };
+        let Type::Con(name, args) = &result else {
+            unreachable!()
+        };
         assert_eq!(name, "Arvore");
         assert_eq!(fields[1], args[0]);
         assert_eq!(fields[0], result);
@@ -438,10 +576,18 @@ mod tests {
     fn substitutes_type_arguments_in_fields_and_signatures() {
         let (env, _) = build(TREE);
         let int = Type::con("Int");
-        assert_eq!(env.field_type("Caixa", std::slice::from_ref(&int), "valor"), Some(int.clone()));
-        assert_eq!(env.field_type("Caixa", std::slice::from_ref(&int), "outro"), None);
+        assert_eq!(
+            env.field_type("Caixa", std::slice::from_ref(&int), "valor"),
+            Some(int.clone())
+        );
+        assert_eq!(
+            env.field_type("Caixa", std::slice::from_ref(&int), "outro"),
+            None
+        );
         assert_eq!(env.records_with_field("valor"), vec!["Caixa"]);
-        let signatures = env.constructors(&Type::Con("Arvore".into(), vec![int.clone()])).unwrap();
+        let signatures = env
+            .constructors(&Type::Con("Arvore".into(), vec![int.clone()]))
+            .unwrap();
         assert_eq!(signatures[0].args[1], int);
         assert!(env.constructors(&Type::con("Int")).is_none());
         assert_eq!(env.constructors(&Type::con("Boolean")).unwrap().len(), 2);
@@ -460,12 +606,24 @@ mod tests {
     fn reports_declaration_errors() {
         assert_eq!(build("data class C(var x: Int)").1, vec!["E7002"]);
         assert_eq!(build("data class C(val x: Nada)").1, vec!["E7103"]);
-        assert_eq!(build("data class C(val x: List<Int, Int>)").1, vec!["E7102"]);
-        assert_eq!(build("data class C(val x: Int)\ndata class C(val y: Int)").1, vec!["E7110"]);
+        assert_eq!(
+            build("data class C(val x: List<Int, Int>)").1,
+            vec!["E7102"]
+        );
+        assert_eq!(
+            build("data class C(val x: Int)\ndata class C(val y: Int)").1,
+            vec!["E7110"]
+        );
         assert_eq!(build("data class String(val x: Int)").1, vec!["E7110"]);
-        assert_eq!(build("enum class A { X }\nenum class B { X }").1, vec!["E7110"]);
+        assert_eq!(
+            build("enum class A { X }\nenum class B { X }").1,
+            vec!["E7110"]
+        );
         assert_eq!(build("fun f() = 1\nfun f() = 2").1, vec!["E7110"]);
-        assert_eq!(build("entity C<T>(val id: UUID, val x: T)").1, vec!["E7004"]);
+        assert_eq!(
+            build("entity C<T>(val id: UUID, val x: T)").1,
+            vec!["E7004"]
+        );
         assert!(build("entity C(val id: UUID, val x: Int)").1.is_empty());
     }
 }

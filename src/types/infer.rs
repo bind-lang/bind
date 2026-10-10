@@ -33,7 +33,11 @@ pub struct TypedProgram {
     pub patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
 }
 
-pub fn check_program(program: &Program, env: &Env, schema: &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>) {
+pub fn check_program(
+    program: &Program,
+    env: &Env,
+    schema: &DatabaseSchema,
+) -> (TypedProgram, Vec<Diagnostic>) {
     let mut checker = Checker::new(env, schema);
     checker.run(program);
     let typed = checker.finish(program);
@@ -86,10 +90,13 @@ impl<'a> Checker<'a> {
         self.install_builtins();
         self.install_environment(program);
         for function in &program.functions {
-            self.function_spans.insert(function.name.clone(), function.span.clone());
+            self.function_spans
+                .insert(function.name.clone(), function.span.clone());
         }
-        let (annotated, inferred): (Vec<&Function>, Vec<&Function>) =
-            program.functions.iter().partition(|function| is_fully_annotated(function));
+        let (annotated, inferred): (Vec<&Function>, Vec<&Function>) = program
+            .functions
+            .iter()
+            .partition(|function| is_fully_annotated(function));
         for function in &annotated {
             let scheme = self.annotated_scheme(function);
             self.globals.insert(function.name.clone(), scheme);
@@ -105,16 +112,33 @@ impl<'a> Checker<'a> {
 
     fn install_environment(&mut self, program: &Program) {
         for declaration in &program.environment {
-            if program.functions.iter().any(|function| function.name == declaration.name) {
+            if program
+                .functions
+                .iter()
+                .any(|function| function.name == declaration.name)
+            {
                 self.error(
                     "E7110",
-                    format!("`{}` is declared both as an environment value and as a function.", declaration.name),
+                    format!(
+                        "`{}` is declared both as an environment value and as a function.",
+                        declaration.name
+                    ),
                     &declaration.span,
                 );
             }
-            let base = self.lower_ref(&declaration.type_ref, &declaration.span, &BTreeMap::new(), true);
-            let ty = if declaration.optional { Type::option(base) } else { base };
-            self.globals.insert(declaration.name.clone(), Scheme::mono(ty));
+            let base = self.lower_ref(
+                &declaration.type_ref,
+                &declaration.span,
+                &BTreeMap::new(),
+                true,
+            );
+            let ty = if declaration.optional {
+                Type::option(base)
+            } else {
+                base
+            };
+            self.globals
+                .insert(declaration.name.clone(), Scheme::mono(ty));
         }
     }
 
@@ -122,14 +146,27 @@ impl<'a> Checker<'a> {
         let table = &mut self.table;
         let list = |ty: &Type| Type::list(ty.clone());
         let builtins = [
-            ("first", builtin(table, 1, |v| Type::Fun(vec![list(&v[0])], Box::new(Type::option(v[0].clone()))))),
+            (
+                "first",
+                builtin(table, 1, |v| {
+                    Type::Fun(vec![list(&v[0])], Box::new(Type::option(v[0].clone())))
+                }),
+            ),
             (
                 "get",
                 builtin(table, 1, |v| {
-                    Type::Fun(vec![list(&v[0]), Type::con("Int")], Box::new(Type::option(v[0].clone())))
+                    Type::Fun(
+                        vec![list(&v[0]), Type::con("Int")],
+                        Box::new(Type::option(v[0].clone())),
+                    )
                 }),
             ),
-            ("length", builtin(table, 1, |v| Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int"))))),
+            (
+                "length",
+                builtin(table, 1, |v| {
+                    Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int")))
+                }),
+            ),
             (
                 "map",
                 builtin(table, 2, |v| {
@@ -141,10 +178,16 @@ impl<'a> Checker<'a> {
                 "fold",
                 builtin(table, 2, |v| {
                     let step = Type::Fun(vec![v[1].clone(), v[0].clone()], Box::new(v[1].clone()));
-                    Type::Fun(vec![list(&v[0]), v[1].clone(), step], Box::new(v[1].clone()))
+                    Type::Fun(
+                        vec![list(&v[0]), v[1].clone(), step],
+                        Box::new(v[1].clone()),
+                    )
                 }),
             ),
-            ("emptyList", builtin(table, 1, |v| Type::Fun(Vec::new(), Box::new(list(&v[0]))))),
+            (
+                "emptyList",
+                builtin(table, 1, |v| Type::Fun(Vec::new(), Box::new(list(&v[0])))),
+            ),
         ];
         for (name, scheme) in builtins {
             self.globals.insert(name.into(), scheme);
@@ -166,7 +209,12 @@ impl<'a> Checker<'a> {
     }
 
     /// Function type from the declaration; missing annotations become fresh variables.
-    fn signature(&mut self, function: &Function, vars: &BTreeMap<String, Type>, report: bool) -> Type {
+    fn signature(
+        &mut self,
+        function: &Function,
+        vars: &BTreeMap<String, Type>,
+        report: bool,
+    ) -> Type {
         let mut params = Vec::new();
         for parameter in &function.parameters {
             let ty = match &parameter.type_ref {
@@ -186,9 +234,19 @@ impl<'a> Checker<'a> {
         Type::Fun(params, Box::new(result))
     }
 
-    fn lower_ref(&mut self, type_ref: &TypeRef, span: &Span, vars: &BTreeMap<String, Type>, report: bool) -> Type {
+    fn lower_ref(
+        &mut self,
+        type_ref: &TypeRef,
+        span: &Span,
+        vars: &BTreeMap<String, Type>,
+        report: bool,
+    ) -> Type {
         let mut sink = Vec::new();
-        let diagnostics = if report { &mut self.diagnostics } else { &mut sink };
+        let diagnostics = if report {
+            &mut self.diagnostics
+        } else {
+            &mut sink
+        };
         match parse_type_text(&type_ref.display(), span) {
             Ok(te) => self.env.lower(&te, vars, diagnostics),
             Err(diagnostic) => {
@@ -208,7 +266,8 @@ impl<'a> Checker<'a> {
                 scope.insert(name.clone(), self.fresh());
             }
             let ty = self.signature(function, &scope, true);
-            self.globals.insert(function.name.clone(), Scheme::mono(ty.clone()));
+            self.globals
+                .insert(function.name.clone(), Scheme::mono(ty.clone()));
             types.push(ty);
             scopes.push(scope);
         }
@@ -271,13 +330,18 @@ impl<'a> Checker<'a> {
     }
 
     fn check_body(&mut self, function: &Function, ty: &Type) {
-        let Type::Fun(params, result) = ty else { return };
+        let Type::Fun(params, result) = ty else {
+            return;
+        };
         let mut names = BTreeSet::new();
         for parameter in &function.parameters {
             if !names.insert(parameter.name.as_str()) {
                 self.error(
                     "E7113",
-                    format!("`{}` is declared more than once in the parameters of `{}`.", parameter.name, function.name),
+                    format!(
+                        "`{}` is declared more than once in the parameters of `{}`.",
+                        parameter.name, function.name
+                    ),
                     &function.span,
                 );
             }
@@ -287,7 +351,8 @@ impl<'a> Checker<'a> {
         self.return_type = Some((**result).clone());
         self.locals.clear();
         for (parameter, param) in function.parameters.iter().zip(params) {
-            self.locals.push((parameter.name.clone(), Scheme::mono(param.clone())));
+            self.locals
+                .push((parameter.name.clone(), Scheme::mono(param.clone())));
         }
         let body = self.infer_block(block);
         let reason = if function.component {
@@ -309,7 +374,11 @@ impl<'a> Checker<'a> {
                 typed.signatures.insert(function.name.clone(), ty);
             }
         }
-        typed.node_types = self.nodes.iter().map(|(key, (ty, _))| (key.clone(), self.table.resolve(ty))).collect();
+        typed.node_types = self
+            .nodes
+            .iter()
+            .map(|(key, (ty, _))| (key.clone(), self.table.resolve(ty)))
+            .collect();
         typed.patterns = self.patterns.clone();
         typed
     }
@@ -319,12 +388,18 @@ impl<'a> Checker<'a> {
     /// Constrained variables still unbound at the end of a function have no concrete type.
     fn report_ambiguous(&mut self, function: &str) {
         let key = function.to_string();
-        let entries: Vec<(Type, Span)> =
-            self.nodes.range((key.clone(), 0)..=(key, NodeId::MAX)).map(|(_, entry)| entry.clone()).collect();
+        let entries: Vec<(Type, Span)> = self
+            .nodes
+            .range((key.clone(), 0)..=(key, NodeId::MAX))
+            .map(|(_, entry)| entry.clone())
+            .collect();
         let mut seen = BTreeSet::new();
         for (ty, span) in entries {
             for id in free_vars(&self.table, &ty) {
-                if let VarState::Unbound { constraint: Some(constraint), .. } = self.table.state(id).clone()
+                if let VarState::Unbound {
+                    constraint: Some(constraint),
+                    ..
+                } = self.table.state(id).clone()
                     && seen.insert(id)
                 {
                     self.ambiguity(constraint, &span);
@@ -345,7 +420,10 @@ impl<'a> Checker<'a> {
         self.diagnostics.push(
             Diagnostic::error(
                 "E7302",
-                format!("Ambiguous type: a value used with {} never receives a concrete type.", constraint.describe()),
+                format!(
+                    "Ambiguous type: a value used with {} never receives a concrete type.",
+                    constraint.describe()
+                ),
                 span.clone(),
             )
             .with_hint("Annotate a parameter or value, e.g. `a: Int` or `a: Double`."),
@@ -359,11 +437,13 @@ impl<'a> Checker<'a> {
     }
 
     fn record(&mut self, id: NodeId, ty: &Type, span: &Span) {
-        self.nodes.insert((self.function.clone(), id), (ty.clone(), span.clone()));
+        self.nodes
+            .insert((self.function.clone(), id), (ty.clone(), span.clone()));
     }
 
     fn error(&mut self, code: &'static str, message: impl Into<String>, span: &Span) {
-        self.diagnostics.push(Diagnostic::error(code, message, span.clone()));
+        self.diagnostics
+            .push(Diagnostic::error(code, message, span.clone()));
     }
 
     fn shown(&self, ty: &Type) -> String {
@@ -379,17 +459,24 @@ impl<'a> Checker<'a> {
     }
 
     fn unify_at(&mut self, expected: &Type, found: &Type, span: &Span, reason: Option<String>) {
-        let Err(error) = unify(&mut self.table, expected, found) else { return };
+        let Err(error) = unify(&mut self.table, expected, found) else {
+            return;
+        };
         let diagnostic = match error {
             UnifyError::Mismatch { expected, found } => {
                 let names = display_all(&[&expected, &found]);
                 let diagnostic = Diagnostic::error(
                     "E7101",
-                    format!("Type mismatch: expected `{}`, found `{}`.", names[0], names[1]),
+                    format!(
+                        "Type mismatch: expected `{}`, found `{}`.",
+                        names[0], names[1]
+                    ),
                     span.clone(),
                 );
                 match reason {
-                    Some(reason) => diagnostic.with_hint(format!("`{}` is required by {reason}.", names[0])),
+                    Some(reason) => {
+                        diagnostic.with_hint(format!("`{}` is required by {reason}.", names[0]))
+                    }
                     None => diagnostic,
                 }
             }
@@ -397,28 +484,48 @@ impl<'a> Checker<'a> {
                 let names = display_all(&[&Type::Var(var), &ty]);
                 Diagnostic::error(
                     "E7107",
-                    format!("Infinite type: `{}` would have to equal `{}`.", names[0], names[1]),
+                    format!(
+                        "Infinite type: `{}` would have to equal `{}`.",
+                        names[0], names[1]
+                    ),
                     span.clone(),
                 )
             }
-            UnifyError::Constraint { constraint, ty } => self.constraint_error(constraint, &ty, span),
+            UnifyError::Constraint { constraint, ty } => {
+                self.constraint_error(constraint, &ty, span)
+            }
         };
         self.diagnostics.push(diagnostic);
     }
 
     fn require(&mut self, constraint: Constraint, ty: &Type, span: &Span) {
-        if let Err(UnifyError::Constraint { constraint, ty }) = constrain(&mut self.table, constraint, ty) {
+        if let Err(UnifyError::Constraint { constraint, ty }) =
+            constrain(&mut self.table, constraint, ty)
+        {
             let diagnostic = self.constraint_error(constraint, &ty, span);
             self.diagnostics.push(diagnostic);
         }
     }
 
     fn constraint_error(&self, constraint: Constraint, ty: &Type, span: &Span) -> Diagnostic {
-        let diagnostic =
-            Diagnostic::error("E7301", format!("`{}` does not support {}.", display(ty), constraint.describe()), span.clone());
+        let diagnostic = Diagnostic::error(
+            "E7301",
+            format!(
+                "`{}` does not support {}.",
+                display(ty),
+                constraint.describe()
+            ),
+            span.clone(),
+        );
         match ty {
-            Type::Con(name, _) if constraint == Constraint::Eq && name != "Ui" && self.table.is_non_equatable(name) => {
-                diagnostic.with_hint(format!("`{name}` has a field that contains a function or a UI tree."))
+            Type::Con(name, _)
+                if constraint == Constraint::Eq
+                    && name != "Ui"
+                    && self.table.is_non_equatable(name) =>
+            {
+                diagnostic.with_hint(format!(
+                    "`{name}` has a field that contains a function or a UI tree."
+                ))
             }
             _ => diagnostic,
         }
@@ -432,7 +539,12 @@ impl<'a> Checker<'a> {
         for (index, stmt) in block.stmts.iter().enumerate() {
             let last = index + 1 == block.stmts.len();
             match stmt {
-                Stmt::Val { name, annotation, value: expr, span } => self.bind_val(name, annotation.as_ref(), expr, span),
+                Stmt::Val {
+                    name,
+                    annotation,
+                    value: expr,
+                    span,
+                } => self.bind_val(name, annotation.as_ref(), expr, span),
                 Stmt::Expr(expr) => {
                     let ty = self.infer(expr);
                     if last {
@@ -452,8 +564,15 @@ impl<'a> Checker<'a> {
         self.level += 1;
         let mut ty = self.infer(value);
         if let Some(annotation) = annotation {
-            let declared = self.env.lower(annotation, &self.rigid, &mut self.diagnostics);
-            self.unify_at(&declared, &ty, &value.span, Some(format!("the annotation on `{name}`")));
+            let declared = self
+                .env
+                .lower(annotation, &self.rigid, &mut self.diagnostics);
+            self.unify_at(
+                &declared,
+                &ty,
+                &value.span,
+                Some(format!("the annotation on `{name}`")),
+            );
             ty = declared;
         }
         self.level -= 1;
@@ -496,13 +615,22 @@ impl<'a> Checker<'a> {
                 Type::option(inner)
             }
             ExprKind::Name(name) => self.infer_name(name, &expr.span),
-            ExprKind::Call { callee, args, children } => self.infer_call(callee, args, children.as_ref(), &expr.span),
+            ExprKind::Call {
+                callee,
+                args,
+                children,
+            } => self.infer_call(callee, args, children.as_ref(), &expr.span),
             ExprKind::Field { target, name } => self.infer_field(target, name, &expr.span),
             ExprKind::SafeField { target, name } => {
                 let receiver = self.infer(target);
                 let inner = self.fresh();
                 let reported = self.diagnostics.len();
-                self.unify_at(&Type::option(inner.clone()), &receiver, &target.span, Some("the receiver of `?.`".into()));
+                self.unify_at(
+                    &Type::option(inner.clone()),
+                    &receiver,
+                    &target.span,
+                    Some("the receiver of `?.`".into()),
+                );
                 if self.diagnostics.len() > reported {
                     self.record(expr.id, &Type::Error, &expr.span);
                     return Type::Error;
@@ -513,34 +641,71 @@ impl<'a> Checker<'a> {
                     _ => Type::option(field),
                 }
             }
-            ExprKind::Unary { op: UnaryOp::Neg, operand } => {
+            ExprKind::Unary {
+                op: UnaryOp::Neg,
+                operand,
+            } => {
                 let ty = self.infer(operand);
                 self.require(Constraint::Sub, &ty, &operand.span);
                 ty
             }
-            ExprKind::Unary { op: UnaryOp::Not, operand } => {
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                operand,
+            } => {
                 let ty = self.infer(operand);
-                self.unify_at(&Type::con("Boolean"), &ty, &operand.span, Some("the `!` operator".into()));
+                self.unify_at(
+                    &Type::con("Boolean"),
+                    &ty,
+                    &operand.span,
+                    Some("the `!` operator".into()),
+                );
                 Type::con("Boolean")
             }
             ExprKind::Binary { op, left, right } => self.infer_binary(*op, left, right, &expr.span),
             ExprKind::Elvis { value, fallback } => {
                 let ty = self.infer(value);
                 let inner = self.fresh();
-                self.unify_at(&Type::option(inner.clone()), &ty, &value.span, Some("the left side of `?:`".into()));
+                self.unify_at(
+                    &Type::option(inner.clone()),
+                    &ty,
+                    &value.span,
+                    Some("the left side of `?:`".into()),
+                );
                 let fallback_ty = self.infer(fallback);
-                self.unify_at(&inner, &fallback_ty, &fallback.span, Some("the left side of `?:`".into()));
+                self.unify_at(
+                    &inner,
+                    &fallback_ty,
+                    &fallback.span,
+                    Some("the left side of `?:`".into()),
+                );
                 inner
             }
-            ExprKind::If { condition, then_branch, else_branch } => {
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => {
                 let condition_ty = self.infer(condition);
-                self.unify_at(&Type::con("Boolean"), &condition_ty, &condition.span, Some("an `if` condition".into()));
+                self.unify_at(
+                    &Type::con("Boolean"),
+                    &condition_ty,
+                    &condition.span,
+                    Some("an `if` condition".into()),
+                );
                 let then_ty = self.infer(then_branch);
                 let else_ty = self.infer(else_branch);
-                self.unify_at(&then_ty, &else_ty, &else_branch.span, Some("the first `if` branch".into()));
+                self.unify_at(
+                    &then_ty,
+                    &else_ty,
+                    &else_branch.span,
+                    Some("the first `if` branch".into()),
+                );
                 then_ty
             }
-            ExprKind::When { scrutinee, arms } => self.infer_when(expr.id, scrutinee, arms, &expr.span),
+            ExprKind::When { scrutinee, arms } => {
+                self.infer_when(expr.id, scrutinee, arms, &expr.span)
+            }
             ExprKind::Lambda { params, body } => self.infer_lambda(params, body, None),
             ExprKind::Block(block) => self.infer_block(block),
             ExprKind::Return(value) => {
@@ -564,7 +729,13 @@ impl<'a> Checker<'a> {
     }
 
     fn infer_name(&mut self, name: &str, span: &Span) -> Type {
-        if let Some(scheme) = self.locals.iter().rev().find(|(local, _)| local == name).map(|(_, scheme)| scheme.clone()) {
+        if let Some(scheme) = self
+            .locals
+            .iter()
+            .rev()
+            .find(|(local, _)| local == name)
+            .map(|(_, scheme)| scheme.clone())
+        {
             return instantiate(&mut self.table, &scheme, self.level);
         }
         if let Some(scheme) = self.globals.get(name).cloned() {
@@ -574,7 +745,11 @@ impl<'a> Checker<'a> {
             return self.constructor_value(name);
         }
         if UI_NODES.contains(&name) {
-            self.error("E7004", format!("UI node `{name}` must be called, e.g. `{name}(...)`."), span);
+            self.error(
+                "E7004",
+                format!("UI node `{name}` must be called, e.g. `{name}(...)`."),
+                span,
+            );
             return Type::Error;
         }
         self.error("E7103", format!("Unknown name `{name}`."), span);
@@ -583,10 +758,20 @@ impl<'a> Checker<'a> {
 
     fn constructor_value(&mut self, name: &str) -> Type {
         let (fields, result) = self.env.instantiate_ctor(name, &mut self.table, self.level);
-        if fields.is_empty() { result } else { Type::Fun(fields, Box::new(result)) }
+        if fields.is_empty() {
+            result
+        } else {
+            Type::Fun(fields, Box::new(result))
+        }
     }
 
-    fn infer_call(&mut self, callee: &Expr, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
+    fn infer_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Expr],
+        children: Option<&Block>,
+        span: &Span,
+    ) -> Type {
         if let ExprKind::Name(name) = &callee.kind
             && !self.is_shadowed(name)
             && !self.env.ctors.contains_key(name)
@@ -625,7 +810,11 @@ impl<'a> Checker<'a> {
             Type::Fun(params, result) => {
                 self.error(
                     "E7102",
-                    format!("This function expects {} argument(s), but {} were given.", params.len(), args.len()),
+                    format!(
+                        "This function expects {} argument(s), but {} were given.",
+                        params.len(),
+                        args.len()
+                    ),
                     span,
                 );
                 *result
@@ -639,7 +828,11 @@ impl<'a> Checker<'a> {
             }
             other => {
                 let shown = self.shown(&other);
-                self.error("E7101", format!("A value of type `{shown}` is not a function."), &callee.span);
+                self.error(
+                    "E7101",
+                    format!("A value of type `{shown}` is not a function."),
+                    &callee.span,
+                );
                 Type::Error
             }
         }
@@ -659,13 +852,22 @@ impl<'a> Checker<'a> {
         self.infer(arg)
     }
 
-    fn infer_lambda(&mut self, params: &[(String, Span)], body: &Block, seed: Option<&[Type]>) -> Type {
+    fn infer_lambda(
+        &mut self,
+        params: &[(String, Span)],
+        body: &Block,
+        seed: Option<&[Type]>,
+    ) -> Type {
         let mark = self.locals.len();
         let mut names = BTreeSet::new();
         let mut param_types = Vec::new();
         for (index, (name, span)) in params.iter().enumerate() {
             if !names.insert(name.as_str()) {
-                self.error("E7113", format!("`{name}` is bound more than once in this lambda."), span);
+                self.error(
+                    "E7113",
+                    format!("`{name}` is bound more than once in this lambda."),
+                    span,
+                );
             }
             let ty = match seed.and_then(|types| types.get(index)) {
                 Some(ty) => ty.clone(),
@@ -682,7 +884,9 @@ impl<'a> Checker<'a> {
     }
 
     fn parameter_reason(&self, callee: &Expr) -> Option<String> {
-        let ExprKind::Name(name) = &callee.kind else { return None };
+        let ExprKind::Name(name) = &callee.kind else {
+            return None;
+        };
         match self.function_spans.get(name) {
             Some(span) if !self.is_local(name) => Some(format!(
                 "a parameter of `{name}` (declared at {}:{}:{})",
@@ -699,7 +903,12 @@ impl<'a> Checker<'a> {
         let element = self.fresh();
         for arg in args {
             let ty = self.infer(arg);
-            self.unify_at(&element, &ty, &arg.span, Some("the first element of `listOf`".into()));
+            self.unify_at(
+                &element,
+                &ty,
+                &arg.span,
+                Some("the first element of `listOf`".into()),
+            );
         }
         Type::list(element)
     }
@@ -713,7 +922,11 @@ impl<'a> Checker<'a> {
                 return match self.globals.get(name).cloned().filter(|_| declared) {
                     Some(scheme) => instantiate(&mut self.table, &scheme, self.level),
                     None => {
-                        self.error("E7103", format!("`server.{name}` does not name a function."), span);
+                        self.error(
+                            "E7103",
+                            format!("`server.{name}` does not name a function."),
+                            span,
+                        );
                         Type::Error
                     }
                 };
@@ -751,7 +964,9 @@ impl<'a> Checker<'a> {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "E7101",
-                            format!("Cannot access `{name}` on a nullable value of type `{shown}`."),
+                            format!(
+                                "Cannot access `{name}` on a nullable value of type `{shown}`."
+                            ),
                             span.clone(),
                         )
                         .with_hint("Use `?.`, `?:` or a `when` that handles `null`."),
@@ -771,20 +986,33 @@ impl<'a> Checker<'a> {
                 let owners = self.env.records_with_field(name);
                 match owners.as_slice() {
                     [owner] => {
-                        let record = self.env.instantiate_record(owner, &mut self.table, self.level);
+                        let record =
+                            self.env
+                                .instantiate_record(owner, &mut self.table, self.level);
                         self.unify_at(&record, target, span, None);
-                        let Type::Con(record_name, args) = &record else { return Type::Error };
-                        self.env.field_type(record_name, args, name).unwrap_or(Type::Error)
+                        let Type::Con(record_name, args) = &record else {
+                            return Type::Error;
+                        };
+                        self.env
+                            .field_type(record_name, args, name)
+                            .unwrap_or(Type::Error)
                     }
                     [] => {
-                        self.error("E7104", format!("No record type has a field `{name}`."), span);
+                        self.error(
+                            "E7104",
+                            format!("No record type has a field `{name}`."),
+                            span,
+                        );
                         Type::Error
                     }
                     _ => {
                         self.diagnostics.push(
                             Diagnostic::error(
                                 "E7106",
-                                format!("The field `{name}` exists in several types ({}).", owners.join(", ")),
+                                format!(
+                                    "The field `{name}` exists in several types ({}).",
+                                    owners.join(", ")
+                                ),
                                 span.clone(),
                             )
                             .with_hint("Annotate the value's type."),
@@ -814,7 +1042,12 @@ impl<'a> Checker<'a> {
             BinaryOp::Rem => {
                 let int = Type::con("Int");
                 self.unify_at(&int, &left_ty, &left.span, Some("the `%` operator".into()));
-                self.unify_at(&int, &right_ty, &right.span, Some("the `%` operator".into()));
+                self.unify_at(
+                    &int,
+                    &right_ty,
+                    &right.span,
+                    Some("the `%` operator".into()),
+                );
                 Type::option(int)
             }
             _ => {
@@ -825,7 +1058,12 @@ impl<'a> Checker<'a> {
                     BinaryOp::Eq | BinaryOp::NotEq => Constraint::Eq,
                     _ => Constraint::Ord,
                 };
-                self.unify_at(&left_ty, &right_ty, &right.span, Some(format!("the left operand of `{}`", op.symbol())));
+                self.unify_at(
+                    &left_ty,
+                    &right_ty,
+                    &right.span,
+                    Some(format!("the left operand of `{}`", op.symbol())),
+                );
                 self.require(constraint, &left_ty, span);
                 match op {
                     BinaryOp::Div => self.division_result(&left_ty, span),
@@ -839,7 +1077,9 @@ impl<'a> Checker<'a> {
     /// `Int` and `Decimal` division can divide by zero, so it is nullable; IEEE floats are not.
     fn division_result(&mut self, operand: &Type, span: &Span) -> Type {
         match self.table.shallow(operand) {
-            Type::Con(name, _) if name == "Int" || name == "Decimal" => Type::option(operand.clone()),
+            Type::Con(name, _) if name == "Int" || name == "Decimal" => {
+                Type::option(operand.clone())
+            }
             Type::Var(id) => {
                 self.diagnostics.push(
                     Diagnostic::error(
@@ -857,12 +1097,17 @@ impl<'a> Checker<'a> {
     }
 
     fn infer_builder(&mut self, target: &Expr, fields: &[FieldInit], span: &Span) -> Type {
-        let insert = db_method(target).filter(|(_, method)| *method == "insert" && !self.is_shadowed("db"));
+        let insert =
+            db_method(target).filter(|(_, method)| *method == "insert" && !self.is_shadowed("db"));
         let Some((table, _)) = insert else {
             for field in fields {
                 self.infer(&field.value);
             }
-            self.error("E7004", "`{ field = value }` blocks are only supported on `db.<table>.insert`.", span);
+            self.error(
+                "E7004",
+                "`{ field = value }` blocks are only supported on `db.<table>.insert`.",
+                span,
+            );
             return Type::Error;
         };
         let schema = self.schema;
@@ -877,7 +1122,11 @@ impl<'a> Checker<'a> {
         for field in fields {
             let found = self.infer(&field.value);
             if !seen.insert(field.name.as_str()) {
-                self.error("E7110", format!("Column `{}` is assigned more than once.", field.name), &field.span);
+                self.error(
+                    "E7110",
+                    format!("Column `{}` is assigned more than once.", field.name),
+                    &field.span,
+                );
                 continue;
             }
             match columns.get(&field.name) {
@@ -886,7 +1135,11 @@ impl<'a> Checker<'a> {
                     let reason = Some(format!("column `{table}.{}`", field.name));
                     self.unify_at(&expected, &found, &field.value.span, reason);
                 }
-                None => self.error("E7104", format!("Table `{table}` has no column `{}`.", field.name), &field.span),
+                None => self.error(
+                    "E7104",
+                    format!("Table `{table}` has no column `{}`.", field.name),
+                    &field.span,
+                ),
             }
         }
         model
@@ -922,8 +1175,17 @@ impl<'a> Checker<'a> {
             return Type::Error;
         }
         let found = self.infer(&args[0]);
-        self.unify_at(&key, &found, &args[0].span, Some(format!("the primary key of table `{table}`")));
-        if method == "find" { Type::option(model) } else { model }
+        self.unify_at(
+            &key,
+            &found,
+            &args[0].span,
+            Some(format!("the primary key of table `{table}`")),
+        );
+        if method == "find" {
+            Type::option(model)
+        } else {
+            model
+        }
     }
 
     /// The primary-key type and model type of a table, which must map to a declared entity.
@@ -933,11 +1195,18 @@ impl<'a> Checker<'a> {
             self.error("E7104", format!("Unknown database table `{table}`."), span);
             return None;
         };
-        let is_entity = self.env.types.get(&definition.model).is_some_and(|info| info.kind == TypeKind::Entity);
+        let is_entity = self
+            .env
+            .types
+            .get(&definition.model)
+            .is_some_and(|info| info.kind == TypeKind::Entity);
         if !is_entity {
             self.error(
                 "E7103",
-                format!("Table `{table}` maps to `{}`, which is not a declared entity.", definition.model),
+                format!(
+                    "Table `{table}` maps to `{}`, which is not a declared entity.",
+                    definition.model
+                ),
                 span,
             );
             return None;
@@ -967,13 +1236,27 @@ impl<'a> Checker<'a> {
                 Type::Error
             }
         };
-        if column.nullable { Type::option(base) } else { base }
+        if column.nullable {
+            Type::option(base)
+        } else {
+            base
+        }
     }
 
-    fn infer_ui(&mut self, name: &str, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
+    fn infer_ui(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        children: Option<&Block>,
+        span: &Span,
+    ) -> Type {
         if name == "Text" {
             if args.len() != 1 {
-                self.error("E7102", format!("`Text` expects 1 argument, but {} were given.", args.len()), span);
+                self.error(
+                    "E7102",
+                    format!("`Text` expects 1 argument, but {} were given.", args.len()),
+                    span,
+                );
             }
             for arg in args {
                 let ty = self.infer(arg);
@@ -987,7 +1270,10 @@ impl<'a> Checker<'a> {
                     self.diagnostics.push(
                         Diagnostic::error(
                             "E7105",
-                            format!("`Text` cannot display a value of type `{}`.", display(&resolved)),
+                            format!(
+                                "`Text` cannot display a value of type `{}`.",
+                                display(&resolved)
+                            ),
                             arg.span.clone(),
                         )
                         .with_hint(hint),
@@ -1003,7 +1289,8 @@ impl<'a> Checker<'a> {
             let ty = self.infer(arg);
             match self.table.shallow(&ty) {
                 Type::Error => {}
-                Type::Con(type_name, type_args) if type_args.is_empty() && (type_name == "String" || type_name == "Int") => {}
+                Type::Con(type_name, type_args)
+                    if type_args.is_empty() && (type_name == "String" || type_name == "Int") => {}
                 other => {
                     let shown = self.shown(&other);
                     let mut diagnostic = Diagnostic::error(
@@ -1012,7 +1299,8 @@ impl<'a> Checker<'a> {
                         arg.span.clone(),
                     );
                     if matches!(other, Type::Var(_)) {
-                        diagnostic = diagnostic.with_hint("Annotate the parameter's type, e.g. `label: String`.");
+                        diagnostic = diagnostic
+                            .with_hint("Annotate the parameter's type, e.g. `label: String`.");
                     }
                     self.diagnostics.push(diagnostic);
                 }
@@ -1022,10 +1310,20 @@ impl<'a> Checker<'a> {
             let mark = self.locals.len();
             for stmt in &block.stmts {
                 match stmt {
-                    Stmt::Val { name, annotation, value, span } => self.bind_val(name, annotation.as_ref(), value, span),
+                    Stmt::Val {
+                        name,
+                        annotation,
+                        value,
+                        span,
+                    } => self.bind_val(name, annotation.as_ref(), value, span),
                     Stmt::Expr(expr) => {
                         let ty = self.infer(expr);
-                        self.unify_at(&Type::con("Ui"), &ty, &expr.span, Some("a UI child block".into()));
+                        self.unify_at(
+                            &Type::con("Ui"),
+                            &ty,
+                            &expr.span,
+                            Some("a UI child block".into()),
+                        );
                     }
                 }
             }
@@ -1042,11 +1340,18 @@ impl<'a> Checker<'a> {
         // A scrutinee of still unknown type matched against `null` is optional, which the arms
         // before the `null` arm must already see. A known type is left to the `null` pattern,
         // which reports a mismatch once, at the pattern.
-        if arms.iter().any(|arm| matches!(arm.pattern, Pattern::Null(_)))
+        if arms
+            .iter()
+            .any(|arm| matches!(arm.pattern, Pattern::Null(_)))
             && matches!(self.table.shallow(&subject), Type::Var(_))
         {
             let inner = self.fresh();
-            self.unify_at(&Type::option(inner), &subject, &scrutinee.span, Some("a `null` pattern".into()));
+            self.unify_at(
+                &Type::option(inner),
+                &subject,
+                &scrutinee.span,
+                Some("a `null` pattern".into()),
+            );
         }
         let result = self.fresh();
         let mut patterns = Vec::new();
@@ -1067,7 +1372,12 @@ impl<'a> Checker<'a> {
             null_seen |= matches!(arm.pattern, Pattern::Null(_));
             invalid_pattern |= self.diagnostics.len() > reported;
             let body = self.infer(&arm.body);
-            self.unify_at(&result, &body, &arm.body.span, Some("the first `when` branch".into()));
+            self.unify_at(
+                &result,
+                &body,
+                &arm.body.span,
+                Some("the first `when` branch".into()),
+            );
             self.locals.truncate(mark);
             patterns.push(pattern);
         }
@@ -1076,12 +1386,19 @@ impl<'a> Checker<'a> {
         if !invalid_pattern && !subject_ty.contains_error() {
             let report = exhaustive::check_match(self.env, &subject_ty, &patterns);
             for index in report.redundant {
-                self.error("E7202", "This `when` branch can never be reached.", &arms[index].span);
+                self.error(
+                    "E7202",
+                    "This `when` branch can never be reached.",
+                    &arms[index].span,
+                );
             }
             if let Some(missing) = report.missing {
                 self.error(
                     "E7201",
-                    format!("`when` is not exhaustive; missing case: {}.", exhaustive::render(&missing)),
+                    format!(
+                        "`when` is not exhaustive; missing case: {}.",
+                        exhaustive::render(&missing)
+                    ),
                     span,
                 );
             }
@@ -1104,9 +1421,14 @@ impl<'a> Checker<'a> {
 
     fn bind_variable(&mut self, name: &str, ty: &Type, span: &Span, bound: &mut BTreeSet<String>) {
         if !bound.insert(name.to_string()) {
-            self.error("E7113", format!("`{name}` is bound more than once in this pattern."), span);
+            self.error(
+                "E7113",
+                format!("`{name}` is bound more than once in this pattern."),
+                span,
+            );
         }
-        self.locals.push((name.to_string(), Scheme::mono(ty.clone())));
+        self.locals
+            .push((name.to_string(), Scheme::mono(ty.clone())));
     }
 
     /// Checks `pattern` against `ty`. Variables and `_` are irrefutable and take `ty` as is.
@@ -1125,12 +1447,22 @@ impl<'a> Checker<'a> {
         self.check_value_pattern(pattern, ty, bound)
     }
 
-    fn check_value_pattern(&mut self, pattern: &Pattern, ty: &Type, bound: &mut BTreeSet<String>) -> Pat {
+    fn check_value_pattern(
+        &mut self,
+        pattern: &Pattern,
+        ty: &Type,
+        bound: &mut BTreeSet<String>,
+    ) -> Pat {
         match pattern {
             Pattern::Wildcard => Pat::Wild,
             Pattern::Null(span) => {
                 let inner = self.fresh();
-                self.unify_at(&Type::option(inner), ty, span, Some("a `null` pattern".into()));
+                self.unify_at(
+                    &Type::option(inner),
+                    ty,
+                    span,
+                    Some("a `null` pattern".into()),
+                );
                 Pat::Ctor("null".into(), Vec::new())
             }
             Pattern::Bool(value, span) => {
@@ -1146,7 +1478,11 @@ impl<'a> Checker<'a> {
                 Pat::Lit(format!("{text:?}"))
             }
             Pattern::Double(text, span) => {
-                self.error("E7109", format!("The floating-point literal `{text}` cannot be used as a pattern."), span);
+                self.error(
+                    "E7109",
+                    format!("The floating-point literal `{text}` cannot be used as a pattern."),
+                    span,
+                );
                 Pat::Wild
             }
             Pattern::Name(name, span) => {
@@ -1154,7 +1490,10 @@ impl<'a> Checker<'a> {
                     if !ctor.fields.is_empty() {
                         self.error(
                             "E7102",
-                            format!("Constructor `{name}` has {} field(s); write `{name}(...)`.", ctor.fields.len()),
+                            format!(
+                                "Constructor `{name}` has {} field(s); write `{name}(...)`.",
+                                ctor.fields.len()
+                            ),
                             span,
                         );
                         return Pat::Wild;
@@ -1180,12 +1519,20 @@ impl<'a> Checker<'a> {
                 if fields.len() != args.len() {
                     self.error(
                         "E7102",
-                        format!("Constructor `{name}` has {} field(s), but the pattern lists {}.", fields.len(), args.len()),
+                        format!(
+                            "Constructor `{name}` has {} field(s), but the pattern lists {}.",
+                            fields.len(),
+                            args.len()
+                        ),
                         span,
                     );
                     return Pat::Wild;
                 }
-                let patterns = args.iter().zip(&fields).map(|(arg, field)| self.check_pattern(arg, field, bound)).collect();
+                let patterns = args
+                    .iter()
+                    .zip(&fields)
+                    .map(|(arg, field)| self.check_pattern(arg, field, bound))
+                    .collect();
                 Pat::Ctor(name.clone(), patterns)
             }
         }
@@ -1194,8 +1541,20 @@ impl<'a> Checker<'a> {
 
 /// `db.<table>.<method>` as written, before any shadowing check.
 fn db_method(expr: &Expr) -> Option<(&str, &str)> {
-    let ExprKind::Field { target, name: method } = &expr.kind else { return None };
-    let ExprKind::Field { target: root, name: table } = &target.kind else { return None };
+    let ExprKind::Field {
+        target,
+        name: method,
+    } = &expr.kind
+    else {
+        return None;
+    };
+    let ExprKind::Field {
+        target: root,
+        name: table,
+    } = &target.kind
+    else {
+        return None;
+    };
     match &root.kind {
         ExprKind::Name(db) if db == "db" => Some((table.as_str(), method.as_str())),
         _ => None,
@@ -1203,14 +1562,29 @@ fn db_method(expr: &Expr) -> Option<(&str, &str)> {
 }
 
 fn is_fully_annotated(function: &Function) -> bool {
-    function.parameters.iter().all(|parameter| parameter.type_ref.is_some())
+    function
+        .parameters
+        .iter()
+        .all(|parameter| parameter.type_ref.is_some())
         && (function.component || function.return_type.is_some())
 }
 
 fn builtin(table: &mut TypeTable, arity: usize, build: impl Fn(&[Type]) -> Type) -> Scheme {
     let vars: Vec<Type> = (0..arity).map(|_| table.fresh(GENERIC_LEVEL)).collect();
-    let ids = vars.iter().filter_map(|var| if let Type::Var(id) = var { Some(*id) } else { None }).collect();
-    Scheme { vars: ids, ty: build(&vars) }
+    let ids = vars
+        .iter()
+        .filter_map(|var| {
+            if let Type::Var(id) = var {
+                Some(*id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    Scheme {
+        vars: ids,
+        ty: build(&vars),
+    }
 }
 
 fn result_span(block: &Block) -> Span {
@@ -1232,8 +1606,11 @@ fn abbreviate(text: &str) -> String {
 /// Strongly connected components of the call graph among `functions`, dependencies first
 /// (Tarjan). Each component is inferred together, which supports mutual recursion.
 fn components(functions: &[&Function]) -> Vec<Vec<usize>> {
-    let index: BTreeMap<&str, usize> =
-        functions.iter().enumerate().map(|(position, function)| (function.name.as_str(), position)).collect();
+    let index: BTreeMap<&str, usize> = functions
+        .iter()
+        .enumerate()
+        .map(|(position, function)| (function.name.as_str(), position))
+        .collect();
     let edges: Vec<Vec<usize>> = functions
         .iter()
         .map(|function| {
@@ -1241,7 +1618,10 @@ fn components(functions: &[&Function]) -> Vec<Vec<usize>> {
             if let Some(block) = &function.expr {
                 collect_block(block, &mut names);
             }
-            names.iter().filter_map(|name| index.get(name.as_str()).copied()).collect()
+            names
+                .iter()
+                .filter_map(|name| index.get(name.as_str()).copied())
+                .collect()
         })
         .collect();
     let mut tarjan = Tarjan {
@@ -1285,7 +1665,9 @@ impl Tarjan<'_> {
                     self.visit(other);
                     self.low[vertex] = self.low[vertex].min(self.low[other]);
                 }
-                Some(index) if self.on_stack[other] => self.low[vertex] = self.low[vertex].min(index),
+                Some(index) if self.on_stack[other] => {
+                    self.low[vertex] = self.low[vertex].min(index)
+                }
                 Some(_) => {}
             }
         }
@@ -1327,7 +1709,11 @@ fn collect_expr(expr: &Expr, names: &mut BTreeSet<String>) {
             collect_expr(target, names);
         }
         ExprKind::SafeField { target, .. } => collect_expr(target, names),
-        ExprKind::Call { callee, args, children } => {
+        ExprKind::Call {
+            callee,
+            args,
+            children,
+        } => {
             collect_expr(callee, names);
             args.iter().for_each(|arg| collect_expr(arg, names));
             if let Some(block) = children {
@@ -1343,7 +1729,11 @@ fn collect_expr(expr: &Expr, names: &mut BTreeSet<String>) {
             collect_expr(value, names);
             collect_expr(fallback, names);
         }
-        ExprKind::If { condition, then_branch, else_branch } => {
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
             collect_expr(condition, names);
             collect_expr(then_branch, names);
             collect_expr(else_branch, names);
@@ -1356,9 +1746,16 @@ fn collect_expr(expr: &Expr, names: &mut BTreeSet<String>) {
         ExprKind::Return(value) => collect_expr(value, names),
         ExprKind::Builder { target, fields } => {
             collect_expr(target, names);
-            fields.iter().for_each(|field| collect_expr(&field.value, names));
+            fields
+                .iter()
+                .for_each(|field| collect_expr(&field.value, names));
         }
-        ExprKind::Int(_) | ExprKind::Double(_) | ExprKind::Float(_) | ExprKind::Str(_) | ExprKind::Bool(_) | ExprKind::Null => {}
+        ExprKind::Int(_)
+        | ExprKind::Double(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null => {}
     }
 }
 
@@ -1370,34 +1767,64 @@ mod tests {
 
     #[test]
     fn elvis_chains_are_right_associative() {
-        assert_eq!(scheme("fun f(a: Int?, b: Int?): Int = a ?: b ?: 0", "f"), "(Int?, Int?) -> Int");
+        assert_eq!(
+            scheme("fun f(a: Int?, b: Int?): Int = a ?: b ?: 0", "f"),
+            "(Int?, Int?) -> Int"
+        );
     }
 
     #[test]
     fn nested_optional_annotation_is_supported() {
-        assert_eq!(scheme("fun f(a: Int??): Int? = a ?: null", "f"), "(Int??) -> Int?");
+        assert_eq!(
+            scheme("fun f(a: Int??): Int? = a ?: null", "f"),
+            "(Int??) -> Int?"
+        );
     }
 
     #[test]
     fn infers_principal_types() {
         assert_eq!(scheme("fun ident(x) = x", "ident"), "('a) -> 'a");
-        assert_eq!(scheme("fun constante(x, y) = x", "constante"), "('a, 'b) -> 'a");
-        assert_eq!(scheme("fun compose(f, g, x) = f(g(x))", "compose"), "(('a) -> 'b, ('c) -> 'a, 'c) -> 'b");
-        assert_eq!(scheme("fun aplica(f, x) = f(x)", "aplica"), "(('a) -> 'b, 'a) -> 'b");
+        assert_eq!(
+            scheme("fun constante(x, y) = x", "constante"),
+            "('a, 'b) -> 'a"
+        );
+        assert_eq!(
+            scheme("fun compose(f, g, x) = f(g(x))", "compose"),
+            "(('a) -> 'b, ('c) -> 'a, 'c) -> 'b"
+        );
+        assert_eq!(
+            scheme("fun aplica(f, x) = f(x)", "aplica"),
+            "(('a) -> 'b, 'a) -> 'b"
+        );
     }
 
     #[test]
     fn literals_resolve_operator_constraints() {
         assert_eq!(scheme("fun dobro(x) = x * 2", "dobro"), "(Int) -> Int");
-        assert_eq!(scheme("fun concat(a, b) = a + b + \"\"", "concat"), "(String, String) -> String");
-        assert_eq!(scheme("fun media(a: Double, b: Double) = (a + b) / 2.0", "media"), "(Double, Double) -> Double");
-        assert_eq!(scheme("fun menor(a: Instant, b: Instant) = a < b", "menor"), "(Instant, Instant) -> Boolean");
+        assert_eq!(
+            scheme("fun concat(a, b) = a + b + \"\"", "concat"),
+            "(String, String) -> String"
+        );
+        assert_eq!(
+            scheme("fun media(a: Double, b: Double) = (a + b) / 2.0", "media"),
+            "(Double, Double) -> Double"
+        );
+        assert_eq!(
+            scheme("fun menor(a: Instant, b: Instant) = a < b", "menor"),
+            "(Instant, Instant) -> Boolean"
+        );
     }
 
     #[test]
     fn integer_division_and_remainder_are_nullable() {
-        assert_eq!(scheme("fun metade(x: Int) = x / 2", "metade"), "(Int) -> Int?");
-        assert_eq!(scheme("fun resto(x: Int) = (x % 2) ?: 0", "resto"), "(Int) -> Int");
+        assert_eq!(
+            scheme("fun metade(x: Int) = x / 2", "metade"),
+            "(Int) -> Int?"
+        );
+        assert_eq!(
+            scheme("fun resto(x: Int) = (x % 2) ?: 0", "resto"),
+            "(Int) -> Int"
+        );
         assert_eq!(errors("fun f(x: Int): Int = x / 2"), vec!["E7101"]);
     }
 
@@ -1405,26 +1832,52 @@ mod tests {
     fn rejects_ambiguous_and_unsupported_operators() {
         assert_eq!(errors("fun soma(a, b) = a + b"), vec!["E7302"]);
         assert_eq!(errors("fun divide(a, b) = a / b"), vec!["E7302"]);
-        assert_eq!(errors("fun f(a: Boolean, b: Boolean) = a + b"), vec!["E7301"]);
+        assert_eq!(
+            errors("fun f(a: Boolean, b: Boolean) = a + b"),
+            vec!["E7301"]
+        );
         assert_eq!(errors("fun f(a: String, b: String) = a - b"), vec!["E7301"]);
-        assert_eq!(errors("fun g(x: Int): Int = x\nfun f(): Boolean = g == g"), vec!["E7301"]);
-        assert_eq!(errors("fun <T> igual(a: T, b: T): Boolean = a == b"), vec!["E7301"]);
+        assert_eq!(
+            errors("fun g(x: Int): Int = x\nfun f(): Boolean = g == g"),
+            vec!["E7301"]
+        );
+        assert_eq!(
+            errors("fun <T> igual(a: T, b: T): Boolean = a == b"),
+            vec!["E7301"]
+        );
     }
 
     #[test]
     fn equality_rejects_types_that_contain_functions() {
         let holder = "data class H(val run: (Int) -> Int)\n";
-        assert_eq!(errors(&format!("{holder}fun f(a: H, b: H): Boolean = a == b")), vec!["E7301"]);
-        let wrapper = format!("{holder}data class W(val h: H)\nfun f(a: W, b: W): Boolean = a == b");
+        assert_eq!(
+            errors(&format!("{holder}fun f(a: H, b: H): Boolean = a == b")),
+            vec!["E7301"]
+        );
+        let wrapper =
+            format!("{holder}data class W(val h: H)\nfun f(a: W, b: W): Boolean = a == b");
         assert_eq!(errors(&wrapper), vec!["E7301"]);
         let sealed = "sealed class S {\n    data class C(val k: () -> Int)\n    data object D\n}\n";
-        assert_eq!(errors(&format!("{sealed}fun f(a: S, b: S): Boolean = a == b")), vec!["E7301"]);
-        assert_eq!(errors("fun f(a: Ui, b: Ui): Boolean = a == b"), vec!["E7301"]);
+        assert_eq!(
+            errors(&format!("{sealed}fun f(a: S, b: S): Boolean = a == b")),
+            vec!["E7301"]
+        );
+        assert_eq!(
+            errors("fun f(a: Ui, b: Ui): Boolean = a == b"),
+            vec!["E7301"]
+        );
         let plain = "data class P(val x: Int)\nfun f(a: P, b: P): Boolean = a == b";
         assert_eq!(scheme(plain, "f"), "(P, P) -> Boolean");
         let boxed = "data class Box<T>(val v: T)\n";
-        assert_eq!(scheme(&format!("{boxed}fun f(a: Box<Int>, b: Box<Int>): Boolean = a == b"), "f"), "(Box<Int>, Box<Int>) -> Boolean");
-        let functions = format!("{boxed}fun f(a: Box<(Int) -> Int>, b: Box<(Int) -> Int>): Boolean = a == b");
+        assert_eq!(
+            scheme(
+                &format!("{boxed}fun f(a: Box<Int>, b: Box<Int>): Boolean = a == b"),
+                "f"
+            ),
+            "(Box<Int>, Box<Int>) -> Boolean"
+        );
+        let functions =
+            format!("{boxed}fun f(a: Box<(Int) -> Int>, b: Box<(Int) -> Int>): Boolean = a == b");
         assert_eq!(errors(&functions), vec!["E7301"]);
         let local = format!("{holder}fun f(x: H): Boolean {{\n    val y = x\n    y == x\n}}");
         assert_eq!(errors(&local), vec!["E7301"]);
@@ -1436,36 +1889,86 @@ mod tests {
     fn inputs_at_the_parser_limits_type_check() {
         crate::with_compiler_stack(|| {
             let chain = vec!["x"; 1_001].join(" + ");
-            assert_eq!(scheme(&format!("fun f(x: Int): Int = {chain}"), "f"), "(Int) -> Int");
+            assert_eq!(
+                scheme(&format!("fun f(x: Int): Int = {chain}"), "f"),
+                "(Int) -> Int"
+            );
             let nested = format!("{}x{}", "(x + ".repeat(255), ")".repeat(255));
-            assert_eq!(scheme(&format!("fun f(x: Int): Int = {nested}"), "f"), "(Int) -> Int");
-            let mixed = format!("{}{}{}", "-(".repeat(127), vec!["x"; 744].join(" - "), ")".repeat(127));
-            assert_eq!(scheme(&format!("fun f(x: Int): Int = {mixed}"), "f"), "(Int) -> Int");
+            assert_eq!(
+                scheme(&format!("fun f(x: Int): Int = {nested}"), "f"),
+                "(Int) -> Int"
+            );
+            let mixed = format!(
+                "{}{}{}",
+                "-(".repeat(127),
+                vec!["x"; 744].join(" - "),
+                ")".repeat(127)
+            );
+            assert_eq!(
+                scheme(&format!("fun f(x: Int): Int = {mixed}"), "f"),
+                "(Int) -> Int"
+            );
             let calls = format!("{}x{}", "g(".repeat(254), ")".repeat(254));
-            assert_eq!(scheme(&format!("fun g(x: Int): Int = x\nfun f(x: Int): Int = {calls}"), "f"), "(Int) -> Int");
-            let ifs = format!("{}x{}", "if (true) { ".repeat(126), " } else { x }".repeat(126));
-            assert_eq!(scheme(&format!("fun f(x: Int): Int = {ifs}"), "f"), "(Int) -> Int");
+            assert_eq!(
+                scheme(
+                    &format!("fun g(x: Int): Int = x\nfun f(x: Int): Int = {calls}"),
+                    "f"
+                ),
+                "(Int) -> Int"
+            );
+            let ifs = format!(
+                "{}x{}",
+                "if (true) { ".repeat(126),
+                " } else { x }".repeat(126)
+            );
+            assert_eq!(
+                scheme(&format!("fun f(x: Int): Int = {ifs}"), "f"),
+                "(Int) -> Int"
+            );
             let whens = format!("{}x{}", "when (x) { _ -> ".repeat(255), " }".repeat(255));
-            assert_eq!(scheme(&format!("fun f(x: Int): Int = {whens}"), "f"), "(Int) -> Int");
+            assert_eq!(
+                scheme(&format!("fun f(x: Int): Int = {whens}"), "f"),
+                "(Int) -> Int"
+            );
             let lambdas = format!("{}x{}", "{ y -> ".repeat(250), " }".repeat(250));
             assert!(infer(&format!("fun f(x: Int) = {lambdas}")).is_ok());
-            assert_eq!(errors(&format!("fun f(x: Int): Int = {}", vec!["x"; 1_500].join(" + "))), vec!["E7004"]);
-            assert_eq!(errors(&format!("fun f(x: Int): Int = {}x{}", "(".repeat(300), ")".repeat(300))), vec!["E7004"]);
+            assert_eq!(
+                errors(&format!(
+                    "fun f(x: Int): Int = {}",
+                    vec!["x"; 1_500].join(" + ")
+                )),
+                vec!["E7004"]
+            );
+            assert_eq!(
+                errors(&format!(
+                    "fun f(x: Int): Int = {}x{}",
+                    "(".repeat(300),
+                    ")".repeat(300)
+                )),
+                vec!["E7004"]
+            );
         });
     }
 
     #[test]
     fn generalizes_local_values() {
-        let source = "fun f(): Boolean {\n    val id = { x -> x }\n    val n = id(1)\n    id(n == 1)\n}";
+        let source =
+            "fun f(): Boolean {\n    val id = { x -> x }\n    val n = id(1)\n    id(n == 1)\n}";
         assert_eq!(scheme(source, "f"), "() -> Boolean");
     }
 
     #[test]
     fn annotated_type_parameters_are_rigid() {
-        assert_eq!(scheme("fun <T> primeiro(xs: List<T>): T? = first(xs)", "primeiro"), "(List<'a>) -> 'a?");
+        assert_eq!(
+            scheme("fun <T> primeiro(xs: List<T>): T? = first(xs)", "primeiro"),
+            "(List<'a>) -> 'a?"
+        );
         assert_eq!(errors("fun <T> errado(x: T): Int = x"), vec!["E7101"]);
         assert_eq!(
-            scheme("fun <A, B> mapear(xs: List<A>, f: (A) -> B): List<B> = map(xs, f)", "mapear"),
+            scheme(
+                "fun <A, B> mapear(xs: List<A>, f: (A) -> B): List<B> = map(xs, f)",
+                "mapear"
+            ),
             "(List<'a>, ('a) -> 'b) -> List<'b>"
         );
     }
@@ -1475,7 +1978,13 @@ mod tests {
         let source = "fun par(n) = if (n == 0) true else impar(n - 1)\nfun impar(n) = if (n == 0) false else par(n - 1)";
         assert_eq!(scheme(source, "par"), "(Int) -> Boolean");
         assert_eq!(scheme(source, "impar"), "(Int) -> Boolean");
-        assert_eq!(scheme("fun fatorial(n) = if (n <= 1) 1 else n * fatorial(n - 1)", "fatorial"), "(Int) -> Int");
+        assert_eq!(
+            scheme(
+                "fun fatorial(n) = if (n <= 1) 1 else n * fatorial(n - 1)",
+                "fatorial"
+            ),
+            "(Int) -> Int"
+        );
     }
 
     #[test]
@@ -1486,91 +1995,188 @@ mod tests {
     #[test]
     fn discarded_values_are_errors() {
         assert_eq!(errors("fun f(): Int {\n    1 + 1\n    2\n}"), vec!["E7108"]);
-        assert_eq!(scheme("fun f(): Int {\n    val _ = 1 + 1\n    2\n}", "f"), "() -> Int");
-        let operator_on_next_line = "fun f(a: Int, b: Int): Int {\n    val y = a\n        - b\n    y\n}";
+        assert_eq!(
+            scheme("fun f(): Int {\n    val _ = 1 + 1\n    2\n}", "f"),
+            "() -> Int"
+        );
+        let operator_on_next_line =
+            "fun f(a: Int, b: Int): Int {\n    val y = a\n        - b\n    y\n}";
         assert_eq!(errors(operator_on_next_line), vec!["E7108"]);
     }
 
     #[test]
     fn returns_and_lambdas() {
-        assert_eq!(scheme("fun f(x: Int): Int {\n    return x\n}", "f"), "(Int) -> Int");
-        assert_eq!(errors("fun f(): Int {\n    val g = { x -> return x }\n    g(1)\n}"), vec!["E7111"]);
+        assert_eq!(
+            scheme("fun f(x: Int): Int {\n    return x\n}", "f"),
+            "(Int) -> Int"
+        );
+        assert_eq!(
+            errors("fun f(): Int {\n    val g = { x -> return x }\n    g(1)\n}"),
+            vec!["E7111"]
+        );
         assert_eq!(errors("fun f(): Int {\n    return \"a\"\n}"), vec!["E7101"]);
-        assert_eq!(errors("fun f(c: Boolean) = if (c) 1 else \"a\""), vec!["E7101"]);
+        assert_eq!(
+            errors("fun f(c: Boolean) = if (c) 1 else \"a\""),
+            vec!["E7101"]
+        );
     }
 
     #[test]
     fn when_must_be_exhaustive_and_free_of_redundancy() {
-        let complete = format!("{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 0\n}}");
+        let complete = format!(
+            "{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 0\n}}"
+        );
         assert_eq!(scheme(&complete, "f"), "(Pedido) -> Int");
-        let missing = format!("{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    Pendente(n) -> n\n    Cancelado -> 0\n}}");
+        let missing = format!(
+            "{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    Pendente(n) -> n\n    Cancelado -> 0\n}}"
+        );
         assert_eq!(errors(&missing), vec!["E7201"]);
-        let redundant = format!("{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    _ -> 0\n    Cancelado -> 1\n}}");
+        let redundant = format!(
+            "{PEDIDO}fun f(p: Pedido): Int = when (p) {{\n    _ -> 0\n    Cancelado -> 1\n}}"
+        );
         assert_eq!(errors(&redundant), vec!["E7202"]);
-        assert_eq!(errors(&format!("{PEDIDO}fun f(p: Pedido): Int = when (p) {{ Pendente(a, b) -> 1; _ -> 0 }}")), vec!["E7102"]);
+        assert_eq!(
+            errors(&format!(
+                "{PEDIDO}fun f(p: Pedido): Int = when (p) {{ Pendente(a, b) -> 1; _ -> 0 }}"
+            )),
+            vec!["E7102"]
+        );
     }
 
     #[test]
     fn nullable_patterns() {
-        assert_eq!(scheme("fun f(x: Int?): Int = when (x) {\n    null -> 0\n    n -> n\n}", "f"), "(Int?) -> Int");
-        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n }"), vec!["E7101"]);
-        assert_eq!(scheme("fun f(x) = when (x) {\n    null -> 0\n    n -> n + 1\n}", "f"), "(Int?) -> Int");
+        assert_eq!(
+            scheme(
+                "fun f(x: Int?): Int = when (x) {\n    null -> 0\n    n -> n\n}",
+                "f"
+            ),
+            "(Int?) -> Int"
+        );
+        assert_eq!(
+            errors("fun f(x: Int?): Int = when (x) { n -> n }"),
+            vec!["E7101"]
+        );
+        assert_eq!(
+            scheme(
+                "fun f(x) = when (x) {\n    null -> 0\n    n -> n + 1\n}",
+                "f"
+            ),
+            "(Int?) -> Int"
+        );
     }
 
     #[test]
     fn variable_patterns_bind_the_type_as_is() {
         let record = "data class U(val nome: String, val email: String?)\n";
-        assert_eq!(scheme(&format!("{record}fun f(u: U): String = when (u) {{ U(n, e) -> n }}"), "f"), "(U) -> String");
+        assert_eq!(
+            scheme(
+                &format!("{record}fun f(u: U): String = when (u) {{ U(n, e) -> n }}"),
+                "f"
+            ),
+            "(U) -> String"
+        );
         let email = format!("{record}fun f(u: U): String = when (u) {{ U(_, e) -> e ?: \"\" }}");
         assert_eq!(scheme(&email, "f"), "(U) -> String");
-        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { null -> 0; n -> n }", "f"), "(Int?) -> Int");
-        assert_eq!(scheme("fun f(x: Int?): Int? = when (x) { n -> n }", "f"), "(Int?) -> Int?");
-        assert_eq!(scheme("fun f(x: Int??): Int = when (x) { null -> 0; y -> y ?: 1 }", "f"), "(Int??) -> Int");
+        assert_eq!(
+            scheme("fun f(x: Int?): Int = when (x) { null -> 0; n -> n }", "f"),
+            "(Int?) -> Int"
+        );
+        assert_eq!(
+            scheme("fun f(x: Int?): Int? = when (x) { n -> n }", "f"),
+            "(Int?) -> Int?"
+        );
+        assert_eq!(
+            scheme(
+                "fun f(x: Int??): Int = when (x) { null -> 0; y -> y ?: 1 }",
+                "f"
+            ),
+            "(Int??) -> Int"
+        );
         // Only a top-level variable arm after a top-level `null` arm is smart-cast; before it,
         // the variable takes `Int?` and already covers `null`.
-        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n; null -> 0 }"), vec!["E7101", "E7202"]);
-        assert_eq!(errors("fun f(x: Int?): Int = when (x) { n -> n ?: 0; null -> 0 }"), vec!["E7202"]);
+        assert_eq!(
+            errors("fun f(x: Int?): Int = when (x) { n -> n; null -> 0 }"),
+            vec!["E7101", "E7202"]
+        );
+        assert_eq!(
+            errors("fun f(x: Int?): Int = when (x) { n -> n ?: 0; null -> 0 }"),
+            vec!["E7202"]
+        );
     }
 
     fn diagnostic_codes(source: &str) -> Vec<&'static str> {
         let (tokens, _) = crate::lexer::lex("t.bd", source);
         let (program, parse_diagnostics) = crate::parser::parse(tokens);
         assert!(parse_diagnostics.is_empty(), "{parse_diagnostics:?}");
-        let (_, diagnostics) = crate::types::check(&program, &crate::schema::DatabaseSchema::default());
+        let (_, diagnostics) =
+            crate::types::check(&program, &crate::schema::DatabaseSchema::default());
         diagnostics.iter().map(|item| item.code).collect()
     }
 
     #[test]
     fn null_pattern_on_a_non_optional_scrutinee_is_reported_once() {
-        assert_eq!(diagnostic_codes("fun f(x: Int): Int = when (x) { null -> 0; _ -> 1 }"), vec!["E7101"]);
-        assert_eq!(diagnostic_codes("fun f(x: String): Int = when (x) { \"a\" -> 1; null -> 0; _ -> 1 }"), vec!["E7101"]);
-        assert_eq!(scheme("fun f(x) = when (x) { 1 -> 1; null -> 0; _ -> 2 }", "f"), "(Int?) -> Int");
+        assert_eq!(
+            diagnostic_codes("fun f(x: Int): Int = when (x) { null -> 0; _ -> 1 }"),
+            vec!["E7101"]
+        );
+        assert_eq!(
+            diagnostic_codes("fun f(x: String): Int = when (x) { \"a\" -> 1; null -> 0; _ -> 1 }"),
+            vec!["E7101"]
+        );
+        assert_eq!(
+            scheme("fun f(x) = when (x) { 1 -> 1; null -> 0; _ -> 2 }", "f"),
+            "(Int?) -> Int"
+        );
     }
 
     #[test]
     fn elaborated_patterns_are_recorded_per_when() {
         use crate::types::exhaustive::Pat;
-        let (tokens, _) = crate::lexer::lex("t.bd", "fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; n -> n }");
+        let (tokens, _) = crate::lexer::lex(
+            "t.bd",
+            "fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; n -> n }",
+        );
         let (program, _) = crate::parser::parse(tokens);
-        let (typed, diagnostics) = crate::types::check(&program, &crate::schema::DatabaseSchema::default());
+        let (typed, diagnostics) =
+            crate::types::check(&program, &crate::schema::DatabaseSchema::default());
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let patterns: Vec<&Vec<Pat>> = typed.patterns.values().collect();
         let some = |inner: Pat| Pat::Ctor("Some".into(), vec![inner]);
         assert_eq!(
             patterns,
-            vec![&vec![Pat::Ctor("null".into(), Vec::new()), some(Pat::Lit("1".into())), some(Pat::Wild)]]
+            vec![&vec![
+                Pat::Ctor("null".into(), Vec::new()),
+                some(Pat::Lit("1".into())),
+                some(Pat::Wild)
+            ]]
         );
         assert!(typed.patterns.keys().all(|(function, _)| function == "f"));
     }
 
     #[test]
     fn constructor_and_literal_patterns_unwrap_one_optional_layer() {
-        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }", "f"), "(Int?) -> Int");
-        assert_eq!(scheme("fun f(x: Int?): Int = when (x) { 1 -> 1; _ -> 2 }", "f"), "(Int?) -> Int");
-        assert_eq!(errors("fun f(x: Int??): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }"), vec!["E7101"]);
-        let pedido = format!("{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    null -> 0\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}");
+        assert_eq!(
+            scheme(
+                "fun f(x: Int?): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }",
+                "f"
+            ),
+            "(Int?) -> Int"
+        );
+        assert_eq!(
+            scheme("fun f(x: Int?): Int = when (x) { 1 -> 1; _ -> 2 }", "f"),
+            "(Int?) -> Int"
+        );
+        assert_eq!(
+            errors("fun f(x: Int??): Int = when (x) { null -> 0; 1 -> 1; _ -> 2 }"),
+            vec!["E7101"]
+        );
+        let pedido = format!(
+            "{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    null -> 0\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}"
+        );
         assert_eq!(scheme(&pedido, "f"), "(Pedido?) -> Int");
-        let missing = format!("{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}");
+        let missing = format!(
+            "{PEDIDO}fun f(p: Pedido?): Int = when (p) {{\n    Pendente(n) -> n\n    Pago(_) -> 1\n    Cancelado -> 2\n}}"
+        );
         assert_eq!(errors(&missing), vec!["E7201"]);
         let nested = "data class W(val v: Int?)\nfun f(w: W): Int = when (w) { W(null) -> 0; W(1) -> 1; W(n) -> n ?: 2 }";
         assert_eq!(scheme(nested, "f"), "(W) -> Int");
@@ -1580,9 +2186,18 @@ mod tests {
     fn literal_patterns() {
         let source = "fun f(x: Int): String = when (x) {\n    0 -> \"zero\"\n    _ -> \"outro\"\n}";
         assert_eq!(scheme(source, "f"), "(Int) -> String");
-        assert_eq!(errors("fun f(x: Int): String = when (x) { 0 -> \"zero\" }"), vec!["E7201"]);
-        assert_eq!(errors("fun f(x: Double): Int = when (x) { 1.5 -> 1; _ -> 0 }"), vec!["E7109"]);
-        assert_eq!(errors("fun f(b: Boolean): Int = when (b) { true -> 1; true -> 2; false -> 3 }"), vec!["E7202"]);
+        assert_eq!(
+            errors("fun f(x: Int): String = when (x) { 0 -> \"zero\" }"),
+            vec!["E7201"]
+        );
+        assert_eq!(
+            errors("fun f(x: Double): Int = when (x) { 1.5 -> 1; _ -> 0 }"),
+            vec!["E7109"]
+        );
+        assert_eq!(
+            errors("fun f(b: Boolean): Int = when (b) { true -> 1; true -> 2; false -> 3 }"),
+            vec!["E7202"]
+        );
     }
 
     #[test]
@@ -1590,19 +2205,46 @@ mod tests {
         let source = "data class P(val x: Int, val nome: String?)\nfun getX(p) = p.x\nfun nome(p: P?) = p?.nome ?: \"\"";
         assert_eq!(scheme(source, "getX"), "(P) -> Int");
         assert_eq!(scheme(source, "nome"), "(P?) -> String");
-        assert_eq!(errors("data class A(val x: Int)\ndata class B(val x: Int)\nfun f(v) = v.x"), vec!["E7106"]);
-        assert_eq!(errors("data class A(val x: Int)\nfun f(a: A) = a.y"), vec!["E7104"]);
-        assert_eq!(errors("data class A(val x: Int)\nfun f(a: A?) = a.x"), vec!["E7101"]);
+        assert_eq!(
+            errors("data class A(val x: Int)\ndata class B(val x: Int)\nfun f(v) = v.x"),
+            vec!["E7106"]
+        );
+        assert_eq!(
+            errors("data class A(val x: Int)\nfun f(a: A) = a.y"),
+            vec!["E7104"]
+        );
+        assert_eq!(
+            errors("data class A(val x: Int)\nfun f(a: A?) = a.x"),
+            vec!["E7101"]
+        );
     }
 
     #[test]
     fn constructors_results_and_enums() {
         assert_eq!(scheme("fun ok() = Ok(1)", "ok"), "() -> Result<Int, 'a>");
-        assert_eq!(scheme("fun erro(s: String): Result<Int, String> = Err(s)", "erro"), "(String) -> Result<Int, String>");
-        assert_eq!(scheme("enum class Cor { Azul, Verde }\nfun azul() = Cor.Azul", "azul"), "() -> Cor");
-        assert_eq!(scheme("data class P(val x: Int)\nfun p() = P(1)", "p"), "() -> P");
-        assert_eq!(errors("data class P(val x: Int)\nfun p() = P(1, 2)"), vec!["E7102"]);
-        assert_eq!(scheme("fun xs() = listOf(1, 2, 3)", "xs"), "() -> List<Int>");
+        assert_eq!(
+            scheme("fun erro(s: String): Result<Int, String> = Err(s)", "erro"),
+            "(String) -> Result<Int, String>"
+        );
+        assert_eq!(
+            scheme(
+                "enum class Cor { Azul, Verde }\nfun azul() = Cor.Azul",
+                "azul"
+            ),
+            "() -> Cor"
+        );
+        assert_eq!(
+            scheme("data class P(val x: Int)\nfun p() = P(1)", "p"),
+            "() -> P"
+        );
+        assert_eq!(
+            errors("data class P(val x: Int)\nfun p() = P(1, 2)"),
+            vec!["E7102"]
+        );
+        assert_eq!(
+            scheme("fun xs() = listOf(1, 2, 3)", "xs"),
+            "() -> List<Int>"
+        );
         assert_eq!(errors("fun xs() = listOf(1, \"a\")"), vec!["E7101"]);
     }
 
@@ -1617,7 +2259,10 @@ mod tests {
     fn declared_type_parameters_stay_generic_in_inferred_functions() {
         assert_eq!(scheme("fun <T> ident(x: T) = x", "ident"), "('a) -> 'a");
         assert_eq!(errors("fun <T> f(x: T) = x + 1"), vec!["E7101"]);
-        assert_eq!(errors("fun <A, B> f(x: A, y: B) = if (true) x else y"), vec!["E7101"]);
+        assert_eq!(
+            errors("fun <A, B> f(x: A, y: B) = if (true) x else y"),
+            vec!["E7101"]
+        );
     }
 
     #[test]
@@ -1628,7 +2273,8 @@ mod tests {
     #[test]
     fn lambda_arguments_see_the_expected_parameter_types() {
         let records = "data class A(val valor: Int)\ndata class B(val valor: Int)\n";
-        let mapped = format!("{records}fun f(xs: List<A>): List<Int> = map(xs, {{ p -> p.valor }})");
+        let mapped =
+            format!("{records}fun f(xs: List<A>): List<Int> = map(xs, {{ p -> p.valor }})");
         assert_eq!(scheme(&mapped, "f"), "(List<A>) -> List<Int>");
         let folded = "fun f(xs: List<Double>): Double = fold(xs, 1.0, { acc, x -> acc / x })";
         assert_eq!(scheme(folded, "f"), "(List<Double>) -> Double");
@@ -1637,8 +2283,19 @@ mod tests {
     #[test]
     fn unknown_uppercase_pattern_names_are_not_bindings() {
         let sealed = "sealed class P {\n    data object Um\n    data object Dois\n}\n";
-        assert_eq!(errors(&format!("{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; Doiss -> 2 }}")), vec!["E7103"]);
-        assert_eq!(scheme(&format!("{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; outro -> 2 }}"), "f"), "(P) -> Int");
+        assert_eq!(
+            errors(&format!(
+                "{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; Doiss -> 2 }}"
+            )),
+            vec!["E7103"]
+        );
+        assert_eq!(
+            scheme(
+                &format!("{sealed}fun f(p: P): Int = when (p) {{ Um -> 1; outro -> 2 }}"),
+                "f"
+            ),
+            "(P) -> Int"
+        );
     }
 
     #[test]
@@ -1675,44 +2332,87 @@ mod tests {
 
     fn db_scheme(source: &str, name: &str) -> String {
         let schemes = with_db(source).unwrap_or_else(|codes| panic!("{codes:?}"));
-        schemes.into_iter().find(|(other, _)| other == name).unwrap().1
+        schemes
+            .into_iter()
+            .find(|(other, _)| other == name)
+            .unwrap()
+            .1
     }
 
     #[test]
     fn database_operations() {
         assert_eq!(
-            db_scheme("server fun buscar(id: ClienteId): Cliente {\n    return db.clientes.require(id)\n}", "buscar"),
+            db_scheme(
+                "server fun buscar(id: ClienteId): Cliente {\n    return db.clientes.require(id)\n}",
+                "buscar"
+            ),
             "(ClienteId) -> Cliente"
         );
-        assert_eq!(db_scheme("server fun talvez(id: ClienteId): Cliente? = db.clientes.find(id)", "talvez"), "(ClienteId) -> Cliente?");
         assert_eq!(
-            db_scheme("server fun criar(nome: String): Cliente {\n    return db.clientes.insert {\n        nome = nome\n        apelido = null\n    }\n}", "criar"),
+            db_scheme(
+                "server fun talvez(id: ClienteId): Cliente? = db.clientes.find(id)",
+                "talvez"
+            ),
+            "(ClienteId) -> Cliente?"
+        );
+        assert_eq!(
+            db_scheme(
+                "server fun criar(nome: String): Cliente {\n    return db.clientes.insert {\n        nome = nome\n        apelido = null\n    }\n}",
+                "criar"
+            ),
             "(String) -> Cliente"
         );
     }
 
     #[test]
     fn database_errors() {
-        assert_eq!(with_db("server fun f(id: ClienteId): Cliente = db.pedidos.require(id)"), Err(vec!["E7104".into()]));
-        assert_eq!(with_db("server fun f(id: String): Cliente = db.clientes.require(id)"), Err(vec!["E7101".into()]));
-        assert_eq!(with_db("server fun f(n: Int): Cliente = db.clientes.insert { nome = n }"), Err(vec!["E7101".into()]));
-        assert_eq!(with_db("server fun f(n: String): Cliente = db.clientes.insert { idade = n }"), Err(vec!["E7104".into()]));
-        assert_eq!(with_db("server fun f(id: ClienteId): Cliente = db.clientes.delete(id)"), Err(vec!["E7004".into()]));
-        assert_eq!(with_db("fun f(c: Cliente) = c.nome { x = 1 }"), Err(vec!["E7004".into()]));
+        assert_eq!(
+            with_db("server fun f(id: ClienteId): Cliente = db.pedidos.require(id)"),
+            Err(vec!["E7104".into()])
+        );
+        assert_eq!(
+            with_db("server fun f(id: String): Cliente = db.clientes.require(id)"),
+            Err(vec!["E7101".into()])
+        );
+        assert_eq!(
+            with_db("server fun f(n: Int): Cliente = db.clientes.insert { nome = n }"),
+            Err(vec!["E7101".into()])
+        );
+        assert_eq!(
+            with_db("server fun f(n: String): Cliente = db.clientes.insert { idade = n }"),
+            Err(vec!["E7104".into()])
+        );
+        assert_eq!(
+            with_db("server fun f(id: ClienteId): Cliente = db.clientes.delete(id)"),
+            Err(vec!["E7004".into()])
+        );
+        assert_eq!(
+            with_db("fun f(c: Cliente) = c.nome { x = 1 }"),
+            Err(vec!["E7004".into()])
+        );
     }
 
     #[test]
     fn missing_primary_key_column_is_reported() {
         let csv = "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Cliente,uid,id,ClienteId,false,true,true,postgresql\ncustomers,Cliente,uid,nome,String,false,true,false,postgresql\n";
-        let source = format!("{ENTIDADE}server fun f(id: ClienteId): Cliente = db.customers.require(id)");
-        assert_eq!(infer_with_schema(&source, &schema(csv)), Err(vec!["E7104".into()]));
+        let source =
+            format!("{ENTIDADE}server fun f(id: ClienteId): Cliente = db.customers.require(id)");
+        assert_eq!(
+            infer_with_schema(&source, &schema(csv)),
+            Err(vec!["E7104".into()])
+        );
         let (tokens, _) = crate::lexer::lex("t.bd", &source);
         let (program, _) = crate::parser::parse(tokens);
         let (_, diagnostics) = crate::types::check(&program, &schema(csv));
-        let messages: Vec<&str> = diagnostics.iter().map(|item| item.message.as_str()).collect();
+        let messages: Vec<&str> = diagnostics
+            .iter()
+            .map(|item| item.message.as_str())
+            .collect();
         assert_eq!(
             messages,
-            vec!["Primary-key column `uid` is missing from table `customers` in the database schema."]
+            vec![
+                "Primary-key column `uid` is missing from table `customers` in the database schema."
+            ]
         );
     }
 
@@ -1722,39 +2422,81 @@ mod tests {
         assert_eq!(scheme(source, "usa"), "() -> Int");
         assert_eq!(scheme(source, "segredo"), "() -> String");
         assert_eq!(scheme(source, "porta2"), "() -> Int");
-        assert_eq!(errors("client fun f(): Int = server.nada(1)"), vec!["E7103"]);
+        assert_eq!(
+            errors("client fun f(): Int = server.nada(1)"),
+            vec!["E7103"]
+        );
     }
 
     #[test]
     fn ui_trees() {
         let page = "data class Item(val nome: String, val preco: Money)\nclient component Pagina(item: Item) {\n    UI {\n        Section(\"hero\", \"top\") {\n            Heading(1, \"titulo\") { Text(item.nome) }\n            Text(item.preco)\n        }\n    }\n}\n";
         assert_eq!(scheme(page, "Pagina"), "(Item) -> Ui");
-        assert_eq!(errors("client component P(xs: List<String>) {\n    UI { Text(xs) }\n}"), vec!["E7105"]);
-        assert_eq!(errors("client component P() {\n    UI { Div(true) { Text(\"a\") } }\n}"), vec!["E7101"]);
+        assert_eq!(
+            errors("client component P(xs: List<String>) {\n    UI { Text(xs) }\n}"),
+            vec!["E7105"]
+        );
+        assert_eq!(
+            errors("client component P() {\n    UI { Div(true) { Text(\"a\") } }\n}"),
+            vec!["E7101"]
+        );
         assert_eq!(errors("client component P() {\n    1\n}"), vec!["E7101"]);
-        assert_eq!(errors("client component P() {\n    UI { 1 }\n}"), vec!["E7101"]);
-        assert_eq!(errors("fun f(x: Int) = f(x) { Text(\"a\") }"), vec!["E7004"]);
+        assert_eq!(
+            errors("client component P() {\n    UI { 1 }\n}"),
+            vec!["E7101"]
+        );
+        assert_eq!(
+            errors("fun f(x: Int) = f(x) { Text(\"a\") }"),
+            vec!["E7004"]
+        );
     }
 
     #[test]
     fn server_only_names_program_functions_and_names_do_not_collide() {
         assert_eq!(errors("fun f() = server.first"), vec!["E7103"]);
         let env = "environment development {\n    secret val token: String = env(\"T\", default = \"x\")\n}\n";
-        assert_eq!(errors(&format!("{env}fun f() = server.token")), vec!["E7103"]);
+        assert_eq!(
+            errors(&format!("{env}fun f() = server.token")),
+            vec!["E7103"]
+        );
         assert_eq!(errors(&format!("{env}fun token(): Int = 1")), vec!["E7110"]);
     }
 
     #[test]
     fn unannotated_ui_arguments_get_a_hint() {
-        assert_eq!(errors("client component P(x) {\n    UI { Text(x) }\n}"), vec!["E7003", "E7105"]);
+        assert_eq!(
+            errors("client component P(x) {\n    UI { Text(x) }\n}"),
+            vec!["E7003", "E7105"]
+        );
     }
 
     #[test]
     fn user_names_shadow_bind_forms() {
-        assert_eq!(scheme("fun Text(x: Int): Int = x\nfun f() = Text(1)", "f"), "() -> Int");
-        assert_eq!(scheme("data class D(val clientes: Int)\nfun f(db: D) = db.clientes", "f"), "(D) -> Int");
-        assert_eq!(scheme("data class Item(val n: Int)\nfun f() = Item(1)", "f"), "() -> Item");
-        assert_eq!(scheme("data class Link(val u: Url)\nfun f(u: Url) = Link(u)", "f"), "(Url) -> Link");
-        assert_eq!(scheme("data class S(val eco: Int)\nfun f(server: S) = server.eco", "f"), "(S) -> Int");
+        assert_eq!(
+            scheme("fun Text(x: Int): Int = x\nfun f() = Text(1)", "f"),
+            "() -> Int"
+        );
+        assert_eq!(
+            scheme(
+                "data class D(val clientes: Int)\nfun f(db: D) = db.clientes",
+                "f"
+            ),
+            "(D) -> Int"
+        );
+        assert_eq!(
+            scheme("data class Item(val n: Int)\nfun f() = Item(1)", "f"),
+            "() -> Item"
+        );
+        assert_eq!(
+            scheme("data class Link(val u: Url)\nfun f(u: Url) = Link(u)", "f"),
+            "(Url) -> Link"
+        );
+        assert_eq!(
+            scheme(
+                "data class S(val eco: Int)\nfun f(server: S) = server.eco",
+                "f"
+            ),
+            "(S) -> Int"
+        );
     }
 }

@@ -26,7 +26,12 @@ pub fn check(program: &Program, schema: &DatabaseSchema) -> (TypedProgram, Vec<D
     let (typed, mut inferred) = infer::check_program(program, &env, schema);
     diagnostics.append(&mut inferred);
     diagnostics.sort_by(|a, b| {
-        (&a.span.file, a.span.line, a.span.column, a.code).cmp(&(&b.span.file, b.span.line, b.span.column, b.code))
+        (&a.span.file, a.span.line, a.span.column, a.code).cmp(&(
+            &b.span.file,
+            b.span.line,
+            b.span.column,
+            b.code,
+        ))
     });
     (typed, diagnostics)
 }
@@ -43,11 +48,18 @@ fn check_boundaries(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
         } else {
             continue;
         };
-        for parameter in function.parameters.iter().filter(|parameter| parameter.type_ref.is_none()) {
+        for parameter in function
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.type_ref.is_none())
+        {
             diagnostics.push(
                 Diagnostic::error(
                     "E7003",
-                    format!("{what} `{}` must declare the type of parameter `{}`.", function.name, parameter.name),
+                    format!(
+                        "{what} `{}` must declare the type of parameter `{}`.",
+                        function.name, parameter.name
+                    ),
                     function.span.clone(),
                 )
                 .with_hint("Boundary signatures are contracts; write `name: Type`."),
@@ -79,7 +91,10 @@ pub(crate) mod testing {
         infer_with_schema(source, &DatabaseSchema::default())
     }
 
-    pub fn infer_with_schema(source: &str, schema: &DatabaseSchema) -> Result<Vec<(String, String)>, Vec<String>> {
+    pub fn infer_with_schema(
+        source: &str,
+        schema: &DatabaseSchema,
+    ) -> Result<Vec<(String, String)>, Vec<String>> {
         let (tokens, mut diagnostics) = lex("test.bd", source);
         let (program, mut parse_diagnostics) = parse(tokens);
         diagnostics.append(&mut parse_diagnostics);
@@ -105,8 +120,13 @@ pub(crate) mod testing {
     }
 
     pub fn scheme(source: &str, name: &str) -> String {
-        let schemes = infer(source).unwrap_or_else(|codes| panic!("expected `{name}` to type-check, got {codes:?}"));
-        schemes.into_iter().find(|(other, _)| other == name).map(|(_, scheme)| scheme).unwrap()
+        let schemes = infer(source)
+            .unwrap_or_else(|codes| panic!("expected `{name}` to type-check, got {codes:?}"));
+        schemes
+            .into_iter()
+            .find(|(other, _)| other == name)
+            .map(|(_, scheme)| scheme)
+            .unwrap()
     }
 
     pub fn errors(source: &str) -> Vec<String> {

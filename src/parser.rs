@@ -663,7 +663,8 @@ impl Parser {
     fn skip_default_value(&mut self) -> bool {
         let mut depth = 0usize;
         while !self.at_eof() {
-            let starts_line = self.index > 0 && self.peek().span.line != self.tokens[self.index - 1].span.line;
+            let starts_line =
+                self.index > 0 && self.peek().span.line != self.tokens[self.index - 1].span.line;
             if starts_line && is_top_level_start(self.peek_text()) {
                 return false;
             }
@@ -820,11 +821,20 @@ mod tests {
         let rendered: Vec<Option<String>> = program
             .functions
             .iter()
-            .map(|function| function.expr.as_ref().map(crate::syntax::expr::render_block))
+            .map(|function| {
+                function
+                    .expr
+                    .as_ref()
+                    .map(crate::syntax::expr::render_block)
+            })
             .collect();
         assert_eq!(
             rendered,
-            vec![Some("{ 1 }".into()), Some("{ val x = 1; (x + 1) }".into()), None]
+            vec![
+                Some("{ 1 }".into()),
+                Some("{ val x = 1; (x + 1) }".into()),
+                None
+            ]
         );
     }
 
@@ -844,15 +854,30 @@ mod tests {
         assert_eq!(program.functions[0].parameters.len(), 2);
         let (program, codes) = parse_with_codes("fun f(x: Int = 1\nfun g(): Int = 2\n");
         assert_eq!(codes, vec!["E7004"]);
-        let names: Vec<&str> = program.functions.iter().map(|function| function.name.as_str()).collect();
+        let names: Vec<&str> = program
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
         assert!(names.contains(&"g"), "{names:?}");
-        assert_eq!(program.functions.iter().find(|function| function.name == "g").unwrap().body_kind, BodyKind::Expression);
+        assert_eq!(
+            program
+                .functions
+                .iter()
+                .find(|function| function.name == "g")
+                .unwrap()
+                .body_kind,
+            BodyKind::Expression
+        );
     }
 
     #[test]
     fn reports_body_syntax_errors() {
         let (tokens, _) = lex("test.bd", "fun f(): Int {\n    var x = 1\n    x\n}\n");
         let (_, diagnostics) = parse(tokens);
-        assert_eq!(diagnostics.iter().map(|item| item.code).collect::<Vec<_>>(), vec!["E7001"]);
+        assert_eq!(
+            diagnostics.iter().map(|item| item.code).collect::<Vec<_>>(),
+            vec!["E7001"]
+        );
     }
 }
