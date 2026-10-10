@@ -1,0 +1,6 @@
+ler : (ClienteId) -> Cliente ! {db.read}
+aplica : (('a) -> 'b ! 'e, 'a) -> 'b ! 'e
+mapear : (List<'a>, ('a) -> 'b ! 'e) -> List<'b> ! 'e
+nomes : (List<ClienteId>) -> List<String> ! {db.read}
+buscar : (ClienteId) -> Cliente ! {db.read}
+tela : (ClienteId) -> String ! {server.call}

@@ -1,0 +1,2 @@
+// expect: E7405
+server fun f(x: Int): Int effects [db.delete] = x

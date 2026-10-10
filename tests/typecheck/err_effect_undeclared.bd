@@ -1,0 +1,2 @@
+// expect: E7402
+fun <A> chama(f: () -> A ! [e]): A effects [] = f()

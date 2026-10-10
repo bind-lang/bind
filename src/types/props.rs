@@ -1,13 +1,13 @@
 //! Property tests for the type system. Each property runs at least 1,000 cases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use proptest::prelude::*;
 
-use super::effects::{Row, RowVarId};
+use super::effects::{Label, Row, RowVarId};
 use super::exhaustive::{CtorSig, Pat, Signatures, check_match};
 use super::ty::*;
-use super::unify::unify;
+use super::unify::{unify, unify_rows};
 use crate::diagnostic::{Span, has_errors};
 use crate::lexer::{Token, TokenKind, lex};
 use crate::parser::expr::parse_expression_tokens;
@@ -694,5 +694,163 @@ proptest! {
         let rendered = render_expr(&expr);
         let expected = format!("{{ {rendered} }}");
         prop_assert_eq!(reparse(&rendered), Ok(expected), "source: {}", rendered);
+    }
+}
+
+// ---- 6. effect rows -------------------------------------------------------------------
+
+fn arb_row(vars: usize) -> impl Strategy<Value = Row> {
+    let labels = proptest::collection::btree_set(
+        prop::sample::select(vec![("db", "read"), ("db", "write"), ("server", "call")])
+            .prop_map(Label::of),
+        0..3,
+    );
+    (labels, proptest::option::of(0..vars)).prop_map(|(labels, tail)| Row { labels, tail })
+}
+
+proptest! {
+    #![proptest_config(config())]
+    #[test]
+    fn row_unification_produces_a_unifier(a in arb_row(3), b in arb_row(3)) {
+        let mut table = TypeTable::default();
+        for _ in 0..3 {
+            table.fresh_row_var(1, None);
+        }
+        if unify_rows(&mut table, &a, &b).is_ok() {
+            prop_assert_eq!(table.resolve_row(&a), table.resolve_row(&b));
+        }
+    }
+}
+
+// ---- 7. inferred effects equal call-graph reachability --------------------------------
+
+#[derive(Clone, Debug)]
+enum Action {
+    Read,
+    Write,
+    Call(usize),
+    CallViaLambda(usize),
+}
+
+fn arb_effect_program() -> impl Strategy<Value = Vec<Vec<Action>>> {
+    (1usize..5).prop_flat_map(|count| {
+        let action = prop_oneof![
+            Just(Action::Read),
+            Just(Action::Write),
+            (0..count).prop_map(Action::Call),
+            (0..count).prop_map(Action::CallViaLambda),
+        ];
+        proptest::collection::vec(proptest::collection::vec(action, 0..4), count)
+    })
+}
+
+const EFFECT_PRELUDE: &str = "distinct type ClienteId = UUID\nentity Cliente(val id: ClienteId, val nome: String)\nfun aplica(f, x) = f(x)\n";
+const EFFECT_SCHEMA: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\nclientes,Cliente,id,id,ClienteId,false,true,true,postgresql\nclientes,Cliente,id,nome,String,false,true,false,postgresql\n";
+
+fn effect_schema() -> &'static DatabaseSchema {
+    static SCHEMA: std::sync::OnceLock<DatabaseSchema> = std::sync::OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        let path =
+            std::env::temp_dir().join(format!("bind-effect-props-{}.csv", std::process::id()));
+        std::fs::write(&path, EFFECT_SCHEMA).unwrap();
+        let schema = DatabaseSchema::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        schema
+    })
+}
+
+fn render_effect_program(program: &[Vec<Action>], clauses: Option<&[BTreeSet<String>]>) -> String {
+    let mut source = EFFECT_PRELUDE.to_string();
+    for (index, actions) in program.iter().enumerate() {
+        let clause = clauses
+            .map(|all| {
+                format!(
+                    " effects [{}]",
+                    all[index].iter().cloned().collect::<Vec<_>>().join(", ")
+                )
+            })
+            .unwrap_or_default();
+        source.push_str(&format!(
+            "fun f{index}(id: ClienteId): ClienteId{clause} {{\n"
+        ));
+        for action in actions {
+            let expr = match action {
+                Action::Read => "db.clientes.require(id)".to_string(),
+                Action::Write => "db.clientes.insert { nome = \"x\" }".to_string(),
+                Action::Call(other) => format!("f{other}(id)"),
+                Action::CallViaLambda(other) => format!("aplica({{ x -> f{other}(x) }}, id)"),
+            };
+            source.push_str(&format!("    val _ = {expr}\n"));
+        }
+        source.push_str("    id\n}\n");
+    }
+    source
+}
+
+/// The expected effects: each function's own operations plus those of every function it can
+/// reach through calls (directly or through a lambda).
+fn reachable_effects(program: &[Vec<Action>]) -> Vec<BTreeSet<String>> {
+    (0..program.len())
+        .map(|start| {
+            let mut effects = BTreeSet::new();
+            let mut stack = vec![start];
+            let mut seen = BTreeSet::new();
+            while let Some(current) = stack.pop() {
+                if !seen.insert(current) {
+                    continue;
+                }
+                for action in &program[current] {
+                    match action {
+                        Action::Read => {
+                            effects.insert("db.read".to_string());
+                        }
+                        Action::Write => {
+                            effects.insert("db.write".to_string());
+                        }
+                        Action::Call(other) | Action::CallViaLambda(other) => stack.push(*other),
+                    }
+                }
+            }
+            effects
+        })
+        .collect()
+}
+
+fn inferred_effects(source: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+    let (tokens, mut diagnostics) = lex("effects.bd", source);
+    let (program, mut parse_diagnostics) = parse(tokens);
+    diagnostics.append(&mut parse_diagnostics);
+    if has_errors(&diagnostics) {
+        return Err(format!("{diagnostics:?}"));
+    }
+    let (typed, type_diagnostics) = super::check(&program, effect_schema());
+    if has_errors(&type_diagnostics) {
+        return Err(format!("{type_diagnostics:?}"));
+    }
+    Ok(typed.effects)
+}
+
+proptest! {
+    #![proptest_config(config())]
+
+    #[test]
+    fn inferred_effects_equal_call_graph_reachability(program in arb_effect_program()) {
+        let source = render_effect_program(&program, None);
+        let effects = inferred_effects(&source).map_err(|error| TestCaseError::fail(format!("{error}\n{source}")))?;
+        for (index, expected) in reachable_effects(&program).into_iter().enumerate() {
+            let found: BTreeSet<String> = effects[&format!("f{index}")].iter().cloned().collect();
+            prop_assert_eq!(&found, &expected, "f{} in\n{}", index, source);
+        }
+    }
+
+    #[test]
+    fn declaring_the_inferred_effects_is_stable(program in arb_effect_program()) {
+        let expected = reachable_effects(&program);
+        let source = render_effect_program(&program, Some(&expected));
+        let effects = inferred_effects(&source).map_err(|error| TestCaseError::fail(format!("{error}\n{source}")))?;
+        for (index, expected) in expected.iter().enumerate() {
+            let found: BTreeSet<String> = effects[&format!("f{index}")].iter().cloned().collect();
+            prop_assert_eq!(&found, expected, "f{} in\n{}", index, source);
+        }
     }
 }

@@ -1,0 +1,3 @@
+// expect: E7404
+server fun eco(x: Int): Int = x
+client fun usa(): Int = eco(1)

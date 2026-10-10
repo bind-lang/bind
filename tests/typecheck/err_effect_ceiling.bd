@@ -1,0 +1,3 @@
+// expect: E7401
+server fun a(x: Int): Int = x
+server fun b(x: Int): Int = server.a(x)

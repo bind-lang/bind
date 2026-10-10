@@ -1,0 +1,9 @@
+// expect: ok
+distinct type ClienteId = UUID
+entity Cliente(val id: ClienteId, val nome: String, val email: Email)
+fun ler(id: ClienteId) = db.clientes.require(id)
+fun aplica(f, x) = f(x)
+fun <A, B> mapear(xs: List<A>, f: (A) -> B ! [e]): List<B> effects [e] = map(xs, f)
+fun nomes(ids: List<ClienteId>) = mapear(ids, { id -> ler(id).nome })
+server fun buscar(id: ClienteId): Cliente effects [db.read] = ler(id)
+client fun tela(id: ClienteId) = server.buscar(id).nome

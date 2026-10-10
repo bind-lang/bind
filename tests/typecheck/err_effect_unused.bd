@@ -1,0 +1,2 @@
+// expect: E7403
+server fun f(x: Int): Int effects [db.read] = x

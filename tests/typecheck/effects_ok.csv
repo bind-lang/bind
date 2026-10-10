@@ -1,0 +1,4 @@
+table,model,primary_key,column,type,nullable,required,has_default,engine
+clientes,Cliente,id,id,ClienteId,false,true,true,postgresql
+clientes,Cliente,id,nome,String,false,true,false,postgresql
+clientes,Cliente,id,email,Email,false,true,false,postgresql
