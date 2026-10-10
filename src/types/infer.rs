@@ -4125,4 +4125,21 @@ mod tests {
             vec!["E7101"]
         );
     }
+
+    #[test]
+    fn effect_variables_must_be_lowercase() {
+        for source in [
+            "fun f(g: () -> Int ! [E]): Int effects [E] = g()\n",
+            "fun f(g: () -> Int ! [E]) = g()\n",
+            "server fun f(): Int effects [E] = 1\n",
+            "fun f(x: Int) effects [Ef] = x\n",
+        ] {
+            assert_eq!(errors(source), vec!["E7405"], "{source}");
+        }
+        let diagnostics = db_diagnostics("server fun f(): Int effects [E] = 1\n");
+        assert_eq!(
+            diagnostics[0].message,
+            "Effect variable `E` must be a lowercase identifier."
+        );
+    }
 }

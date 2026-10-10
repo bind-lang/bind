@@ -395,6 +395,14 @@ impl Env {
                 ));
                 continue;
             }
+            if !name.contains('.') && !name.chars().next().is_some_and(char::is_lowercase) {
+                diagnostics.push(Diagnostic::error(
+                    "E7405",
+                    format!("Effect variable `{name}` must be a lowercase identifier."),
+                    span.clone(),
+                ));
+                continue;
+            }
             if let Some(label) = Label::parse(name) {
                 if label.is_known() {
                     row.labels.insert(label);
