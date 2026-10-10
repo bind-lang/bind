@@ -1175,17 +1175,17 @@ fn list_element(ty: &Type) -> Type {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::diagnostic::has_errors;
     use crate::types::exhaustive::Pat;
     use crate::types::ty::{Type, display};
 
-    const CLIENTES: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\nclientes,Cliente,id,id,ClienteId,false,true,true,postgresql\nclientes,Cliente,id,nome,String,false,true,false,postgresql\nclientes,Cliente,id,apelido,String,true,false,false,postgresql\n";
+    pub(crate) const CLIENTES: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\nclientes,Cliente,id,id,ClienteId,false,true,true,postgresql\nclientes,Cliente,id,nome,String,false,true,false,postgresql\nclientes,Cliente,id,apelido,String,true,false,false,postgresql\n";
 
-    const ENTIDADE: &str = "distinct type ClienteId = UUID\nentity Cliente(val id: ClienteId, val nome: String, val apelido: String?)\n";
+    pub(crate) const ENTIDADE: &str = "distinct type ClienteId = UUID\nentity Cliente(val id: ClienteId, val nome: String, val apelido: String?)\n";
 
-    fn schema(csv: &str) -> DatabaseSchema {
+    pub(crate) fn schema(csv: &str) -> DatabaseSchema {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!("bind-core-{}-{id}.csv", std::process::id()));
@@ -1195,7 +1195,7 @@ mod tests {
         schema
     }
 
-    fn compile_with(source: &str, schema: &DatabaseSchema) -> CoreProgram {
+    pub(crate) fn compile_with(source: &str, schema: &DatabaseSchema) -> CoreProgram {
         let (tokens, mut diagnostics) = crate::lexer::lex("test.bd", source);
         let (program, mut parse_diagnostics) = crate::parser::parse(tokens);
         diagnostics.append(&mut parse_diagnostics);
@@ -1205,7 +1205,7 @@ mod tests {
         lower(&program, &typed, schema)
     }
 
-    fn compile(source: &str) -> CoreProgram {
+    pub(crate) fn compile(source: &str) -> CoreProgram {
         compile_with(source, &DatabaseSchema::default())
     }
 
