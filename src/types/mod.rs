@@ -1,5 +1,6 @@
 //! Static type system: Hindley-Milner inference, algebraic data types and exhaustive matching.
 
+pub mod effects;
 pub mod env;
 pub mod exhaustive;
 pub mod infer;

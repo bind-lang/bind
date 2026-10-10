@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use proptest::prelude::*;
 
+use super::effects::{Row, RowVarId};
 use super::exhaustive::{CtorSig, Pat, Signatures, check_match};
 use super::ty::*;
 use super::unify::unify;
@@ -31,7 +32,7 @@ fn arb_type(vars: usize) -> impl Strategy<Value = Type> {
             inner.clone().prop_map(Type::list),
             inner.clone().prop_map(Type::option),
             (proptest::collection::vec(inner.clone(), 0..3), inner)
-                .prop_map(|(params, result)| Type::Fun(params, Box::new(result))),
+                .prop_map(|(params, result)| Type::Fun(params, Box::new(result), Row::empty())),
         ]
     })
 }
@@ -135,12 +136,20 @@ fn signature_of(source: &str, name: &str) -> Option<Type> {
     typed.signatures.get(name).cloned()
 }
 
-/// Bind source for a type, naming variables `T0`, `T1`...
-fn to_source(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
+/// Names of type variables (`T0`, `T1`...) and row variables (`e0`, `e1`...) in source.
+#[derive(Default)]
+struct SourceNames {
+    types: BTreeMap<TypeVarId, String>,
+    rows: BTreeMap<RowVarId, String>,
+}
+
+/// Bind source for a type, naming variables `T0`, `T1`... and effect variables `e0`, `e1`...
+fn to_source(ty: &Type, names: &mut SourceNames) -> String {
     match ty {
         Type::Var(id) => {
-            let next = names.len();
+            let next = names.types.len();
             names
+                .types
                 .entry(*id)
                 .or_insert_with(|| format!("T{next}"))
                 .clone()
@@ -158,21 +167,51 @@ fn to_source(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
             let rendered: Vec<String> = args.iter().map(|arg| to_source(arg, names)).collect();
             format!("{name}<{}>", rendered.join(", "))
         }
-        Type::Fun(params, result) => {
+        Type::Fun(params, result, row) => {
             let rendered: Vec<String> =
                 params.iter().map(|param| to_source(param, names)).collect();
-            format!("({}) -> {}", rendered.join(", "), to_source(result, names))
+            let inner = to_source(result, names);
+            let result = match result.as_ref() {
+                Type::Fun(_, _, inner_row) if !row.is_pure() || !inner_row.is_pure() => {
+                    format!("({inner})")
+                }
+                _ => inner,
+            };
+            format!(
+                "({}) -> {result}{}",
+                rendered.join(", "),
+                row_source(row, names)
+            )
         }
         Type::Error => "Unit".into(),
     }
 }
 
+/// ` ! [db.read, e0]` with the annotation syntax; nothing for a pure row.
+fn row_source(row: &Row, names: &mut SourceNames) -> String {
+    if row.is_pure() {
+        return String::new();
+    }
+    let mut items: Vec<String> = row.labels.iter().map(ToString::to_string).collect();
+    if let Some(tail) = row.tail {
+        let next = names.rows.len();
+        items.push(
+            names
+                .rows
+                .entry(tail)
+                .or_insert_with(|| format!("e{next}"))
+                .clone(),
+        );
+    }
+    format!(" ! [{}]", items.join(", "))
+}
+
 /// The corpus entry annotated with the given function type.
 fn annotate(entry: &Entry, ty: &Type) -> String {
-    let Type::Fun(params, result) = ty else {
+    let Type::Fun(params, result, _) = ty else {
         unreachable!("corpus entries are functions")
     };
-    let mut names = BTreeMap::new();
+    let mut names = SourceNames::default();
     let params: Vec<String> = entry
         .params
         .iter()
@@ -180,10 +219,10 @@ fn annotate(entry: &Entry, ty: &Type) -> String {
         .map(|(name, param)| format!("{name}: {}", to_source(param, &mut names)))
         .collect();
     let result = to_source(result, &mut names);
-    let generics = if names.is_empty() {
+    let generics = if names.types.is_empty() {
         String::new()
     } else {
-        let mut ordered: Vec<&String> = names.values().collect();
+        let mut ordered: Vec<&String> = names.types.values().collect();
         ordered.sort_by_key(|name| name[1..].parse::<usize>().unwrap_or(0));
         format!(
             "<{}> ",
@@ -203,12 +242,18 @@ fn annotate(entry: &Entry, ty: &Type) -> String {
 }
 
 fn is_instance(general: &Type, specific: &Type) -> bool {
-    fn matches(general: &Type, specific: &Type, bound: &mut BTreeMap<TypeVarId, Type>) -> bool {
+    #[derive(Default)]
+    struct Bound {
+        types: BTreeMap<TypeVarId, Type>,
+        rows: BTreeMap<RowVarId, Row>,
+    }
+
+    fn matches(general: &Type, specific: &Type, bound: &mut Bound) -> bool {
         match (general, specific) {
-            (Type::Var(id), _) => match bound.get(id) {
+            (Type::Var(id), _) => match bound.types.get(id) {
                 Some(existing) => existing == specific,
                 None => {
-                    bound.insert(*id, specific.clone());
+                    bound.types.insert(*id, specific.clone());
                     true
                 }
             },
@@ -217,15 +262,43 @@ fn is_instance(general: &Type, specific: &Type) -> bool {
                     && xs.len() == ys.len()
                     && xs.iter().zip(ys).all(|(x, y)| matches(x, y, bound))
             }
-            (Type::Fun(p, r), Type::Fun(q, s)) => {
+            (Type::Fun(p, r, e), Type::Fun(q, s, f)) => {
                 p.len() == q.len()
                     && p.iter().zip(q).all(|(x, y)| matches(x, y, bound))
                     && matches(r, s, bound)
+                    && rows_match(e, f, bound)
             }
             _ => false,
         }
     }
-    matches(general, specific, &mut BTreeMap::new())
+
+    /// A general row with a tail matches any row containing its labels, binding the tail to
+    /// the remaining labels consistently; a closed row only matches the same row.
+    fn rows_match(general: &Row, specific: &Row, bound: &mut Bound) -> bool {
+        let Some(tail) = general.tail else {
+            return general == specific;
+        };
+        if !general.labels.is_subset(&specific.labels) {
+            return false;
+        }
+        let rest = Row {
+            labels: specific
+                .labels
+                .difference(&general.labels)
+                .cloned()
+                .collect(),
+            tail: specific.tail,
+        };
+        match bound.rows.get(&tail) {
+            Some(existing) => *existing == rest,
+            None => {
+                bound.rows.insert(tail, rest);
+                true
+            }
+        }
+    }
+
+    matches(general, specific, &mut Bound::default())
 }
 
 fn type_vars(ty: &Type, output: &mut Vec<TypeVarId>) {
@@ -236,7 +309,7 @@ fn type_vars(ty: &Type, output: &mut Vec<TypeVarId>) {
             }
         }
         Type::Con(_, args) => args.iter().for_each(|arg| type_vars(arg, output)),
-        Type::Fun(params, result) => {
+        Type::Fun(params, result, _) => {
             params.iter().for_each(|param| type_vars(param, output));
             type_vars(result, output);
         }
@@ -253,7 +326,8 @@ fn arb_ground() -> impl Strategy<Value = Type> {
         Just(Type::option(Type::con("Int"))),
         Just(Type::Fun(
             vec![Type::con("Int")],
-            Box::new(Type::con("Int"))
+            Box::new(Type::con("Int")),
+            Row::empty()
         )),
     ]
 }
@@ -281,7 +355,7 @@ proptest! {
         let entry = &CORPUS[index];
         let inferred = signature_of(&source(entry), entry.name).unwrap();
         let arity = entry.params.len();
-        let annotation = Type::Fun(picks[..arity].to_vec(), Box::new(picks[arity].clone()));
+        let annotation = Type::Fun(picks[..arity].to_vec(), Box::new(picks[arity].clone()), Row::empty());
         if let Some(accepted) = signature_of(&annotate(entry, &annotation), entry.name) {
             prop_assert!(is_instance(&inferred, &accepted), "{} accepted `{}`, not an instance of `{}`", entry.name, display(&accepted), display(&inferred));
         }
@@ -297,7 +371,7 @@ proptest! {
         let mut vars = Vec::new();
         type_vars(&inferred, &mut vars);
         let mapping: BTreeMap<TypeVarId, Type> = vars.into_iter().zip(picks).collect();
-        let instance = substitute(&inferred, &mapping);
+        let instance = substitute(&inferred, &mapping, &BTreeMap::new());
         let annotated = annotate(entry, &instance);
         prop_assert!(signature_of(&annotated, entry.name).is_some(), "rejected instance:\n{}", annotated);
     }

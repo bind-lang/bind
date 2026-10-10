@@ -7,6 +7,7 @@ use crate::diagnostic::{Diagnostic, Span};
 use crate::parser::expr::parse_type_text;
 use crate::syntax::expr::TypeExpr;
 
+use super::effects::Row;
 use super::exhaustive::{CtorSig, Signatures};
 use super::ty::{Type, TypeTable};
 
@@ -311,7 +312,11 @@ impl Env {
                     .iter()
                     .map(|param| self.lower(param, vars, diagnostics))
                     .collect();
-                Type::Fun(params, Box::new(self.lower(result, vars, diagnostics)))
+                Type::Fun(
+                    params,
+                    Box::new(self.lower(result, vars, diagnostics)),
+                    Row::empty(),
+                )
             }
             TypeExpr::Named { name, args, span } => {
                 if name == ERROR_TYPE {

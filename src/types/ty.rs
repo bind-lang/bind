@@ -2,13 +2,15 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::effects::{Label, Row, RowState, RowVarId};
+
 pub type TypeVarId = usize;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Type {
     Var(TypeVarId),
     Con(String, Vec<Type>),
-    Fun(Vec<Type>, Box<Type>),
+    Fun(Vec<Type>, Box<Type>, Row),
     /// Produced after a reported error; unifies with everything to avoid cascades.
     Error,
 }
@@ -31,7 +33,7 @@ impl Type {
             Type::Error => true,
             Type::Var(_) => false,
             Type::Con(_, args) => args.iter().any(Type::contains_error),
-            Type::Fun(params, result) => {
+            Type::Fun(params, result, _) => {
                 params.iter().any(Type::contains_error) || result.contains_error()
             }
         }
@@ -99,6 +101,7 @@ pub enum VarState {
 #[derive(Clone, Debug, Default)]
 pub struct TypeTable {
     vars: Vec<VarState>,
+    rows: Vec<RowState>,
     /// Type constructors that never support equality: `Ui` and user types whose fields
     /// contain a function or another such type (see `Env::build`).
     non_equatable: BTreeSet<String>,
@@ -119,6 +122,39 @@ impl TypeTable {
             constraint: None,
         });
         Type::Var(self.vars.len() - 1)
+    }
+
+    pub fn fresh_row_var(&mut self, level: u32, ceiling: Option<BTreeSet<Label>>) -> RowVarId {
+        self.rows.push(RowState::Unbound { level, ceiling });
+        self.rows.len() - 1
+    }
+
+    /// An open row with no labels yet (consumed by effect inference, which builds on this).
+    #[allow(dead_code)]
+    pub fn fresh_row(&mut self, level: u32) -> Row {
+        let var = self.fresh_row_var(level, None);
+        Row::with_tail([], var)
+    }
+
+    pub fn row_state(&self, id: RowVarId) -> &RowState {
+        &self.rows[id]
+    }
+
+    pub fn set_row(&mut self, id: RowVarId, state: RowState) {
+        self.rows[id] = state;
+    }
+
+    /// Follows the tail links, collecting labels; the result's tail is unbound or absent.
+    pub fn resolve_row(&self, row: &Row) -> Row {
+        let mut labels = row.labels.clone();
+        let mut tail = row.tail;
+        while let Some(id) = tail
+            && let RowState::Link(next) = &self.rows[id]
+        {
+            labels.extend(next.labels.iter().cloned());
+            tail = next.tail;
+        }
+        Row { labels, tail }
     }
 
     pub fn state(&self, id: TypeVarId) -> &VarState {
@@ -146,9 +182,10 @@ impl TypeTable {
             Type::Con(name, args) => {
                 Type::Con(name, args.iter().map(|arg| self.resolve(arg)).collect())
             }
-            Type::Fun(params, result) => Type::Fun(
+            Type::Fun(params, result, row) => Type::Fun(
                 params.iter().map(|param| self.resolve(param)).collect(),
                 Box::new(self.resolve(&result)),
+                self.resolve_row(&row),
             ),
             other => other,
         }
@@ -158,6 +195,7 @@ impl TypeTable {
 #[derive(Clone, Debug)]
 pub struct Scheme {
     pub vars: Vec<TypeVarId>,
+    pub row_vars: Vec<RowVarId>,
     pub ty: Type,
 }
 
@@ -165,6 +203,7 @@ impl Scheme {
     pub fn mono(ty: Type) -> Scheme {
         Scheme {
             vars: Vec::new(),
+            row_vars: Vec::new(),
             ty,
         }
     }
@@ -185,11 +224,36 @@ fn collect_vars(ty: &Type, output: &mut Vec<TypeVarId>) {
             }
         }
         Type::Con(_, args) => args.iter().for_each(|arg| collect_vars(arg, output)),
-        Type::Fun(params, result) => {
+        Type::Fun(params, result, _) => {
             params.iter().for_each(|param| collect_vars(param, output));
             collect_vars(result, output);
         }
         Type::Error => {}
+    }
+}
+
+/// Unbound row variables of `ty`, in order of first appearance.
+pub fn free_row_vars(table: &TypeTable, ty: &Type) -> Vec<RowVarId> {
+    let mut output = Vec::new();
+    collect_row_vars(&table.resolve(ty), &mut output);
+    output
+}
+
+fn collect_row_vars(ty: &Type, output: &mut Vec<RowVarId>) {
+    match ty {
+        Type::Con(_, args) => args.iter().for_each(|arg| collect_row_vars(arg, output)),
+        Type::Fun(params, result, row) => {
+            params
+                .iter()
+                .for_each(|param| collect_row_vars(param, output));
+            collect_row_vars(result, output);
+            if let Some(tail) = row.tail
+                && !output.contains(&tail)
+            {
+                output.push(tail);
+            }
+        }
+        Type::Var(_) | Type::Error => {}
     }
 }
 
@@ -216,34 +280,65 @@ pub fn generalize(
             }
         }
     }
-    (Scheme { vars, ty: resolved }, ambiguous)
+    let row_vars = free_row_vars(table, &resolved)
+        .into_iter()
+        .filter(|id| matches!(table.row_state(*id), RowState::Unbound { level: var_level, .. } if *var_level > level))
+        .collect();
+    (
+        Scheme {
+            vars,
+            row_vars,
+            ty: resolved,
+        },
+        ambiguous,
+    )
 }
 
 pub fn instantiate(table: &mut TypeTable, scheme: &Scheme, level: u32) -> Type {
-    if scheme.vars.is_empty() {
+    if scheme.vars.is_empty() && scheme.row_vars.is_empty() {
         return scheme.ty.clone();
     }
-    let mapping: BTreeMap<TypeVarId, Type> = scheme
+    let types: BTreeMap<TypeVarId, Type> = scheme
         .vars
         .iter()
         .map(|id| (*id, table.fresh(level)))
         .collect();
-    substitute(&scheme.ty, &mapping)
+    let mut rows = BTreeMap::new();
+    for id in &scheme.row_vars {
+        let ceiling = match table.row_state(*id) {
+            RowState::Unbound { ceiling, .. } => ceiling.clone(),
+            RowState::Link(_) => None,
+        };
+        rows.insert(*id, table.fresh_row_var(level, ceiling));
+    }
+    substitute(&scheme.ty, &types, &rows)
 }
 
-pub fn substitute(ty: &Type, mapping: &BTreeMap<TypeVarId, Type>) -> Type {
+pub fn substitute(
+    ty: &Type,
+    types: &BTreeMap<TypeVarId, Type>,
+    rows: &BTreeMap<RowVarId, RowVarId>,
+) -> Type {
     match ty {
-        Type::Var(id) => mapping.get(id).cloned().unwrap_or(Type::Var(*id)),
+        Type::Var(id) => types.get(id).cloned().unwrap_or(Type::Var(*id)),
         Type::Con(name, args) => Type::Con(
             name.clone(),
-            args.iter().map(|arg| substitute(arg, mapping)).collect(),
+            args.iter()
+                .map(|arg| substitute(arg, types, rows))
+                .collect(),
         ),
-        Type::Fun(params, result) => Type::Fun(
+        Type::Fun(params, result, row) => Type::Fun(
             params
                 .iter()
-                .map(|param| substitute(param, mapping))
+                .map(|param| substitute(param, types, rows))
                 .collect(),
-            Box::new(substitute(result, mapping)),
+            Box::new(substitute(result, types, rows)),
+            Row {
+                labels: row.labels.clone(),
+                tail: row
+                    .tail
+                    .map(|tail| rows.get(&tail).copied().unwrap_or(tail)),
+            },
         ),
         Type::Error => Type::Error,
     }
@@ -256,15 +351,25 @@ pub fn display(ty: &Type) -> String {
 
 /// Renders several types with shared variable names (for "expected X, found Y").
 pub fn display_all(types: &[&Type]) -> Vec<String> {
-    let mut names = BTreeMap::new();
+    let mut names = Names::default();
     types.iter().map(|ty| render(ty, &mut names)).collect()
 }
 
-fn render(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
+#[derive(Default)]
+struct Names {
+    types: BTreeMap<TypeVarId, String>,
+    rows: BTreeMap<RowVarId, String>,
+}
+
+fn render(ty: &Type, names: &mut Names) -> String {
     match ty {
         Type::Var(id) => {
-            let next = names.len();
-            names.entry(*id).or_insert_with(|| var_name(next)).clone()
+            let next = names.types.len();
+            names
+                .types
+                .entry(*id)
+                .or_insert_with(|| type_var_name(next))
+                .clone()
         }
         Type::Con(name, args) if name == "Option" && args.len() == 1 => {
             let inner = render(&args[0], names);
@@ -279,20 +384,64 @@ fn render(ty: &Type, names: &mut BTreeMap<TypeVarId, String>) -> String {
             let rendered: Vec<String> = args.iter().map(|arg| render(arg, names)).collect();
             format!("{name}<{}>", rendered.join(", "))
         }
-        Type::Fun(params, result) => {
+        Type::Fun(params, result, row) => {
             let rendered: Vec<String> = params.iter().map(|param| render(param, names)).collect();
-            let result = render(result, names);
-            format!("({}) -> {result}", rendered.join(", "))
+            let inner = render(result, names);
+            // A function result is parenthesized when either arrow shows a row, so `!` always
+            // belongs to the arrow it is written next to.
+            let result = match result.as_ref() {
+                Type::Fun(_, _, inner_row) if !row.is_pure() || !inner_row.is_pure() => {
+                    format!("({inner})")
+                }
+                _ => inner,
+            };
+            format!(
+                "({}) -> {result}{}",
+                rendered.join(", "),
+                render_row(row, names)
+            )
         }
         Type::Error => "<error>".into(),
     }
 }
 
-fn var_name(index: usize) -> String {
-    let letter = char::from(b'a' + (index % 26) as u8);
-    if index < 26 {
+/// ` ! {db.read}`, ` ! 'e`, ` ! {db.read | 'e}`, or nothing for a pure function.
+fn render_row(row: &Row, names: &mut Names) -> String {
+    if row.is_pure() {
+        return String::new();
+    }
+    let labels: Vec<String> = row.labels.iter().map(Label::to_string).collect();
+    let tail = row.tail.map(|id| {
+        let next = names.rows.len();
+        names
+            .rows
+            .entry(id)
+            .or_insert_with(|| row_var_name(next))
+            .clone()
+    });
+    match (labels.is_empty(), tail) {
+        (true, Some(tail)) => format!(" ! {tail}"),
+        (false, Some(tail)) => format!(" ! {{{} | {tail}}}", labels.join(", ")),
+        _ => format!(" ! {{{}}}", labels.join(", ")),
+    }
+}
+
+/// `'a 'b 'c 'd 'f ...`: the letter `e` is reserved for effect (row) variables.
+fn type_var_name(index: usize) -> String {
+    const LETTERS: &[u8] = b"abcdfghijklmnopqrstuvwxyz";
+    let letter = char::from(LETTERS[index % LETTERS.len()]);
+    if index < LETTERS.len() {
         format!("'{letter}")
     } else {
-        format!("'{letter}{}", index / 26)
+        format!("'{letter}{}", index / LETTERS.len())
+    }
+}
+
+/// `'e 'e1 'e2 ...`
+fn row_var_name(index: usize) -> String {
+    if index == 0 {
+        "'e".into()
+    } else {
+        format!("'e{index}")
     }
 }

@@ -11,6 +11,7 @@ use crate::parser::expr::parse_type_text;
 use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
 
+use super::effects::Row;
 use super::env::{Env, UI_NODES, rigid_vars};
 use super::exhaustive::{self, Pat};
 use super::ty::*;
@@ -149,7 +150,11 @@ impl<'a> Checker<'a> {
             (
                 "first",
                 builtin(table, 1, |v| {
-                    Type::Fun(vec![list(&v[0])], Box::new(Type::option(v[0].clone())))
+                    Type::Fun(
+                        vec![list(&v[0])],
+                        Box::new(Type::option(v[0].clone())),
+                        Row::empty(),
+                    )
                 }),
             ),
             (
@@ -158,35 +163,48 @@ impl<'a> Checker<'a> {
                     Type::Fun(
                         vec![list(&v[0]), Type::con("Int")],
                         Box::new(Type::option(v[0].clone())),
+                        Row::empty(),
                     )
                 }),
             ),
             (
                 "length",
                 builtin(table, 1, |v| {
-                    Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int")))
+                    Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int")), Row::empty())
                 }),
             ),
             (
                 "map",
                 builtin(table, 2, |v| {
-                    let mapper = Type::Fun(vec![v[0].clone()], Box::new(v[1].clone()));
-                    Type::Fun(vec![list(&v[0]), mapper], Box::new(list(&v[1])))
+                    let mapper =
+                        Type::Fun(vec![v[0].clone()], Box::new(v[1].clone()), Row::empty());
+                    Type::Fun(
+                        vec![list(&v[0]), mapper],
+                        Box::new(list(&v[1])),
+                        Row::empty(),
+                    )
                 }),
             ),
             (
                 "fold",
                 builtin(table, 2, |v| {
-                    let step = Type::Fun(vec![v[1].clone(), v[0].clone()], Box::new(v[1].clone()));
+                    let step = Type::Fun(
+                        vec![v[1].clone(), v[0].clone()],
+                        Box::new(v[1].clone()),
+                        Row::empty(),
+                    );
                     Type::Fun(
                         vec![list(&v[0]), v[1].clone(), step],
                         Box::new(v[1].clone()),
+                        Row::empty(),
                     )
                 }),
             ),
             (
                 "emptyList",
-                builtin(table, 1, |v| Type::Fun(Vec::new(), Box::new(list(&v[0])))),
+                builtin(table, 1, |v| {
+                    Type::Fun(Vec::new(), Box::new(list(&v[0])), Row::empty())
+                }),
             ),
         ];
         for (name, scheme) in builtins {
@@ -205,7 +223,11 @@ impl<'a> Checker<'a> {
             vars.insert(name.clone(), var);
         }
         let ty = self.signature(function, &vars, true);
-        Scheme { vars: ids, ty }
+        Scheme {
+            vars: ids,
+            row_vars: Vec::new(),
+            ty,
+        }
     }
 
     /// Function type from the declaration; missing annotations become fresh variables.
@@ -231,7 +253,7 @@ impl<'a> Checker<'a> {
                 None => self.fresh(),
             }
         };
-        Type::Fun(params, Box::new(result))
+        Type::Fun(params, Box::new(result), Row::empty())
     }
 
     fn lower_ref(
@@ -330,7 +352,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_body(&mut self, function: &Function, ty: &Type) {
-        let Type::Fun(params, result) = ty else {
+        let Type::Fun(params, result, _) = ty else {
             return;
         };
         let mut names = BTreeSet::new();
@@ -464,22 +486,21 @@ impl<'a> Checker<'a> {
         };
         let diagnostic = match error {
             UnifyError::Mismatch { expected, found } => {
-                let names = display_all(&[&expected, &found]);
-                let diagnostic = Diagnostic::error(
-                    "E7101",
-                    format!(
-                        "Type mismatch: expected `{}`, found `{}`.",
-                        names[0], names[1]
-                    ),
-                    span.clone(),
-                );
-                match reason {
-                    Some(reason) => {
-                        diagnostic.with_hint(format!("`{}` is required by {reason}.", names[0]))
-                    }
-                    None => diagnostic,
-                }
+                mismatch_error(&expected, &found, span, reason)
             }
+            // `unify` widens row mismatches to the enclosing function types; this arm only
+            // guards against a bare row reaching here.
+            UnifyError::RowMismatch { .. } => mismatch_error(
+                &self.table.resolve(expected),
+                &self.table.resolve(found),
+                span,
+                reason,
+            ),
+            UnifyError::Ceiling { label, .. } => Diagnostic::error(
+                "E7401",
+                format!("This code cannot perform `{label}`."),
+                span.clone(),
+            ),
             UnifyError::Infinite { var, ty } => {
                 let names = display_all(&[&Type::Var(var), &ty]);
                 Diagnostic::error(
@@ -761,7 +782,7 @@ impl<'a> Checker<'a> {
         if fields.is_empty() {
             result
         } else {
-            Type::Fun(fields, Box::new(result))
+            Type::Fun(fields, Box::new(result), Row::empty())
         }
     }
 
@@ -795,7 +816,7 @@ impl<'a> Checker<'a> {
         let shallow = self.table.shallow(&callee_ty);
         // Arguments are checked left to right against the parameters, so a lambda argument
         // sees the parameter types fixed by the arguments before it (as in `map(xs, { p -> p.x })`).
-        if let Type::Fun(params, result) = &shallow
+        if let Type::Fun(params, result, _) = &shallow
             && params.len() == args.len()
         {
             let reason = self.parameter_reason(callee);
@@ -807,7 +828,7 @@ impl<'a> Checker<'a> {
         }
         let arg_types: Vec<Type> = args.iter().map(|arg| self.infer(arg)).collect();
         match shallow {
-            Type::Fun(params, result) => {
+            Type::Fun(params, result, _) => {
                 self.error(
                     "E7102",
                     format!(
@@ -822,7 +843,7 @@ impl<'a> Checker<'a> {
             Type::Error => Type::Error,
             Type::Var(_) => {
                 let result = self.fresh();
-                let function = Type::Fun(arg_types, Box::new(result.clone()));
+                let function = Type::Fun(arg_types, Box::new(result.clone()), Row::empty());
                 self.unify_at(&callee_ty, &function, &callee.span, None);
                 result
             }
@@ -842,7 +863,7 @@ impl<'a> Checker<'a> {
     /// types from that function; any other argument is inferred on its own.
     fn infer_argument(&mut self, arg: &Expr, expected: &Type) -> Type {
         if let ExprKind::Lambda { params, body } = &arg.kind
-            && let Type::Fun(seed, _) = self.table.shallow(expected)
+            && let Type::Fun(seed, _, _) = self.table.shallow(expected)
             && seed.len() == params.len()
         {
             let ty = self.infer_lambda(params, body, Some(&seed));
@@ -880,7 +901,7 @@ impl<'a> Checker<'a> {
         let result = self.infer_block(body);
         self.lambda_depth -= 1;
         self.locals.truncate(mark);
-        Type::Fun(param_types, Box::new(result))
+        Type::Fun(param_types, Box::new(result), Row::empty())
     }
 
     fn parameter_reason(&self, callee: &Expr) -> Option<String> {
@@ -1569,6 +1590,27 @@ fn is_fully_annotated(function: &Function) -> bool {
         && (function.component || function.return_type.is_some())
 }
 
+fn mismatch_error(
+    expected: &Type,
+    found: &Type,
+    span: &Span,
+    reason: Option<String>,
+) -> Diagnostic {
+    let names = display_all(&[expected, found]);
+    let diagnostic = Diagnostic::error(
+        "E7101",
+        format!(
+            "Type mismatch: expected `{}`, found `{}`.",
+            names[0], names[1]
+        ),
+        span.clone(),
+    );
+    match reason {
+        Some(reason) => diagnostic.with_hint(format!("`{}` is required by {reason}.", names[0])),
+        None => diagnostic,
+    }
+}
+
 fn builtin(table: &mut TypeTable, arity: usize, build: impl Fn(&[Type]) -> Type) -> Scheme {
     let vars: Vec<Type> = (0..arity).map(|_| table.fresh(GENERIC_LEVEL)).collect();
     let ids = vars
@@ -1583,6 +1625,7 @@ fn builtin(table: &mut TypeTable, arity: usize, build: impl Fn(&[Type]) -> Type)
         .collect();
     Scheme {
         vars: ids,
+        row_vars: Vec::new(),
         ty: build(&vars),
     }
 }
