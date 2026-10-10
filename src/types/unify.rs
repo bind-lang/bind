@@ -13,6 +13,12 @@ pub fn unify(table: &mut TypeTable, expected: &Type, found: &Type) -> Result<(),
     let a = table.shallow(expected);
     let b = table.shallow(found);
     match (&a, &b) {
+        // An unbound variable meeting `Error` is poisoned, so its operator constraint cannot
+        // resurface later as a spurious ambiguity next to the error already reported.
+        (Type::Var(x), Type::Error) | (Type::Error, Type::Var(x)) => {
+            table.set(*x, VarState::Link(Type::Error));
+            Ok(())
+        }
         (Type::Error, _) | (_, Type::Error) => Ok(()),
         (Type::Var(x), Type::Var(y)) if x == y => Ok(()),
         (Type::Var(x), _) => bind(table, *x, &b),
@@ -60,9 +66,14 @@ fn bind(table: &mut TypeTable, var: TypeVarId, ty: &Type) -> Result<(), UnifyErr
         table.set(var, VarState::Link(ty.clone()));
         return Ok(());
     }
-    occurs_and_adjust(table, var, level, ty).map_err(|_| UnifyError::Infinite { var, ty: table.resolve(ty) })?;
-    // A rejected type links the variable to `Error`: the problem is reported once, and later
-    // uses neither cascade nor surface as an ambiguous (still constrained) variable.
+    if occurs_and_adjust(table, var, level, ty).is_err() {
+        let error = UnifyError::Infinite { var, ty: table.resolve(ty) };
+        table.set(var, VarState::Link(Type::Error));
+        return Err(error);
+    }
+    // Any rejection (infinite type, constraint failure) links the variable to `Error`: the
+    // problem is reported once, and later uses neither cascade nor surface as an ambiguous
+    // (still constrained) variable.
     if let Some(constraint) = constraint
         && let Err(error) = constrain(table, constraint, ty)
     {
@@ -156,6 +167,7 @@ mod tests {
         let a = table.fresh(1);
         let error = unify(&mut table, &a, &Type::list(a.clone())).unwrap_err();
         assert!(matches!(error, UnifyError::Infinite { .. }));
+        assert_eq!(table.resolve(&a), Type::Error);
     }
 
     #[test]
@@ -238,5 +250,21 @@ mod tests {
         assert_eq!(display(&Type::option(Type::Fun(vec![], Box::new(int())))), "(() -> Int)?");
         let names = display_all(&[&Type::Var(4), &Type::list(Type::Var(4))]);
         assert_eq!(names, vec!["'a".to_string(), "List<'a>".to_string()]);
+    }
+
+    #[test]
+    fn error_poisons_constrained_variables() {
+        for flip in [false, true] {
+            let mut table = TypeTable::default();
+            let a = table.fresh(1);
+            constrain(&mut table, Constraint::Num, &a).unwrap();
+            if flip {
+                unify(&mut table, &Type::Error, &a).unwrap();
+            } else {
+                unify(&mut table, &a, &Type::Error).unwrap();
+            }
+            assert_eq!(table.resolve(&a), Type::Error);
+            assert!(generalize(&table, 0, &a).1.is_empty());
+        }
     }
 }
