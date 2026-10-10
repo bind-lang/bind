@@ -1,0 +1,43 @@
+data class Par(val a: Int, val b: Int)
+
+fun mesmo(x: Int): Boolean = x == x
+
+fun booleano(c: Boolean): Boolean = if (c) true else false
+
+fun aninhado(a: Boolean, b: Boolean): Int = if (a) { if (b) 1 else 2 } else 3
+
+fun espelho(b: Boolean): Boolean = when (b) {
+    true -> true
+    false -> false
+}
+
+fun soma(p: Par): Int = when (p) {
+    Par(a, b) -> a + b
+}
+
+fun verdade(b: Boolean): Boolean = b == true
+
+fun naoMenor(a: Double, b: Double): Boolean = !(a < b)
+
+fun menorOuIgual(a: Int, b: Int): Boolean = a == b || a < b
+
+fun nada(): Unit {}
+
+fun recebe(u: Unit): Int = 1
+
+fun passaNada(): Int = recebe(nada())
+
+fun identidade(x: Double): Double = x * 1.0 + 0.0
+
+fun duplo(b: Boolean): Boolean = !!b
+
+fun constante(x: Int): Int = x * 0
+
+fun seta(x: Int): Int {
+    val _ = x
+    x + 1
+}
+
+data class ponto(val x: Int)
+
+fun origem(): ponto = ponto(0)

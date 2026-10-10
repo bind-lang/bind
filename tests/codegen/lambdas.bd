@@ -1,0 +1,15 @@
+fun f(xs: List<Int>) = fold(map(xs, { x -> x * 2 }), 0, { s, x -> s + x })
+
+fun soma(xs: List<Int>, k: Int) = map(xs, { x -> x + k })
+
+fun dobro(x: Int) = x * 2
+
+fun dobra(xs: List<Int>) = map(xs, dobro)
+
+fun tamanhos(xss: List<List<Int>>) = map(xss, length)
+
+fun aplica(g: (Int) -> Int, x: Int) = g(x)
+
+fun lista() = listOf(1, 2, 3)
+
+fun escolhe(xs: List<Int>, f: Int, b: Boolean, g: (Int) -> Int) = map(xs, { x -> if (b) f else g(x) })

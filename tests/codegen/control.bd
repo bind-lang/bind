@@ -1,0 +1,42 @@
+fun classifica(x: Int): String = if (x < 0) "negativo" else if (x == 0) "zero" else "positivo"
+
+fun cedo(x: Int): Int {
+    val y = if (x == 0) return 7 else x
+    y + 1
+}
+
+fun sequencia(x: Int): Int {
+    val _ = x + 1
+    val a = x * 2
+    val b = a + 1
+    b
+}
+
+fun texto(s: String): Int = when (s) {
+    "a" -> 1
+    "b\n" -> 2
+    _ -> 3
+}
+
+fun numero(b: Boolean): Int = when (b) {
+    true -> 1
+    false -> 0
+}
+
+fun nada(): Unit {}
+
+fun usaNada(): Unit = nada()
+
+fun resultado(r: Result<Int, String>): Int = when (r) {
+    Ok(v) -> v
+    Err(e) -> 0
+}
+
+fun ok(): Result<Int, String> = Ok(1)
+
+fun mesmo(a: Unit, b: Unit): Boolean = a == b
+
+fun saida(x: Int): Int {
+    val y = return x
+    y + 1
+}

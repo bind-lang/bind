@@ -1,0 +1,18 @@
+data class Pessoa(val nome: String, val apelido: String?)
+
+fun nomeOu(p: Pessoa?): String = p?.nome ?: "anonimo"
+
+fun apelido(p: Pessoa?): String? = p?.apelido
+
+fun inc(x: Int?): Int = when (x) {
+    null -> 0
+    n -> n + 1
+}
+
+fun primeiro(xs: List<Int>) = first(xs) ?: -1
+
+fun um(x: Int?): Boolean = when (x) {
+    1 -> true
+    null -> false
+    _ -> false
+}

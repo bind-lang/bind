@@ -1,0 +1,15 @@
+data class Caixa<T>(val conteudo: T)
+
+fun <T> ident(x: T): T = x
+
+fun usa() = ident(42)
+
+fun <T> par(x: T) = listOf(x, ident(x))
+
+fun <T> abre(c: Caixa<T>): T = c.conteudo
+
+fun primeiroOu(xs, padrao) = first(xs) ?: padrao
+
+fun usaCaixa(): String = abre(Caixa("oi"))
+
+fun aplicaId(xs: List<String>) = map(xs, ident)

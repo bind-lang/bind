@@ -1,0 +1,13 @@
+fun media(a: Double, b: Double) = (a + b) / 2.0
+
+fun escala(x: Float) = -x * 1.5f
+
+fun total(a: Money, b: Money) = a + b - a
+
+fun divide(a: Decimal, b: Decimal) = (a / b) ?: -a
+
+fun maior(a: Double, b: Double) = a > b
+
+fun espera(a: Duration, b: Duration) = a + b - (-a)
+
+fun hoje(d: Date, i: Instant, t: DateTime): Date = d

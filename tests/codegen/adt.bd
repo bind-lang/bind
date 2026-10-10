@@ -1,0 +1,31 @@
+sealed class Arvore {
+    data class No(val esq: Arvore, val valor: Int, val dir: Arvore)
+    data object Folha
+}
+
+data class Ponto(val x: Int, val type: String)
+
+fun soma(a: Arvore): Int = when (a) {
+    Folha -> 0
+    No(e, v, d) -> soma(e) + v + soma(d)
+}
+
+fun folhaUnica(a: Arvore): Boolean = when (a) {
+    No(Folha, _, Folha) -> true
+    _ -> false
+}
+
+fun raiz(v: Int) = No(Folha, v, Folha)
+
+fun esquerda(a: Arvore): Arvore = when (a) {
+    No(e, _, _) -> e
+    Folha -> a
+}
+
+fun px(p: Ponto) = p.x
+
+fun rotulo(n: Int): String = when (n) {
+    0 -> "zero"
+    -1 -> "menos \"um\""
+    _ -> "outro"
+}

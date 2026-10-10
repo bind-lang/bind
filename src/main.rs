@@ -1,4 +1,7 @@
 mod ast;
+// Wired into server generation by Task 7; until then only its tests use it.
+#[allow(dead_code)]
+mod backend;
 mod certified;
 mod cli;
 mod compiler;

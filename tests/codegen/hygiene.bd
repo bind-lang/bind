@@ -1,0 +1,29 @@
+data class Ctx(val depth: Int)
+
+data class Box(val conteudo: String)
+
+data class Vec(val x: Double, val y: Double)
+
+data class T0(val n: Int)
+
+distinct type None = String
+
+distinct type Some = Int
+
+sealed class Arc {
+    data class Clone(val ctx: Ctx)
+    data object Send
+}
+
+fun getX(c: Ctx): Int = c.depth
+
+fun get_x(c: Ctx): Int = getX(c) + 1
+
+fun <T> embrulha(x: T, t: T0): List<T> = listOf(x)
+
+fun caixa(b: Box, o: None, s: Some): Arc = Clone(Ctx(1))
+
+fun envia(a: Arc): Boolean = when (a) {
+    Clone(c) -> true
+    Send -> false
+}

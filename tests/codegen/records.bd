@@ -1,0 +1,45 @@
+distinct type Codigo = String
+
+sealed class Lista<T> {
+    data class Cons(val cabeca: T, val cauda: Lista<T>)
+    data object Vazia
+}
+
+data class Config(val type: String, val match: Int, val filho: Config?)
+
+fun codigo(s: String) = Codigo(s)
+
+fun cabeca(l: Lista<Int>): Int = when (l) {
+    Cons(h, _) -> h
+    Vazia -> -1
+}
+
+fun segundo(l: Lista<Int>): Int = when (l) {
+    Cons(_, Cons(x, _)) -> x
+    _ -> 0
+}
+
+fun um(l: Lista<String>) = Cons("a", l)
+
+fun tipo(c: Config) = c.type
+
+fun neto(c: Config): Int? = c.filho?.match
+
+fun folha(c: Config): Int = when (c) {
+    Config(_, m, null) -> m
+    Config(_, _, f) -> 0
+}
+
+sealed class Unico {
+    data class So(val n: Int?)
+}
+
+fun unico(u: Unico): Int = when (u) {
+    So(null) -> 0
+    So(x) -> 1
+}
+
+fun unicoInterno(u: Unico?): Int = when (u) {
+    So(1) -> 1
+    _ -> 0
+}
