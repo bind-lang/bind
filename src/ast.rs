@@ -45,7 +45,6 @@ pub enum TypeKind {
 pub struct Variant {
     pub name: String,
     pub fields: Vec<Field>,
-    #[allow(dead_code)] // consumed by the type checker in later tasks
     pub span: Span,
 }
 
