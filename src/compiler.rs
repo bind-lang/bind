@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ast::*;
 use crate::config::ProjectConfig;
+use crate::core::ir::CoreProgram;
 use crate::diagnostic::{Diagnostic, Severity, Span, has_errors};
 use crate::lexer::{Token, TokenKind, lex};
 use crate::parser::parse;
@@ -225,6 +226,9 @@ pub struct VerifiedApplication {
     pub rpc_contracts: Vec<RpcContract>,
     pub required_capabilities: BTreeSet<String>,
     pub unsafe_operations: Vec<String>,
+    /// The validated typed core IR: the input of the typed code generators.
+    #[allow(dead_code)] // Read by the typed Rust server backend (later tasks of subproject 3).
+    pub core: CoreProgram,
 }
 
 pub struct CompileResult {
@@ -333,10 +337,25 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             module_count: files.len(),
         };
     }
-    // Every type-correct program is lowered to the core IR, so the lowering runs on all verified
-    // input. The IR is validated and kept in `VerifiedApplication` by the next step of the
-    // typed code generation (validator and E9001).
-    let _core = crate::core::lower::lower(&program, &typed, &database);
+    // Every type-correct program is lowered to the core IR and validated. An inconsistent IR is
+    // a compiler bug: it stops verification before any code is generated.
+    let core = crate::core::lower::lower(&program, &typed, &database);
+    let problems = crate::core::validate::validate(&core);
+    if !problems.is_empty() {
+        diagnostics.push(Diagnostic::error(
+            "E9001",
+            format!(
+                "Internal compiler error: the core IR is inconsistent ({}). This is a bug in bindc.",
+                problems.join("; ")
+            ),
+            Span::default(),
+        ));
+        return CompileResult {
+            application: None,
+            diagnostics,
+            module_count: files.len(),
+        };
+    }
 
     let mut graph = ApplicationGraph::default();
     let type_map: BTreeMap<_, _> = program
@@ -482,6 +501,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             rpc_contracts,
             required_capabilities,
             unsafe_operations: Vec::new(),
+            core,
         })
     };
     CompileResult {
@@ -1721,6 +1741,49 @@ client component CustomerPage(id: CustomerId) {
             vec!["CustomerPage".to_string(), "getCustomer".to_string()]
         );
         assert_eq!(app.rpc_contracts[0].path, "/api/getCustomer");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn verified_application_carries_the_validated_core_ir() {
+        let (root, config) = fixture(SOURCE, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(
+            !codes(&result).contains(&"E9001"),
+            "{:?}",
+            result.diagnostics
+        );
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        let names: Vec<&str> = app
+            .core
+            .functions
+            .iter()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert!(names.contains(&"getCustomer"), "{names:?}");
+        assert!(names.contains(&"CustomerPage"), "{names:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn effectful_generalized_val_used_at_two_types_is_an_internal_error() {
+        // The checker accepts it, but the lowering cannot copy an effectful value per instance,
+        // so the IR is inconsistent and `verify` stops with E9001 instead of generating code.
+        let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun f(id: CustomerId): Int effects [db.read] {\n    val xs = if (db.customers.require(id).name == \"a\") emptyList() else emptyList()\n    val a = length(map(xs, { x -> x + 1 }))\n    return length(map(xs, { x -> x == \"b\" }))\n}\n";
+        let (root, config) = fixture(source, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_none());
+        let found = codes(&result);
+        assert_eq!(found, vec!["E9001"], "{:?}", result.diagnostics);
+        assert!(
+            result.diagnostics[0]
+                .message
+                .starts_with("Internal compiler error: the core IR is inconsistent ("),
+            "{}",
+            result.diagnostics[0].message
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -208,7 +208,7 @@ impl CtorDef {
     }
 }
 
-fn replace_markers(ty: &Type, markers: &BTreeMap<String, Type>) -> Type {
+pub(super) fn replace_markers(ty: &Type, markers: &BTreeMap<String, Type>) -> Type {
     match ty {
         Type::Con(name, args) if args.is_empty() && name.starts_with('\'') => {
             markers.get(name).cloned().unwrap_or(Type::Error)

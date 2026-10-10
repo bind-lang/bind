@@ -3,3 +3,4 @@
 pub mod ir;
 pub mod lower;
 mod specialize;
+pub mod validate;
