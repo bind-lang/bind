@@ -10,11 +10,12 @@ pub mod endpoints;
 pub mod expr;
 pub mod types;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::VerifiedApplication;
 use crate::core::ir::{CoreFunction, CoreProgram, Expr, ExprKind};
 use crate::schema::DatabaseSchema;
+use crate::types::ty::Type;
 
 /// Inner attributes opening every generated module. Each allowed lint is inherent to uniform
 /// code generation; none of the denied ones (`unwrap_used`, `expect_used`, `panic`,
@@ -101,15 +102,11 @@ pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<Strin
         .filter(|function| function.endpoint)
         .collect();
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
-    let functions = reachable(program, &endpoints);
-    for function in &functions {
-        if let Some(what) = outside_server(&function.body) {
-            return Err(format!(
-                "Function `{}` is reachable from an endpoint but uses {what}, which the generated server does not support yet",
-                function.name
-            ));
-        }
+    // `verify` reports these (E8310, E9001); a verified program never has any.
+    if let Some(problem) = server_problems(program, database).first() {
+        return Err(problem.message());
     }
+    let functions = reachable(program, &endpoints);
     let plan = db::DbPlan::new(&db::operations(&functions), program, database)?;
     let names = endpoints::input_names(&endpoints, &layout);
 
@@ -166,12 +163,119 @@ fn reachable<'p>(
     functions
 }
 
-/// The first node of `expr` that server code cannot contain, described.
-fn outside_server(expr: &Expr) -> Option<&'static str> {
+/// Why a verified program has no generated server.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ServerProblem {
+    /// A function reachable from `endpoint` uses `what` (E8310).
+    Unsupported {
+        function: String,
+        endpoint: String,
+        what: &'static str,
+    },
+    /// A field of a table's model whose type has no column mapping (E8310).
+    UnmappedColumn {
+        table: String,
+        column: String,
+        model: String,
+        ty: Type,
+    },
+    /// An inconsistency the checker should have rejected (E9001).
+    Internal(String),
+}
+
+impl ServerProblem {
+    pub fn message(&self) -> String {
+        let profile = crate::certified::profile_version();
+        match self {
+            ServerProblem::Unsupported {
+                function,
+                endpoint,
+                what,
+            } => format!(
+                "Function `{function}` is reachable from endpoint `{endpoint}` but uses {what}, which the generated server does not support in profile {profile}."
+            ),
+            ServerProblem::UnmappedColumn {
+                table, column, ty, ..
+            } => format!(
+                "Column `{table}.{column}` has type `{}`, which has no database mapping in profile {profile}.",
+                crate::types::ty::display(ty)
+            ),
+            ServerProblem::Internal(message) => {
+                format!("Internal compiler error: {message}. This is a bug in bindc.")
+            }
+        }
+    }
+}
+
+/// What prevents generating the server of `program`: unsupported nodes in functions
+/// reachable from an endpoint (attributed to the first endpoint, by name, that reaches them)
+/// and model fields without a column mapping in the tables those functions use.
+pub fn server_problems(program: &CoreProgram, database: &DatabaseSchema) -> Vec<ServerProblem> {
+    let mut endpoints: Vec<&CoreFunction> = program
+        .functions
+        .iter()
+        .filter(|function| function.endpoint)
+        .collect();
+    endpoints.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut origin: BTreeMap<&str, &str> = BTreeMap::new();
+    for endpoint in &endpoints {
+        for function in reachable(program, &[endpoint]) {
+            origin.entry(&function.name).or_insert(&endpoint.name);
+        }
+    }
+    let functions = reachable(program, &endpoints);
+    let mut problems = Vec::new();
+    for function in &functions {
+        let endpoint = origin
+            .get(function.name.as_str())
+            .copied()
+            .unwrap_or_default();
+        let what = match outside_server(&function.body) {
+            None => continue,
+            Some(Outside::Environment) => "an `environment` value",
+            Some(Outside::Ui) => "a UI tree",
+            Some(Outside::ServerCall) => {
+                // The checker rejects `server.` calls outside client code (E7401).
+                problems.push(ServerProblem::Internal(format!(
+                    "function `{}`, reachable from endpoint `{endpoint}`, contains a `server.` call",
+                    function.name
+                )));
+                continue;
+            }
+        };
+        problems.push(ServerProblem::Unsupported {
+            function: function.name.clone(),
+            endpoint: endpoint.to_string(),
+            what,
+        });
+    }
+    match db::unmapped_columns(&db::operations(&functions), program, database) {
+        Ok(columns) => problems.extend(columns.into_iter().map(|(table, column, model, ty)| {
+            ServerProblem::UnmappedColumn {
+                table,
+                column,
+                model,
+                ty,
+            }
+        })),
+        Err(message) => problems.push(ServerProblem::Internal(message)),
+    }
+    problems
+}
+
+/// Nodes server code cannot contain.
+enum Outside {
+    Environment,
+    Ui,
+    ServerCall,
+}
+
+/// The first node of `expr` that server code cannot contain.
+fn outside_server(expr: &Expr) -> Option<Outside> {
     match &expr.kind {
-        ExprKind::Environment(_) => Some("an `environment` value"),
-        ExprKind::ServerCall { .. } => Some("a `server.` call"),
-        ExprKind::Ui => Some("a UI tree"),
+        ExprKind::Environment(_) => Some(Outside::Environment),
+        ExprKind::ServerCall { .. } => Some(Outside::ServerCall),
+        ExprKind::Ui => Some(Outside::Ui),
         _ => children(expr).into_iter().find_map(outside_server),
     }
 }

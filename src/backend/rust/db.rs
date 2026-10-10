@@ -118,6 +118,33 @@ fn field_type<'p>(model: &Model<'p>, column: &str) -> Result<&'p Type, String> {
         .ok_or_else(|| format!("Model `{}` has no field `{column}`", model.name))
 }
 
+/// The model fields, in the tables `keys` use, whose type has no column mapping:
+/// `(table, column, model, type)`. `Err` when a table has no record model (the checker
+/// rejects that).
+pub fn unmapped_columns(
+    keys: &BTreeSet<DbKey>,
+    program: &CoreProgram,
+    database: &DatabaseSchema,
+) -> Result<Vec<(String, String, String, Type)>, String> {
+    let layout = Layout::new(program);
+    let tables: BTreeSet<&str> = keys.iter().map(DbKey::table).collect();
+    let mut output = Vec::new();
+    for table in tables {
+        let model = model(program, database, table)?;
+        for (field, ty) in model.fields {
+            if column(ty, &layout).is_err() {
+                output.push((
+                    table.to_string(),
+                    field.clone(),
+                    model.name.to_string(),
+                    ty.clone(),
+                ));
+            }
+        }
+    }
+    Ok(output)
+}
+
 impl DbPlan {
     pub fn new(
         keys: &BTreeSet<DbKey>,
@@ -390,15 +417,53 @@ fn quote(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-/// A Rust identifier fragment for a table or column name.
+/// A Rust identifier fragment for a table or column name, injective: ASCII letters and
+/// digits are kept, `_` becomes `__` and any other character `_x<hex>_`. A single `_` in the
+/// output is always followed by `_` or `x`, so `_<digit>` (the numbering of inserts) never
+/// occurs inside a fragment and names built as `db_<op>_<fragment>[_<n>]` never collide.
 fn identifier(name: &str) -> String {
-    name.chars()
-        .map(|ch| {
-            if ch.is_alphanumeric() || ch == '_' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    let mut output = String::new();
+    for ch in name.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' => output.push(ch),
+            '_' => output.push_str("__"),
+            other => output.push_str(&format!("_x{:x}_", u32::from(other))),
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::lower::tests::{compile_with, schema};
+
+    #[test]
+    fn identifiers_are_injective() {
+        let names = ["a-b", "a_b", "a__b", "a_x2d_b", "ação", "t_1", "t"];
+        let fragments: BTreeSet<String> = names.iter().map(|name| identifier(name)).collect();
+        assert_eq!(fragments.len(), names.len(), "{fragments:?}");
+        assert_eq!(identifier("customers"), "customers");
+        assert_eq!(identifier("a-b"), "a_x2d_b");
+        assert_eq!(identifier("a_b"), "a__b");
+    }
+
+    #[test]
+    fn numbered_inserts_do_not_collide_with_other_tables() {
+        let csv = "table,model,primary_key,column,type,nullable,required,has_default,engine\nt,T,id,id,TId,false,true,true,postgresql\nt,T,id,a,String,false,true,false,postgresql\nt,T,id,b,String,true,false,false,postgresql\nt_1,U,id,id,UId,false,true,true,postgresql\nt_1,U,id,a,String,false,true,false,postgresql\n";
+        let source = "distinct type TId = UUID\nentity T(val id: TId, val a: String, val b: String?)\ndistinct type UId = UUID\nentity U(val id: UId, val a: String)\nserver fun f(): TId effects [db.write] {\n    val x = db.t.insert {\n        a = \"1\"\n    }\n    val y = db.t.insert {\n        a = \"2\"\n        b = null\n    }\n    val z = db.t_1.insert {\n        a = \"4\"\n    }\n    return x.id\n}\n";
+        let schema = schema(csv);
+        let program = compile_with(source, &schema);
+        let functions: Vec<&CoreFunction> = program.functions.iter().collect();
+        let plan = DbPlan::new(&operations(&functions), &program, &schema).unwrap();
+        let names: BTreeSet<&str> = plan
+            .functions
+            .values()
+            .map(|function| function.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            BTreeSet::from(["db_insert_t_1", "db_insert_t_2", "db_insert_t__1"])
+        );
+    }
 }

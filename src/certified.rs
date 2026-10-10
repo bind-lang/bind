@@ -84,6 +84,16 @@ pub fn generate(
         .ok()
         .filter(|_| same_profile);
     let preserved_npm_lock = fs::read_to_string(target.join("package-lock.json")).ok();
+    // Everything that can fail is computed first: a failure leaves the previous output intact.
+    let mut files = workspace_files(app, config, target_config)?;
+    if let Some(lock) = preserved_cargo_lock {
+        files.push(("Cargo.lock".to_string(), lock));
+    }
+    if target_config.deployment == "vercel"
+        && let Some(lock) = preserved_npm_lock
+    {
+        files.push(("package-lock.json".to_string(), lock));
+    }
     if target.exists() {
         fs::remove_dir_all(&target)
             .map_err(|error| format!("Cannot replace {}: {error}", target.display()))?;
@@ -91,68 +101,60 @@ pub fn generate(
     for directory in ["src", "api", "web/src", "web/dist", "contracts"] {
         fs::create_dir_all(target.join(directory)).map_err(|error| error.to_string())?;
     }
-
-    let component = component_plan(app)?;
-    write(&target.join("Cargo.toml"), &cargo_toml(app, target_config))?;
-    if let Some(lock) = preserved_cargo_lock {
-        write(&target.join("Cargo.lock"), &lock)?;
+    for (path, content) in &files {
+        write(&target.join(path), content)?;
     }
+    Ok(target)
+}
+
+/// Every generated file (relative path, content) except the preserved lock files.
+fn workspace_files(
+    app: &VerifiedApplication,
+    config: &ProjectConfig,
+    target_config: &TargetConfig,
+) -> Result<Vec<(String, String)>, String> {
+    let mut files: Vec<(String, String)> = Vec::new();
+    let mut add = |path: &str, content: String| files.push((path.to_string(), content));
+    let component = component_plan(app)?;
+    add("Cargo.toml", cargo_toml(app, target_config));
     if app.rpc_contracts.is_empty() {
-        write(&target.join("src/lib.rs"), STATIC_LIBRARY)?;
+        add("src/lib.rs", STATIC_LIBRARY.to_string());
     } else {
-        write(
-            &target.join("src/lib.rs"),
-            &crate::backend::rust::server_library(app)?,
-        )?;
-        write(&target.join("src/bind_runtime.rs"), RUNTIME_SOURCE)?;
+        add("src/lib.rs", crate::backend::rust::server_library(app)?);
+        add("src/bind_runtime.rs", RUNTIME_SOURCE.to_string());
     }
     let database_environment = config.database_url_env.as_deref().unwrap_or("DATABASE_URL");
     match target_config.deployment.as_str() {
         "aws-lambda" => {
-            write(&target.join("src/main.rs"), &aws_main(database_environment))?;
-            write(
-                &target.join("template.yaml"),
-                &aws_template(app, database_environment),
-            )?;
+            add("src/main.rs", aws_main(database_environment));
+            add("template.yaml", aws_template(app, database_environment));
         }
         "vercel" => {
             for rpc in &app.rpc_contracts {
-                write(
-                    &target.join(format!("api/{}.rs", rpc.name)),
-                    &vercel_main(&rpc.path, database_environment),
-                )?;
+                add(
+                    &format!("api/{}.rs", rpc.name),
+                    vercel_main(&rpc.path, database_environment),
+                );
             }
-            write(&target.join("vercel.json"), VERCEL_JSON)?;
-            write(&target.join("package.json"), VERCEL_PACKAGE_JSON)?;
-            if let Some(lock) = preserved_npm_lock {
-                write(&target.join("package-lock.json"), &lock)?;
-            }
+            add("vercel.json", VERCEL_JSON.to_string());
+            add("package.json", VERCEL_PACKAGE_JSON.to_string());
         }
-        _ => unreachable!("deployment checked above"),
+        other => return Err(format!("Unsupported certified deployment `{other}`")),
     }
-    write(&target.join("web/elm.json"), ELM_JSON)?;
-    write(
-        &target.join("web/src/Main.elm"),
-        &elm_main(app, &component)?,
-    )?;
-    write(&target.join("web/index.html"), &index_html(config))?;
+    add("web/elm.json", ELM_JSON.to_string());
+    add("web/src/Main.elm", elm_main(app, &component)?);
+    add("web/index.html", index_html(config));
     let styles = match &config.web_stylesheet {
         Some(path) => fs::read_to_string(path)
             .map_err(|error| format!("Cannot read web stylesheet {}: {error}", path.display()))?,
         None => WEB_CSS.to_string(),
     };
-    write(&target.join("web/styles.css"), &styles)?;
-    write(&target.join("contracts/schema.json"), &contract_schema(app))?;
-    write(
-        &target.join("contracts/vectors.json"),
-        &contract_vectors(app),
-    )?;
-    write(
-        &target.join("bind-manifest.json"),
-        &generated_manifest(app, target_config),
-    )?;
-    write(&target.join("README.md"), &generated_readme(target_config))?;
-    Ok(target)
+    add("web/styles.css", styles);
+    add("contracts/schema.json", contract_schema(app));
+    add("contracts/vectors.json", contract_vectors(app));
+    add("bind-manifest.json", generated_manifest(app, target_config));
+    add("README.md", generated_readme(target_config));
+    Ok(files)
 }
 
 pub fn profile_version() -> &'static str {
@@ -1684,6 +1686,57 @@ mod tests {
             );
         }
         assert!(generated.contains("features = [\"derive\", \"rc\"]"));
+    }
+
+    /// A generation that fails leaves the previous output untouched.
+    #[test]
+    fn failed_generation_keeps_the_previous_output() {
+        let root = std::env::temp_dir().join(format!("bindc-generate-{}", std::process::id()));
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::write(
+            root.join("app/main.bd"),
+            "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun getCustomer(id: CustomerId): Customer effects [db.read] = db.customers.require(id)\nclient component CustomerPage(id: CustomerId) {\n    val customer = server.getCustomer(id)\n    UI { Text(customer.name) }\n}\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("schema.csv"),
+            "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Customer,id,id,CustomerId,false,true,true,postgresql\ncustomers,Customer,id,name,String,false,true,false,postgresql\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("bind.toml"),
+            "[project]\nname = \"test\"\nsource = \"app\"\n[database.main]\nschema = \"schema.csv\"\nverification = \"static\"\n[target.aws-lambda]\nclient = \"elm\"\nserver = \"rust\"\ndeployment = \"aws-lambda\"\ncapabilities = [\"ui.dom\", \"server.http\", \"db.read\"]\n",
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let result = crate::compiler::verify(&config, "aws-lambda");
+        let mut app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        let output = root.join("out");
+        fs::create_dir_all(&output).unwrap();
+        fs::write(output.join("previous.txt"), "kept").unwrap();
+        // Simulate a backend failure: an endpoint reading an `environment` value, which
+        // `verify` would have rejected (E8310).
+        let endpoint = app
+            .core
+            .functions
+            .iter_mut()
+            .find(|function| function.endpoint)
+            .unwrap();
+        let ty = endpoint.body.ty.clone();
+        endpoint.body = crate::core::ir::Expr {
+            ty,
+            kind: crate::core::ir::ExprKind::Environment("databaseUrl".to_string()),
+        };
+        let error = generate(&app, &config, Some(&output)).unwrap_err();
+        assert!(error.contains("environment"), "{error}");
+        assert_eq!(
+            fs::read_to_string(output.join("previous.txt")).unwrap(),
+            "kept"
+        );
+        assert!(!output.join("Cargo.toml").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 
     /// `generate` on `examples/commerce` (the repository's `bind.toml`) for both targets, then

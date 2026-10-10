@@ -442,14 +442,11 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     if !built_in_target {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
+    if target_config.server == "rust" {
+        validate_rust_server_surface(&program, &database, &mut diagnostics);
+    }
     if target_config.certified {
-        validate_certified_surface(
-            &program,
-            &database,
-            &database_operations,
-            config,
-            &mut diagnostics,
-        );
+        validate_certified_surface(&program, &database_operations, config, &mut diagnostics);
     }
 
     if config.warnings_as_errors {
@@ -479,7 +476,14 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         let core = crate::core::lower::lower(&program, &typed, &database);
         let problems = crate::core::validate::validate(&core);
         if problems.is_empty() {
-            Some(core)
+            let server_diagnostics = if target_config.server == "rust" {
+                rust_server_diagnostics(&core, &program, &database)
+            } else {
+                Vec::new()
+            };
+            let usable = !has_errors(&server_diagnostics);
+            diagnostics.extend(server_diagnostics);
+            usable.then_some(core)
         } else {
             diagnostics.push(Diagnostic::error(
                 "E9001",
@@ -624,7 +628,6 @@ fn validate_type(
 
 fn validate_certified_surface(
     program: &Program,
-    database: &DatabaseSchema,
     operations: &[DatabaseOperation],
     config: &ProjectConfig,
     diagnostics: &mut Vec<Diagnostic>,
@@ -676,8 +679,8 @@ fn validate_certified_surface(
 
     for function in &program.functions {
         // Client functions are compiled by the token-based Elm generator, whose wire format
-        // is the original one. Endpoints are checked against the v2 wire types (E8309); other
-        // server code may use the whole language.
+        // is the original one. Endpoints are checked against the v2 wire types (E8309, for
+        // every Rust-server target); other server code may use the whole language.
         if function.domain == Domain::Client {
             for type_ref in function
                 .parameters
@@ -696,75 +699,6 @@ fn validate_certified_surface(
                         function.span.clone(),
                     ));
                 }
-            }
-        }
-        if function.domain == Domain::Server && !function.component {
-            for type_ref in function
-                .parameters
-                .iter()
-                .map(Parameter::declared_type)
-                .chain(std::iter::once(function.declared_return()))
-            {
-                let Ok(parsed) = parse_type_text(&type_ref.display(), &function.span) else {
-                    continue;
-                };
-                if !v2_wire_type(&parsed, program, &mut BTreeSet::new()) {
-                    diagnostics.push(Diagnostic::error(
-                        "E8309",
-                        format!(
-                            "Endpoint `{}` uses `{}`, which cannot cross the wire in profile {}.",
-                            function.name,
-                            render_type_expr(&parsed),
-                            crate::certified::profile_version()
-                        ),
-                        function.span.clone(),
-                    ));
-                }
-            }
-        }
-    }
-
-    // `Duration` has no database mapping: neither entity fields nor schema columns may use it.
-    for declaration in &program.types {
-        if declaration.kind != TypeKind::Entity {
-            continue;
-        }
-        for field in &declaration.fields {
-            let Ok(parsed) = parse_type_text(&field.type_ref.display(), &field.span) else {
-                continue;
-            };
-            if mentions_duration(&parsed, program, 0) {
-                diagnostics.push(Diagnostic::error(
-                    "E8309",
-                    format!(
-                        "Entity field `{}.{}` uses `{}`, which has no database mapping in profile {}.",
-                        declaration.name,
-                        field.name,
-                        render_type_expr(&parsed),
-                        crate::certified::profile_version()
-                    ),
-                    field.span.clone(),
-                ));
-            }
-        }
-    }
-    for table in database.tables.values() {
-        for column in table.columns.values() {
-            let Ok(parsed) = parse_type_text(&column.type_name, &Span::default()) else {
-                continue;
-            };
-            if mentions_duration(&parsed, program, 0) {
-                diagnostics.push(Diagnostic::error(
-                    "E8309",
-                    format!(
-                        "Column `{}.{}` uses `{}`, which has no database mapping in profile {}.",
-                        table.name,
-                        column.name,
-                        column.type_name,
-                        crate::certified::profile_version()
-                    ),
-                    Span::default(),
-                ));
             }
         }
     }
@@ -819,6 +753,148 @@ fn validate_certified_surface(
                     "Declare `runtime secret val databaseUrl: DatabaseUrl = env(\"DATABASE_URL\")` and reference the same variable from `[database.main].env`.",
                 ),
             ),
+        }
+    }
+}
+
+/// Checks of every target whose server is generated by the Rust backend (certified or not):
+/// endpoint signatures must be wire types and `Duration` cannot be stored (E8309).
+fn validate_rust_server_surface(
+    program: &Program,
+    database: &DatabaseSchema,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for function in &program.functions {
+        if function.domain == Domain::Server && !function.component {
+            for type_ref in function
+                .parameters
+                .iter()
+                .map(Parameter::declared_type)
+                .chain(std::iter::once(function.declared_return()))
+            {
+                let Some(parsed) =
+                    parse_declared_type(&type_ref.display(), &function.span, diagnostics)
+                else {
+                    continue;
+                };
+                if !v2_wire_type(&parsed, program, &mut BTreeSet::new()) {
+                    diagnostics.push(Diagnostic::error(
+                        "E8309",
+                        format!(
+                            "Endpoint `{}` uses `{}`, which cannot cross the wire in profile {}.",
+                            function.name,
+                            render_type_expr(&parsed),
+                            crate::certified::profile_version()
+                        ),
+                        function.span.clone(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // `Duration` has no database mapping: neither entity fields nor schema columns may use it.
+    for declaration in &program.types {
+        if declaration.kind != TypeKind::Entity {
+            continue;
+        }
+        for field in &declaration.fields {
+            let Some(parsed) =
+                parse_declared_type(&field.type_ref.display(), &field.span, diagnostics)
+            else {
+                continue;
+            };
+            if mentions_duration(&parsed, program, 0) {
+                diagnostics.push(Diagnostic::error(
+                    "E8309",
+                    format!(
+                        "Entity field `{}.{}` uses `{}`, which has no database mapping in profile {}.",
+                        declaration.name,
+                        field.name,
+                        render_type_expr(&parsed),
+                        crate::certified::profile_version()
+                    ),
+                    field.span.clone(),
+                ));
+            }
+        }
+    }
+    for table in database.tables.values() {
+        for column in table.columns.values() {
+            let Some(parsed) =
+                parse_declared_type(&column.type_name, &Span::default(), diagnostics)
+            else {
+                continue;
+            };
+            if mentions_duration(&parsed, program, 0) {
+                diagnostics.push(Diagnostic::error(
+                    "E8309",
+                    format!(
+                        "Column `{}.{}` uses `{}`, which has no database mapping in profile {}.",
+                        table.name,
+                        column.name,
+                        column.type_name,
+                        crate::certified::profile_version()
+                    ),
+                    Span::default(),
+                ));
+            }
+        }
+    }
+}
+
+/// What keeps the Rust backend from generating the server of a verified program: E8310 for
+/// code or columns the profile does not support, E9001 for inconsistencies. Run on the core
+/// IR so `generate` never fails on a program `verify` accepted.
+fn rust_server_diagnostics(
+    core: &CoreProgram,
+    program: &Program,
+    database: &DatabaseSchema,
+) -> Vec<Diagnostic> {
+    use crate::backend::rust::ServerProblem;
+    crate::backend::rust::server_problems(core, database)
+        .into_iter()
+        .map(|problem| {
+            let span = match &problem {
+                ServerProblem::Unsupported { function, .. } => program
+                    .functions
+                    .iter()
+                    .find(|item| item.name == *function)
+                    .map(|item| item.span.clone()),
+                ServerProblem::UnmappedColumn { model, column, .. } => program
+                    .types
+                    .iter()
+                    .find(|item| item.name == *model)
+                    .and_then(|item| item.fields.iter().find(|field| field.name == *column))
+                    .map(|field| field.span.clone()),
+                ServerProblem::Internal(_) => None,
+            };
+            let code = match problem {
+                ServerProblem::Internal(_) => "E9001",
+                _ => "E8310",
+            };
+            Diagnostic::error(code, problem.message(), span.unwrap_or_default())
+        })
+        .collect()
+}
+
+/// Parses a type the checker already accepted; a failure is a compiler bug (E9001).
+fn parse_declared_type(
+    text: &str,
+    span: &Span,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<TypeExpr> {
+    match parse_type_text(text, span) {
+        Ok(parsed) => Some(parsed),
+        Err(_) => {
+            diagnostics.push(Diagnostic::error(
+                "E9001",
+                format!(
+                    "Internal compiler error: the verified type `{text}` cannot be parsed again. This is a bug in bindc."
+                ),
+                span.clone(),
+            ));
+            None
         }
     }
 }
@@ -1951,6 +2027,77 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
             result.diagnostics
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wire_types_are_checked_for_every_rust_server_target() {
+        // `fixture`'s target is not certified.
+        let source = "server fun bad(x: Int): (Int) -> Int effects [] = { y -> y }\n";
+        let (root, config) = fixture(source, EMPTY_SCHEMA);
+        assert!(!config.targets["aws-lambda"].certified);
+        let result = verify(&config, "aws-lambda");
+        assert!(
+            codes(&result).contains(&"E8309"),
+            "{:?}",
+            result.diagnostics
+        );
+        assert!(result.application.is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn e8310(source: &str, schema: &str) -> Vec<String> {
+        let (root, config) = fixture(source, schema);
+        let result = verify(&config, "aws-lambda");
+        let found: Vec<String> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == "E8310")
+            .map(|item| item.message.clone())
+            .collect();
+        if !found.is_empty() {
+            assert!(result.application.is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+        found
+    }
+
+    #[test]
+    fn endpoints_reaching_environment_values_are_rejected() {
+        let source = "environment development {\n    public val appName: String = env(\"BIND_TEST_APP_NAME\", default = \"x\")\n}\nfun nome(): String = appName\nserver fun a(): String = nome()\nserver fun b(): String = nome()\n";
+        assert_eq!(
+            e8310(source, EMPTY_SCHEMA),
+            vec![
+                "Function `nome` is reachable from endpoint `a` but uses an `environment` value, which the generated server does not support in profile rust-elm-web-v2."
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoints_reaching_ui_trees_are_rejected() {
+        let source = "fun tela() = UI { Text(\"x\") }\nserver fun f(): Int {\n    val t = tela()\n    return 1\n}\n";
+        assert_eq!(
+            e8310(source, EMPTY_SCHEMA),
+            vec![
+                "Function `tela` is reachable from endpoint `f` but uses a UI tree, which the generated server does not support in profile rust-elm-web-v2."
+            ]
+        );
+    }
+
+    #[test]
+    fn columns_without_a_database_mapping_are_rejected() {
+        let source = "enum class Cor { Azul, Verde }\ndistinct type ItemId = UUID\nentity Item(val id: ItemId, val cor: Cor)\nserver fun ler(id: ItemId): ItemId effects [db.read] = db.itens.require(id).id\n";
+        let schema = format!(
+            "{EMPTY_SCHEMA}itens,Item,id,id,ItemId,false,true,true,postgresql\nitens,Item,id,cor,Cor,false,true,false,postgresql\n"
+        );
+        assert_eq!(
+            e8310(source, &schema),
+            vec![
+                "Column `itens.cor` has type `Cor`, which has no database mapping in profile rust-elm-web-v2."
+            ]
+        );
+        // A table no endpoint uses does not matter.
+        let unused = "enum class Cor { Azul, Verde }\ndistinct type ItemId = UUID\nentity Item(val id: ItemId, val cor: Cor)\nserver fun nada(): Int = 1\n";
+        assert!(e8310(unused, &schema).is_empty());
     }
 
     /// The endpoint of `tests/codegen/endpoint.bd`: a helper, a `when` and two database
