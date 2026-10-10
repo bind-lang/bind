@@ -8,6 +8,7 @@ build:
 
 test:
 	cargo test
+	cargo test --manifest-path runtime/bind-runtime/Cargo.toml
 
 check:
 	cargo run -- check --target aws-lambda

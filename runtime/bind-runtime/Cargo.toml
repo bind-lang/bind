@@ -1,0 +1,18 @@
+[package]
+name = "bind-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "bigdecimal", "rust_decimal"] }
+num-bigint = "=0.4.6"
+bigdecimal = "=0.4.8"
+rust_decimal = { version = "=1.37.2", features = ["serde-str"] }
+chrono = { version = "=0.4.41", features = ["serde"] }
+futures = "=0.3.31"
