@@ -1611,6 +1611,31 @@ client component CustomerPage(id: CustomerId) {
     }
 
     #[test]
+    fn pure_code_may_call_only_effect_free_functions() {
+        let prelude = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\n";
+        let reader = format!(
+            "{prelude}server fun leitor(id: CustomerId): Customer effects [db.read] = db.customers.require(id)\npure fun p(id: CustomerId): String = leitor(id).name\n"
+        );
+        let (root, config) = fixture(&reader, SCHEMA);
+        let found = codes(&verify(&config, "aws-lambda"));
+        assert!(found.contains(&"E7401"), "{found:?}");
+        assert!(
+            !found.iter().any(|code| code.starts_with("E6")),
+            "{found:?}"
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        // Accepted behavior: `pure` means effect-free, so an effect-free
+        // `server fun` may be called from pure code (legacy E6102 is gone).
+        let echo =
+            format!("{prelude}server fun eco(x: Int): Int = x\npure fun q(x: Int): Int = eco(x)\n");
+        let (root, config) = fixture(&echo, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn capabilities_come_from_typed_effects() {
         let (root, config) = fixture(SOURCE, SCHEMA);
         let app = verify(&config, "aws-lambda")
