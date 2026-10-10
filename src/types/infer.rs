@@ -4148,4 +4148,16 @@ mod tests {
             "(ClienteId, (ClienteId) -> ClienteId ! 'e) -> ClienteId ! {db.read | 'e}"
         );
     }
+
+    #[test]
+    fn documented_effect_messages_match_the_checker() {
+        let docs = include_str!("../../docs/type-system.md");
+        let ceiling = only_e7401(
+            "server fun buscar(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)\nfun h(id: ClienteId) = buscar(id)\nclient fun tela(id: ClienteId) = h(id).nome\n",
+        );
+        assert!(docs.contains(&ceiling.message), "{}", ceiling.message);
+        let rigid = db_diagnostics("fun <A> chama(f: () -> A ! [e]): A effects [] = f()\n");
+        assert!(docs.contains(&rigid[0].message), "{}", rigid[0].message);
+        assert!(!docs.contains("with the domain's ceiling"));
+    }
 }

@@ -138,9 +138,11 @@ map    : (List<'a>, ('a) -> 'b ! 'e) -> List<'b> ! 'e
 ```
 
 Row variables render as `'e`, `'e1`, `'e2`, …; type variables skip the letter `e` (`'a 'b 'c 'd 'f`).
-Display hides a row variable that occurs once and only in result positions (a function's own row or
-the row of a returned function), because it constrains nothing; a row variable in a parameter
-position is always shown.
+Display hides a row variable that occurs exactly once among the types shown and in a positive
+position, because it constrains nothing. Positions follow polarity: a function's own row and the row of
+a returned function are positive, each parameter flips the polarity (so the row of a parameter is
+always shown, while that of a parameter's parameter counts as positive), and rows inside type
+arguments (`List<() -> X ! {db.read | 'e}>`) count as negative, so they are always shown.
 
 ### Annotations
 
@@ -153,10 +155,12 @@ server fun buscar(id: ClienteId): Cliente effects [db.read] = db.clientes.requir
 
 - In a function type, `! [r1, r2, e]` lists the effects; no `!` means pure.
 - Inside `[...]`, a lowercase name without a dot is an effect variable; `resource.operation` is a label.
+  A name without a dot that does not start with a lowercase letter (`E`) is E7405.
 - `effects [...]` is the row of the function itself. A `server fun` without a clause means `effects []`.
 - A row holds at most one effect variable (two distinct ones are E7004).
-- Effect variables are generic in the function's scheme, rigid in the body of an annotated function
-  (like `T` in `fun <T> f(x: T)`), and flexible in inferred functions.
+- Effect variables are generic in the function's scheme and rigid inside its body, annotated or
+  inferred (like `T` in `fun <T> f(x: T)`): the body can neither add labels to them nor change the
+  declared row of a parameter, so `fun f(g: () -> Int ! [e]) = g() + 1` keeps `g : () -> Int ! 'e`.
 - A `pure` or `server` function without an `effects` clause implicitly carries the effect variables
   named in its parameter types.
 
@@ -194,6 +198,12 @@ effect it produces is unified.
 - Generalization closes only a function's own top row. The rows of returned functions stay open.
 - `server.f` used as a value has the open row `{server.call | …}` (never `f`'s own effects), so
   `map(ids, server.buscar)` in client code performs only `server.call`.
+- `server.f` requires `f` to be a `server fun` that is not a component; otherwise it is E7404
+  ("`server.f` is not a server endpoint; declare it `server fun`.").
+- Origins: each body (the function's and each lambda's) records where its effects come from. A
+  lambda's origins join the function's only when its row flows into the function's row (it is called,
+  directly, through a `val`, or by the function it is passed to), so diagnostics never point into a
+  lambda that never runs.
 
 ### Domains as ceilings
 
@@ -208,11 +218,12 @@ Ceilings are checked after each function body (after the whole recursive group f
 recursive functions): a concrete label outside the ceiling is E7401 at the function, with the path to
 the operation and a hint chosen by (domain, label). Ceilings never travel to callers. They constrain
 only concrete labels: effect variables are polymorphic in every domain, and the caller is charged when
-it instantiates the variable.
+it instantiates the variable. E7401 is reported once, at the function that performs the effect: a
+caller whose path goes through a function already reported for the same label is not reported again.
 
 ```text
 BIND ERROR E7401
-`tela` is client code and cannot perform `db.read`.
+`tela` is client code (it runs in the browser) and cannot perform `db.read`.
 Binding path:
     tela
       -> buscar (src/app.bd:9:5)
@@ -227,9 +238,20 @@ rejected, even if it has no effects. Reach it with `server.f(...)`.
 
 ### Exact contracts
 
-The body is inferred under a fresh row (with the domain's ceiling) and then compared with the
-declaration. An effect produced but not declared is E7402; one declared but not produced is E7403.
-Both E7401 and E7402 carry the binding path from the function to the operation.
+The body is inferred under a fresh context row and, after the body (after the whole group for
+mutually recursive functions), compared with the declaration. An effect produced but not declared is
+E7402; one declared but not produced is E7403. Both E7401 and E7402 carry the binding path from the
+function to the operation, and E7402 quotes the clause as written. E7403 is not reported for a
+function whose body already has an error.
+
+Declared effect variables are enforced exactly in every function with an `effects` clause, annotated
+or not: a declared variable whose row gained concrete labels is E7402 (with the path), and a declared
+variable the body never uses is E7403:
+
+```text
+BIND ERROR E7402
+`chama` performs the effects of `f` (effect variable `e`), but declares only [].
+```
 
 A function has its signature known in advance, so it is rigid and joins the annotated path, when its
 parameters and result are annotated and its effects are known: it has an `effects [...]` clause, it is
@@ -252,8 +274,8 @@ sorted labels of each function; the generated artifacts, including `bind-manifes
 | E7401 | an effect exceeds the domain's ceiling |
 | E7402 | an effect is performed but not declared |
 | E7403 | an effect is declared but not performed |
-| E7404 | a `server fun` is used directly in `client` code |
-| E7405 | unknown effect label or effect variable |
+| E7404 | a `server fun` is used directly in `client` code, or `server.f` names a non-endpoint |
+| E7405 | unknown effect label or effect variable, or an effect variable that is not lowercase |
 
 ## Patterns and exhaustiveness
 
@@ -347,11 +369,18 @@ depend on what is known when the expression is checked; annotating the value res
 - Effects of caches, queues and files have no operations yet; there is a single database (`db`).
 - A row holds at most one effect variable (two distinct ones are E7004). So `f: () -> A ! [db.read, e]`
   and `g: () -> A ! [db.write, e]` cannot be called in the same inferred function: set-based rows
-  cannot share a tail with different labels.
-- A declared effect can be justified by a recursive cycle (an over-approximation, so safe).
+  cannot share a tail with different labels. For the same reason, passing a function of the caller's
+  own recursive group as a callback to a function that adds effects to it (`'r ~ {db.read | 'r}`) is
+  rejected with "Effect mismatch" (E7101).
+- A declared effect can be justified by a recursive cycle: E7403 is not raised when the effect comes
+  only through the cycle (an over-approximation, so safe).
 - Diagnostic paths stop at locals, and E7401 is reported at the function (the path gives the operation).
 - Known gap: the body of an effect-free `server fun` can be reached without `server.` through `pure`
   or plain helpers, since `pure` only means effect-free.
+- Known gap: a `client fun` body can run caller-chosen effects through effect variables when it is
+  called from server or plain code: `client fun t(f: () -> A ! [e]) = f()` called from a plain function
+  with a lambda that reads the database performs `db.read` inside `t`, because ceilings constrain only
+  concrete labels and the caller is the one charged.
 - No refinement types: properties of values (`balance >= 0`) are not checked.
 - `"\$name"` (an escaped dollar followed by a letter) is rejected as interpolation, because the lexer
   has already decoded the escape. Write `"$" + "name"`.
