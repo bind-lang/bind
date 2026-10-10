@@ -17,6 +17,8 @@ use crate::ast::{BodyKind, Domain, Program};
 use crate::diagnostic::Diagnostic;
 use crate::schema::DatabaseSchema;
 
+#[allow(unused_imports)] // Consumed by the typed IR lowering (later tasks of typed-codegen).
+pub use infer::Resolution;
 pub use infer::TypedProgram;
 
 /// Type-checks a whole program. Diagnostics are sorted by file, line, column and code.

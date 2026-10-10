@@ -20,6 +20,25 @@ use super::unify::{UnifyError, constrain, unify, unify_rows};
 /// Level of quantified variables in schemes; never adjusted by unification.
 const GENERIC_LEVEL: u32 = u32::MAX;
 
+/// What a name (or a `server.f` / `Tipo.Variante` field) resolved to, as chosen by the checker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolution {
+    /// A parameter, `val`, lambda parameter or pattern binding of the current body.
+    Local,
+    /// A top-level function of the program.
+    Function(String),
+    /// `first`, `get`, `length`, `map`, `fold`, `emptyList`, `listOf`.
+    Builtin(String),
+    /// A constructor used as a value or called (`Pago(...)`, `Ok(...)`, `Cancelado`).
+    Constructor(String),
+    /// A value declared in `environment`.
+    Environment(String),
+    /// `server.f` (recorded on the `Field` node).
+    ServerCall(String),
+    /// `Tipo.Variante` (recorded on the `Field` node): the constructor name.
+    Variant(String),
+}
+
 #[allow(dead_code)] // Consumed by subprojects 2 and 3 (typed IR for verification and code generation).
 #[derive(Clone, Debug, Default)]
 pub struct TypedProgram {
@@ -34,6 +53,8 @@ pub struct TypedProgram {
     pub patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
     /// Resolved effect labels of each function (e.g. `["db.read"]`), sorted.
     pub effects: BTreeMap<String, Vec<String>>,
+    /// How each name was resolved, keyed by function and node.
+    pub resolutions: BTreeMap<(String, NodeId), Resolution>,
 }
 
 pub fn check_program(
@@ -54,6 +75,9 @@ struct Checker<'a> {
     level: u32,
     globals: BTreeMap<String, Scheme>,
     function_spans: BTreeMap<String, Span>,
+    /// Names declared in `environment`.
+    environment_names: BTreeSet<String>,
+    resolutions: BTreeMap<(String, NodeId), Resolution>,
     locals: Vec<(String, Scheme)>,
     /// Type parameters in scope: rigid in annotated functions, flexible in inferred ones.
     rigid: BTreeMap<String, Type>,
@@ -150,6 +174,8 @@ impl<'a> Checker<'a> {
             level: 0,
             globals: BTreeMap::new(),
             function_spans: BTreeMap::new(),
+            environment_names: BTreeSet::new(),
+            resolutions: BTreeMap::new(),
             locals: Vec::new(),
             rigid: BTreeMap::new(),
             function: String::new(),
@@ -233,6 +259,7 @@ impl<'a> Checker<'a> {
             } else {
                 base
             };
+            self.environment_names.insert(declaration.name.clone());
             self.globals
                 .insert(declaration.name.clone(), Scheme::mono(ty));
         }
@@ -717,6 +744,7 @@ impl<'a> Checker<'a> {
             .map(|(key, (ty, _))| (key.clone(), self.table.resolve(ty)))
             .collect();
         typed.patterns = self.patterns.clone();
+        typed.resolutions = self.resolutions.clone();
         typed
     }
 
@@ -1414,13 +1442,13 @@ impl<'a> Checker<'a> {
                 let inner = self.fresh();
                 Type::option(inner)
             }
-            ExprKind::Name(name) => self.infer_name(name, &expr.span),
+            ExprKind::Name(name) => self.infer_name(expr.id, name, &expr.span),
             ExprKind::Call {
                 callee,
                 args,
                 children,
             } => self.infer_call(callee, args, children.as_ref(), &expr.span),
-            ExprKind::Field { target, name } => self.infer_field(target, name, &expr.span),
+            ExprKind::Field { target, name } => self.infer_field(expr.id, target, name, &expr.span),
             ExprKind::SafeField { target, name } => {
                 let receiver = self.infer(target);
                 let inner = self.fresh();
@@ -1528,7 +1556,12 @@ impl<'a> Checker<'a> {
         ty
     }
 
-    fn infer_name(&mut self, name: &str, span: &Span) -> Type {
+    fn resolve(&mut self, id: NodeId, resolution: Resolution) {
+        self.resolutions
+            .insert((self.function.clone(), id), resolution);
+    }
+
+    fn infer_name(&mut self, id: NodeId, name: &str, span: &Span) -> Type {
         if let Some(scheme) = self
             .locals
             .iter()
@@ -1536,6 +1569,7 @@ impl<'a> Checker<'a> {
             .find(|(local, _)| local == name)
             .map(|(_, scheme)| scheme.clone())
         {
+            self.resolve(id, Resolution::Local);
             let (ty, rows) = instantiate_with_rows(&mut self.table, &scheme, self.level);
             self.row_instances.extend(
                 rows.into_iter()
@@ -1544,6 +1578,14 @@ impl<'a> Checker<'a> {
             return self.open_top(ty);
         }
         if let Some(scheme) = self.globals.get(name).cloned() {
+            let resolution = if self.function_spans.contains_key(name) {
+                Resolution::Function(name.to_string())
+            } else if self.environment_names.contains(name) {
+                Resolution::Environment(name.to_string())
+            } else {
+                Resolution::Builtin(name.to_string())
+            };
+            self.resolve(id, resolution);
             let ty = instantiate(&mut self.table, &scheme, self.level);
             if self.domain == Domain::Client
                 && self.function_domains.get(name) == Some(&Domain::Server)
@@ -1565,6 +1607,7 @@ impl<'a> Checker<'a> {
             return self.open_top(ty);
         }
         if self.env.ctors.contains_key(name) {
+            self.resolve(id, Resolution::Constructor(name.to_string()));
             return self.constructor_value(name);
         }
         if UI_NODES.contains(&name) {
@@ -1603,6 +1646,7 @@ impl<'a> Checker<'a> {
                 return self.infer_ui(name, args, children, span);
             }
             if name == "listOf" {
+                self.resolve(callee.id, Resolution::Builtin("listOf".into()));
                 return self.infer_list_of(args, children, span);
             }
         }
@@ -1746,7 +1790,7 @@ impl<'a> Checker<'a> {
         Type::list(element)
     }
 
-    fn infer_field(&mut self, target: &Expr, name: &str, span: &Span) -> Type {
+    fn infer_field(&mut self, id: NodeId, target: &Expr, name: &str, span: &Span) -> Type {
         if let ExprKind::Name(base) = &target.kind
             && !self.is_shadowed(base)
         {
@@ -1762,7 +1806,11 @@ impl<'a> Checker<'a> {
                     );
                     return Type::Error;
                 }
-                return match self.globals.get(name).cloned().filter(|_| declared) {
+                let scheme = self.globals.get(name).cloned().filter(|_| declared);
+                if scheme.is_some() {
+                    self.resolve(id, Resolution::ServerCall(name.to_string()));
+                }
+                return match scheme {
                     Some(scheme) => match instantiate(&mut self.table, &scheme, self.level) {
                         // Open, like any instantiated function, so it fits where more
                         // effects are allowed.
@@ -1801,6 +1849,7 @@ impl<'a> Checker<'a> {
             && matches!(info.kind, TypeKind::Enum | TypeKind::Sealed)
         {
             if info.ctors.iter().any(|ctor| ctor == name) {
+                self.resolve(id, Resolution::Variant(name.to_string()));
                 return self.constructor_value(name);
             }
             self.error("E7104", format!("`{base}` has no variant `{name}`."), span);
@@ -2753,7 +2802,47 @@ fn collect_expr(expr: &Expr, names: &mut BTreeSet<String>) {
 
 #[cfg(test)]
 mod tests {
+    use super::NodeId;
+    use super::Resolution;
     use crate::types::testing::{errors, infer, scheme};
+
+    fn resolutions(source: &str) -> Vec<(NodeId, Resolution)> {
+        let (tokens, _) = crate::lexer::lex("test.bd", source);
+        let (program, _) = crate::parser::parse(tokens);
+        let (typed, diagnostics) = crate::types::check(&program, &DatabaseSchema::default());
+        assert!(
+            !crate::diagnostic::has_errors(&diagnostics),
+            "{diagnostics:?}"
+        );
+        typed
+            .resolutions
+            .into_iter()
+            .filter(|((function, _), _)| function == "f")
+            .map(|((_, id), r)| (id, r))
+            .collect()
+    }
+
+    #[test]
+    fn records_how_each_name_was_resolved() {
+        let source = "sealed class Cor {\n    data object Azul\n    data class Rgb(val r: Int)\n}\nfun g(x: Int) = x\nfun f(x: Int): Int {\n    val y = g(x)\n    val c = Cor.Azul\n    val d = Rgb(1)\n    val xs = listOf(y)\n    length(xs)\n}\n";
+        let found: Vec<Resolution> = resolutions(source).into_iter().map(|(_, r)| r).collect();
+        assert!(found.contains(&Resolution::Function("g".into())));
+        assert!(found.contains(&Resolution::Local));
+        assert!(found.contains(&Resolution::Variant("Azul".into())));
+        assert!(found.contains(&Resolution::Constructor("Rgb".into())));
+        assert!(found.contains(&Resolution::Builtin("listOf".into())));
+        assert!(found.contains(&Resolution::Builtin("length".into())));
+    }
+
+    #[test]
+    fn shadowing_is_recorded_as_local() {
+        let found: Vec<Resolution> =
+            resolutions("fun length(x: Int) = x\nfun f(length: Int): Int = length\n")
+                .into_iter()
+                .map(|(_, r)| r)
+                .collect();
+        assert_eq!(found, vec![Resolution::Local]);
+    }
 
     const PEDIDO: &str = "sealed class Pedido {\n    data class Pendente(val itens: Int)\n    data class Pago(val valor: Money)\n    data object Cancelado\n}\n";
 
