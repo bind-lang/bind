@@ -6,3 +6,5 @@
 # everyone who runs the test benefits from these saved cases.
 cc ec8c94e99de9202b82e83ec4c3877e94f72390430dbb9ad11efedee5fc3b7223 # shrinks to index = 5, picks = [Con("Option", [Con("Int", [])]), Con("Int", []), Con("Int", []), Con("Int", [])]
 cc e4a7661ae80a96aa174364fd7af6ace879bf28ff08f2a52633e4cf089606f348 # shrinks to index = 2, picks = [Con("Int", []), Con("Int", []), Con("Int", []), Con("Int", [])]
+cc fc19b11ce22cfa770f3c92a4f3c9ad80d259339ec1fb012f4b7a127ead2e2b14 # shrinks to program = [EffectFunction { actions: [CallParameter, Read], returns: false, higher_order: true, declared: false }]
+cc d05513efa3d674fd205e9756dd39f5818ff3b432e282dc7d9a4af2098718d0c7 # shrinks to program = [EffectFunction { actions: [Read, CallParameter], returns: false, higher_order: true, declared: false }, EffectFunction { actions: [CallViaLambda(0, Function(1))], returns: false, higher_order: false, declared: false }]

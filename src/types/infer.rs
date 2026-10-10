@@ -440,20 +440,15 @@ impl<'a> Checker<'a> {
             for name in &function.type_params {
                 scope.insert(name.clone(), self.fresh());
             }
-            // Effect variables are flexible, like type parameters, unless the function's effects
-            // are declared: then, as in annotated bodies, each one only equals itself inside the
-            // body (so the body cannot add concrete labels to it), and it is released into a
-            // generic row variable once the group is checked.
-            let rigid = effects_known(function);
+            // As in annotated bodies, an effect variable named in the signature only equals
+            // itself inside the body: the body can neither add concrete labels to it (E7402 when
+            // the effects are declared) nor rewrite the declared row of a parameter. It is
+            // released into a generic row variable once the group is checked.
             let effects: BTreeMap<String, Row> = effect_variable_names(function)
                 .into_iter()
                 .map(|name| {
-                    let row = if rigid {
-                        rigid_names.insert(name.clone());
-                        Row::closed([Label::rigid(&name)])
-                    } else {
-                        self.table.fresh_row(self.level)
-                    };
+                    rigid_names.insert(name.clone());
+                    let row = Row::closed([Label::rigid(&name)]);
                     (name, row)
                 })
                 .collect();
@@ -4140,6 +4135,17 @@ mod tests {
         assert_eq!(
             diagnostics[0].message,
             "Effect variable `E` must be a lowercase identifier."
+        );
+    }
+
+    #[test]
+    fn parameters_keep_their_declared_rows_without_a_clause() {
+        let schemes = db_schemes(
+            "fun f0(id: ClienteId, g: (ClienteId) -> ClienteId ! [e]) {\n    val _ = g(id)\n    val _ = db.clientes.require(id)\n    id\n}\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "f0"),
+            "(ClienteId, (ClienteId) -> ClienteId ! 'e) -> ClienteId ! {db.read | 'e}"
         );
     }
 }
