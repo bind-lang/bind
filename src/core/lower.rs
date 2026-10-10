@@ -1627,6 +1627,7 @@ mod tests {
             "Let(1 id = Lambda(0 x: String -> Local(0)); Let(4 id = Lambda(3 x: Int -> Local(3)); Let(2 s = Call(Local(1), [Lit(\"a\")]); Call(Local(4), [Lit(1)]))))"
         );
         let program = compile(source);
+        assert_consistent(function(&program, "f"));
         let values = let_value(&function(&program, "f").body, "id");
         let string = Type::con("String");
         let int = Type::con("Int");
@@ -1774,6 +1775,135 @@ mod tests {
             assert_eq!(vars, (0..scheme.vars).collect::<Vec<_>>(), "{name}");
         }
         assert!(builtin_scheme("listOf").is_none());
+    }
+
+    fn without_rows(ty: &Type) -> Type {
+        match ty {
+            Type::Con(name, args) => {
+                Type::Con(name.clone(), args.iter().map(without_rows).collect())
+            }
+            Type::Fun(params, result, _) => Type::Fun(
+                params.iter().map(without_rows).collect(),
+                Box::new(without_rows(result)),
+                Row::empty(),
+            ),
+            other => other.clone(),
+        }
+    }
+
+    /// Every `Local` use has its binding's type (ignoring effect rows), and every binding is used
+    /// at its own type, so no binding keeps a defaulted `Unit` where a real instance exists.
+    fn assert_consistent(function: &CoreFunction) {
+        fn walk(expr: &Expr, scope: &mut Vec<(LocalId, Type)>) {
+            let bind = |scope: &mut Vec<(LocalId, Type)>, local: LocalId, ty: &Type| {
+                scope.push((local, without_rows(ty)));
+            };
+            match &expr.kind {
+                ExprKind::Local(local) => {
+                    let bound = scope
+                        .iter()
+                        .rev()
+                        .find(|(other, _)| other == local)
+                        .map(|(_, ty)| ty.clone());
+                    assert_eq!(
+                        bound,
+                        Some(without_rows(&expr.ty)),
+                        "local {local} used at {}",
+                        display(&expr.ty)
+                    );
+                }
+                ExprKind::Let {
+                    local, value, body, ..
+                } => {
+                    walk(value, scope);
+                    let mark = scope.len();
+                    bind(scope, *local, &value.ty);
+                    walk(body, scope);
+                    scope.truncate(mark);
+                }
+                ExprKind::Lambda { params, body } => {
+                    let mark = scope.len();
+                    for (local, _, ty) in params {
+                        bind(scope, *local, ty);
+                    }
+                    walk(body, scope);
+                    scope.truncate(mark);
+                }
+                ExprKind::Match { scrutinee, arms } => {
+                    walk(scrutinee, scope);
+                    for arm in arms {
+                        let mark = scope.len();
+                        for (local, _, ty) in &arm.bindings {
+                            bind(scope, *local, ty);
+                        }
+                        walk(&arm.body, scope);
+                        scope.truncate(mark);
+                    }
+                }
+                ExprKind::Call { callee, args } => {
+                    walk(callee, scope);
+                    args.iter().for_each(|arg| walk(arg, scope));
+                }
+                ExprKind::Ctor { args, .. }
+                | ExprKind::ServerCall { args, .. }
+                | ExprKind::Prim { args, .. }
+                | ExprKind::Db { args, .. } => args.iter().for_each(|arg| walk(arg, scope)),
+                ExprKind::Some(inner) | ExprKind::Return(inner) => walk(inner, scope),
+                ExprKind::Field { target, .. } => walk(target, scope),
+                ExprKind::Seq { value, body } => {
+                    walk(value, scope);
+                    walk(body, scope);
+                }
+                ExprKind::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                } => {
+                    walk(condition, scope);
+                    walk(then_branch, scope);
+                    walk(else_branch, scope);
+                }
+                _ => {}
+            }
+        }
+        let mut scope: Vec<(LocalId, Type)> = function
+            .params
+            .iter()
+            .map(|(local, _, ty)| (*local, without_rows(ty)))
+            .collect();
+        walk(&function.body, &mut scope);
+    }
+
+    #[test]
+    fn generalized_vals_used_inside_later_generalized_vals() {
+        let programs = [
+            "fun f(): Int {\n val e = emptyList()\n val g = e\n length(map(g, { x -> x + 1 }))\n}",
+            "fun f(): Int {\n val id = { x -> x }\n val id2 = id\n id2(1)\n}",
+            "fun f(): Int {\n val e = emptyList()\n val h = { y -> e }\n length(map(h(1), { x -> x + 1 }))\n}",
+            "fun f(): Int {\n val id = { x -> x }\n val a = { y -> id(y) }\n val s = id(\"s\")\n a(1)\n}",
+            "fun f(): Int {\n val id = { x -> x }\n val k = { z -> id(z) }\n val s = k(\"s\")\n k(1)\n}",
+            "fun f(): Int {\n val id = { x -> x }\n val w = { y ->\n val z = id(y)\n z\n }\n val s = w(\"s\")\n w(1)\n}",
+        ];
+        for source in programs {
+            let program = compile(source);
+            assert_consistent(function(&program, "f"));
+        }
+        // `e` gets its real instance through `g`, and `id` one copy per type reached via `k`.
+        let program = compile(programs[0]);
+        let values = let_value(&function(&program, "f").body, "e");
+        assert_eq!(values[0].ty, Type::list(Type::con("Int")));
+        let program = compile(programs[4]);
+        let ids: Vec<String> = let_value(&function(&program, "f").body, "id")
+            .iter()
+            .map(|value| display(&value.ty))
+            .collect();
+        assert_eq!(ids, vec!["(String) -> String", "(Int) -> Int"]);
+        let program = compile(programs[3]);
+        let ids: Vec<String> = let_value(&function(&program, "f").body, "id")
+            .iter()
+            .map(|value| display(&value.ty))
+            .collect();
+        assert_eq!(ids, vec!["(Int) -> Int", "(String) -> String"]);
     }
 
     #[test]

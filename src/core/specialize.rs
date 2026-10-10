@@ -5,7 +5,8 @@
 //! types every node with one type. Each generalized `val` is therefore specialized to the
 //! instances its uses actually need: an effect-free value is copied once per instance; an
 //! effectful one is never copied (it would run twice), so it is specialized only when it has a
-//! single instance.
+//! single instance. The pass is bottom-up (see `specialize_let`), so no use is read before the
+//! `val`s it sits in have their final types.
 
 use std::collections::BTreeSet;
 
@@ -41,6 +42,9 @@ impl Specializer<'_> {
         }
     }
 
+    /// Bottom-up: the body is specialized first, so the later `val`s it declares already have
+    /// their final types when this `val`'s uses inside their values are read. Each copy of the
+    /// value is specialized after substitution, which does the same for the `val`s it uses.
     fn specialize_let(&mut self, expr: &mut Expr, live: &mut Vec<usize>) {
         let ExprKind::Let {
             local, value, body, ..
@@ -48,12 +52,12 @@ impl Specializer<'_> {
         else {
             return;
         };
+        self.walk(body, live);
         let mut own = Vec::new();
         type_vars(&value.ty, &mut own);
         own.retain(|var| !live.contains(var));
         if own.is_empty() {
             self.walk(value, live);
-            self.walk(body, live);
             return;
         }
         let mut uses = Vec::new();
@@ -66,16 +70,15 @@ impl Specializer<'_> {
             }
         }
         match instances.as_slice() {
-            [] => self.keep_generalized(value, body, &own, live),
+            [] => self.keep_generalized(value, &own, live),
             [instance] => {
                 substitute(value, &own, instance);
                 self.walk(value, live);
-                self.walk(body, live);
             }
             _ if !effect_free(value, &self.effect_rows) => {
                 // Copying would run the effects once per copy, so the value stays generalized
                 // and its uses disagree with it: the validator rejects the program (E9001).
-                self.keep_generalized(value, body, &own, live);
+                self.keep_generalized(value, &own, live);
             }
             _ => {
                 let ty = expr.ty.clone();
@@ -109,7 +112,6 @@ impl Specializer<'_> {
                         .position(|other| *other == instance)
                         .map_or(local, |index| ids[index])
                 });
-                self.walk(&mut body, live);
                 let mut chain = *body;
                 for (id, copy) in copies.into_iter().rev() {
                     chain = Expr {
@@ -127,17 +129,12 @@ impl Specializer<'_> {
         }
     }
 
-    fn keep_generalized(
-        &mut self,
-        value: &mut Expr,
-        body: &mut Expr,
-        own: &[usize],
-        live: &mut Vec<usize>,
-    ) {
+    /// An unused `val` (its variables default to `Unit` at the end) or an effectful one used at
+    /// several types: the value is specialized with its own variables kept.
+    fn keep_generalized(&mut self, value: &mut Expr, own: &[usize], live: &mut Vec<usize>) {
         let mark = live.len();
         live.extend_from_slice(own);
         self.walk(value, live);
-        self.walk(body, live);
         live.truncate(mark);
     }
 
