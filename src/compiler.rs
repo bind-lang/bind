@@ -881,7 +881,9 @@ fn analyze_function(
             && let Some(callee) = functions.get(&call_name)
         {
             graph.add_edge(function.name.clone(), call_name.clone());
-            if function.domain == Domain::Pure && callee.domain != Domain::Pure {
+            if function.domain == Domain::Pure
+                && !matches!(callee.domain, Domain::Pure | Domain::Inferred)
+            {
                 diagnostics.push(Diagnostic::error(
                     "E6102",
                     format!(

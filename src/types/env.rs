@@ -7,7 +7,7 @@ use crate::diagnostic::{Diagnostic, Span};
 use crate::parser::expr::parse_type_text;
 use crate::syntax::expr::TypeExpr;
 
-use super::effects::Row;
+use super::effects::{Label, Row};
 use super::exhaustive::{CtorSig, Signatures};
 use super::ty::{Type, TypeTable};
 
@@ -305,18 +305,33 @@ impl Env {
         vars: &BTreeMap<String, Type>,
         diagnostics: &mut Vec<Diagnostic>,
     ) -> Type {
+        self.lower_with_effects(te, vars, &BTreeMap::new(), diagnostics)
+    }
+
+    /// Like `lower`, with the effect variables in scope (a function signature's `effects`).
+    pub fn lower_with_effects(
+        &self,
+        te: &TypeExpr,
+        vars: &BTreeMap<String, Type>,
+        effects: &BTreeMap<String, Row>,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Type {
         match te {
-            TypeExpr::Nullable(inner) => Type::option(self.lower(inner, vars, diagnostics)),
-            TypeExpr::Function { params, result } => {
+            TypeExpr::Nullable(inner) => {
+                Type::option(self.lower_with_effects(inner, vars, effects, diagnostics))
+            }
+            TypeExpr::Function {
+                params,
+                result,
+                effects: names,
+            } => {
                 let params = params
                     .iter()
-                    .map(|param| self.lower(param, vars, diagnostics))
+                    .map(|param| self.lower_with_effects(param, vars, effects, diagnostics))
                     .collect();
-                Type::Fun(
-                    params,
-                    Box::new(self.lower(result, vars, diagnostics)),
-                    Row::empty(),
-                )
+                let lowered = self.lower_with_effects(result, vars, effects, diagnostics);
+                let row = self.lower_row(names, effects, &type_span(result), diagnostics);
+                Type::Fun(params, Box::new(lowered), row)
             }
             TypeExpr::Named { name, args, span } => {
                 if name == ERROR_TYPE {
@@ -355,11 +370,69 @@ impl Env {
                 Type::Con(
                     name.clone(),
                     args.iter()
-                        .map(|arg| self.lower(arg, vars, diagnostics))
+                        .map(|arg| self.lower_with_effects(arg, vars, effects, diagnostics))
                         .collect(),
                 )
             }
         }
+    }
+
+    /// The row written as `[db.read, e]`: known labels plus at most one effect variable.
+    pub fn lower_row(
+        &self,
+        names: &[String],
+        effects: &BTreeMap<String, Row>,
+        span: &Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Row {
+        let mut row = Row::empty();
+        for name in names {
+            if !is_effect_name(name) {
+                diagnostics.push(Diagnostic::error(
+                    "E7405",
+                    format!("`{name}` is not a valid effect name."),
+                    span.clone(),
+                ));
+                continue;
+            }
+            if let Some(label) = Label::parse(name) {
+                if label.is_known() {
+                    row.labels.insert(label);
+                } else {
+                    diagnostics.push(Diagnostic::error(
+                        "E7405",
+                        format!(
+                            "Unknown effect `{name}`; the known effects are db.read, db.write and server.call."
+                        ),
+                        span.clone(),
+                    ));
+                }
+                continue;
+            }
+            let Some(variable) = effects.get(name) else {
+                diagnostics.push(Diagnostic::error(
+                    "E7405",
+                    format!(
+                        "Unknown effect variable `{name}`; effect variables are only allowed in function signatures."
+                    ),
+                    span.clone(),
+                ));
+                continue;
+            };
+            row.labels.extend(variable.labels.iter().cloned());
+            match (row.tail, variable.tail) {
+                (Some(existing), Some(tail)) if existing != tail => {
+                    diagnostics.push(Diagnostic::error(
+                        "E7004",
+                        "An effect row can contain at most one effect variable.",
+                        span.clone(),
+                    ))
+                }
+                (_, Some(tail)) => row.tail = Some(tail),
+                _ => {}
+            }
+        }
+        row
     }
 
     pub fn lower_quiet(&self, te: &TypeExpr, vars: &BTreeMap<String, Type>) -> Type {
@@ -512,6 +585,25 @@ fn contains_non_equatable(te: &TypeExpr, params: &[String], set: &BTreeSet<Strin
 }
 
 /// Type parameters inside the body of an annotated function: they only equal themselves.
+/// Identifier segments (ASCII letters, digits, `_`) separated by at most one dot.
+fn is_effect_name(name: &str) -> bool {
+    name.split('.').count() <= 2
+        && name.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+fn type_span(te: &TypeExpr) -> Span {
+    match te {
+        TypeExpr::Named { span, .. } => span.clone(),
+        TypeExpr::Nullable(inner) => type_span(inner),
+        TypeExpr::Function { result, .. } => type_span(result),
+    }
+}
+
 pub fn rigid_vars(params: &[String]) -> BTreeMap<String, Type> {
     params
         .iter()
@@ -547,6 +639,97 @@ mod tests {
         let mut diagnostics = Vec::new();
         let env = Env::build(&program, &mut diagnostics);
         (env, diagnostics.iter().map(|item| item.code).collect())
+    }
+
+    use crate::types::effects::{Label, Row};
+
+    fn lower_text(
+        env: &Env,
+        text: &str,
+        effects: &BTreeMap<String, Row>,
+    ) -> (Type, Vec<&'static str>) {
+        let te = parse_type_text(text, &Span::default()).unwrap();
+        let mut diagnostics = Vec::new();
+        let ty = env.lower_with_effects(&te, &BTreeMap::new(), effects, &mut diagnostics);
+        (ty, diagnostics.iter().map(|item| item.code).collect())
+    }
+
+    #[test]
+    fn lowers_function_types_with_effect_rows() {
+        let (env, _) = build("");
+        let (pure, codes) = lower_text(&env, "(Int) -> Int", &BTreeMap::new());
+        assert!(codes.is_empty());
+        assert_eq!(
+            pure,
+            Type::Fun(
+                vec![Type::con("Int")],
+                Box::new(Type::con("Int")),
+                Row::empty()
+            )
+        );
+        let (reads, _) = lower_text(&env, "(Int) -> Int ! [db.read]", &BTreeMap::new());
+        let Type::Fun(_, _, row) = reads else {
+            unreachable!()
+        };
+        assert_eq!(row, Row::closed([Label::new("db", "read")]));
+        let effects: BTreeMap<String, Row> = [("e".to_string(), Row::with_tail([], 7))].into();
+        let (open, _) = lower_text(&env, "(Int) -> Int ! [db.write, e]", &effects);
+        let Type::Fun(_, _, row) = open else {
+            unreachable!()
+        };
+        assert_eq!(row, Row::with_tail([Label::new("db", "write")], 7));
+    }
+
+    #[test]
+    fn rejects_unknown_effects_and_two_variables() {
+        let (env, _) = build("");
+        assert_eq!(
+            lower_text(&env, "(Int) -> Int ! [db.delete]", &BTreeMap::new()).1,
+            vec!["E7405"]
+        );
+        assert_eq!(
+            lower_text(&env, "(Int) -> Int ! [e]", &BTreeMap::new()).1,
+            vec!["E7405"]
+        );
+        let effects: BTreeMap<String, Row> = [
+            ("e".to_string(), Row::with_tail([], 1)),
+            ("f".to_string(), Row::with_tail([], 2)),
+        ]
+        .into();
+        assert_eq!(
+            lower_text(&env, "(Int) -> Int ! [e, f]", &effects).1,
+            vec!["E7004"]
+        );
+        assert!(
+            build("data class C(val f: (Int) -> Int ! [db.read])")
+                .1
+                .is_empty()
+        );
+        assert_eq!(
+            build("data class C(val f: (Int) -> Int ! [e])").1,
+            vec!["E7405"]
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_effect_names() {
+        let (env, _) = build("");
+        let names: Vec<String> = vec!["'x.y".into()];
+        let mut diagnostics = Vec::new();
+        let row = env.lower_row(&names, &BTreeMap::new(), &Span::default(), &mut diagnostics);
+        assert_eq!(row, Row::empty());
+        let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7405"]);
+        for bad in ["a.b.c", ".x", "x.", "", "d-b.read"] {
+            let mut diagnostics = Vec::new();
+            env.lower_row(
+                &[bad.to_string()],
+                &BTreeMap::new(),
+                &Span::default(),
+                &mut diagnostics,
+            );
+            assert_eq!(diagnostics.len(), 1, "{bad}");
+        }
     }
 
     const TREE: &str = "sealed class Arvore<T> {\n    data class No(val esq: Arvore<T>, val valor: T, val dir: Arvore<T>)\n    data object Folha\n}\ndata class Caixa<T>(val valor: T)\ndistinct type ClienteId = UUID\n";

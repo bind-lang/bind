@@ -1,5 +1,7 @@
 //! Expression, pattern and type syntax for function bodies.
 
+use std::collections::BTreeSet;
+
 use crate::diagnostic::Span;
 
 /// Identifies an expression or block inside one function body.
@@ -15,8 +17,34 @@ pub enum TypeExpr {
     Function {
         params: Vec<TypeExpr>,
         result: Box<TypeExpr>,
+        /// Effect labels and variables written after `!`; empty means pure.
+        effects: Vec<String>,
     },
     Nullable(Box<TypeExpr>),
+}
+
+impl TypeExpr {
+    /// Effect variables (lowercase names without a dot) mentioned in function types.
+    #[allow(dead_code)] // Used by signature inference (Task 3).
+    pub fn effect_variables(&self, output: &mut BTreeSet<String>) {
+        match self {
+            TypeExpr::Named { args, .. } => {
+                args.iter().for_each(|arg| arg.effect_variables(output))
+            }
+            TypeExpr::Nullable(inner) => inner.effect_variables(output),
+            TypeExpr::Function {
+                params,
+                result,
+                effects,
+            } => {
+                params
+                    .iter()
+                    .for_each(|param| param.effect_variables(output));
+                result.effect_variables(output);
+                output.extend(effects.iter().filter(|name| !name.contains('.')).cloned());
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -294,8 +322,17 @@ pub fn render_type(ty: &TypeExpr) -> String {
     match ty {
         TypeExpr::Named { name, args, .. } if args.is_empty() => name.clone(),
         TypeExpr::Named { name, args, .. } => format!("{name}<{}>", join(args, render_type)),
-        TypeExpr::Function { params, result } => {
-            format!("({}) -> {}", join(params, render_type), render_type(result))
+        TypeExpr::Function {
+            params,
+            result,
+            effects,
+        } => {
+            let base = format!("({}) -> {}", join(params, render_type), render_type(result));
+            if effects.is_empty() {
+                base
+            } else {
+                format!("{base} ! [{}]", effects.join(", "))
+            }
         }
         TypeExpr::Nullable(inner) => match inner.as_ref() {
             TypeExpr::Function { .. } => format!("({})?", render_type(inner)),

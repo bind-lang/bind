@@ -215,6 +215,10 @@ pub fn unify_rows(table: &mut TypeTable, expected: &Row, found: &Row) -> Result<
         (Some(x), Some(y)) => {
             let (x_level, x_ceiling) = unbound_row(table, x);
             let (y_level, y_ceiling) = unbound_row(table, y);
+            // Check both ceilings before touching the table, so a failure leaves no
+            // partial state behind.
+            check_ceiling(&only_b, x_ceiling.as_ref())?;
+            check_ceiling(&only_a, y_ceiling.as_ref())?;
             let fresh =
                 table.fresh_row_var(x_level.min(y_level), intersect(&x_ceiling, &y_ceiling));
             bind_row(table, x, Row::with_tail(only_b, fresh))?;
@@ -230,13 +234,13 @@ fn unbound_row(table: &TypeTable, id: RowVarId) -> (u32, Option<BTreeSet<Label>>
     }
 }
 
-/// Links a row variable, enforcing its ceiling (rigid labels are exempt) and handing the
-/// ceiling and level down to the new tail.
-fn bind_row(table: &mut TypeTable, var: RowVarId, row: Row) -> Result<(), UnifyError> {
-    let (level, ceiling) = unbound_row(table, var);
-    if let Some(ceiling) = &ceiling
-        && let Some(label) = row
-            .labels
+/// Fails when `labels` holds a non-rigid label outside `ceiling` (rigid labels are exempt).
+fn check_ceiling(
+    labels: &BTreeSet<Label>,
+    ceiling: Option<&BTreeSet<Label>>,
+) -> Result<(), UnifyError> {
+    if let Some(ceiling) = ceiling
+        && let Some(label) = labels
             .iter()
             .find(|label| !label.is_rigid() && !ceiling.contains(label))
     {
@@ -245,6 +249,14 @@ fn bind_row(table: &mut TypeTable, var: RowVarId, row: Row) -> Result<(), UnifyE
             ceiling: ceiling.clone(),
         });
     }
+    Ok(())
+}
+
+/// Links a row variable, enforcing its ceiling (rigid labels are exempt) and handing the
+/// ceiling and level down to the new tail.
+fn bind_row(table: &mut TypeTable, var: RowVarId, row: Row) -> Result<(), UnifyError> {
+    let (level, ceiling) = unbound_row(table, var);
+    check_ceiling(&row.labels, ceiling.as_ref())?;
     if let Some(tail) = row.tail {
         let (tail_level, tail_ceiling) = unbound_row(table, tail);
         table.set_row(
@@ -379,6 +391,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn open_open_ceiling_failure_leaves_no_partial_state() {
+        let mut table = TypeTable::default();
+        let x = table.fresh_row_var(1, None);
+        let y = table.fresh_row_var(1, Some([Label::new("server", "call")].into()));
+        let error = unify_rows(
+            &mut table,
+            &Row::with_tail([read()], x),
+            &Row::with_tail([], y),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            UnifyError::Ceiling {
+                label: read(),
+                ceiling: [Label::new("server", "call")].into()
+            }
+        );
+        assert_eq!(
+            table.resolve_row(&Row::with_tail([], x)),
+            Row::with_tail([], x)
+        );
+        assert!(matches!(
+            table.row_state(x),
+            RowState::Unbound { ceiling: None, .. }
+        ));
     }
 
     #[test]

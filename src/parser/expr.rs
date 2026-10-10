@@ -978,6 +978,29 @@ impl ExprParser {
         self.nested(Self::type_expr_inner)
     }
 
+    /// `! [db.read, e]` after a function type, or nothing.
+    fn effect_list(&mut self) -> Option<Vec<String>> {
+        if !(self.is("!") && self.peek_at(1).text == "[") {
+            return Some(Vec::new());
+        }
+        self.advance();
+        self.advance();
+        let mut names = Vec::new();
+        while !self.is("]") && !self.at_end() {
+            let mut name = self.identifier()?;
+            if self.consume(".") {
+                name.push('.');
+                name.push_str(&self.identifier()?);
+            }
+            names.push(name);
+            if !self.consume(",") {
+                break;
+            }
+        }
+        self.expect("]")?;
+        Some(names)
+    }
+
     fn type_expr_inner(&mut self) -> Option<TypeExpr> {
         let span = self.peek().span.clone();
         let mut ty = if self.is("(") {
@@ -992,9 +1015,11 @@ impl ExprParser {
             self.expect(")")?;
             if self.consume("->") {
                 let result = self.type_expr()?;
+                let effects = self.effect_list()?;
                 TypeExpr::Function {
                     params,
                     result: Box::new(result),
+                    effects,
                 }
             } else if params.len() == 1 {
                 params.remove(0)
@@ -1167,6 +1192,23 @@ mod tests {
         assert_eq!(render("((Int)->Int)?"), "((Int) -> Int)?");
         assert_eq!(render("Int??"), "Int??");
         assert!(parse_type_text("List<", &span).is_err());
+    }
+
+    #[test]
+    fn parses_effect_rows_in_types() {
+        let span = Span::default();
+        let render = |text: &str| render_type(&parse_type_text(text, &span).unwrap());
+        assert_eq!(
+            render("(Int) -> Int ! [db.read, e]"),
+            "(Int) -> Int ! [db.read, e]"
+        );
+        assert_eq!(render("((Int) -> Int ! [e])?"), "((Int) -> Int ! [e])?");
+        assert_eq!(render("(A) -> (B) -> C ! [e]"), "(A) -> (B) -> C ! [e]");
+        assert_eq!(
+            render("(Int)->Int![db.read,e]"),
+            "(Int) -> Int ! [db.read, e]"
+        );
+        assert!(parse_type_text("(Int) -> Int ! [", &span).is_err());
     }
 
     fn block(source: &str) -> String {

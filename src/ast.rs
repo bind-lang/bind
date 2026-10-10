@@ -64,6 +64,8 @@ pub struct TypeDecl {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Domain {
+    /// A plain `fun`: its effects are inferred from the body.
+    Inferred,
     Pure,
     Client,
     Server,
@@ -75,6 +77,7 @@ pub enum Domain {
 impl Domain {
     pub fn as_str(&self) -> &'static str {
         match self {
+            Self::Inferred => "inferred",
             Self::Pure => "pure",
             Self::Client => "client",
             Self::Server => "server",
@@ -116,6 +119,9 @@ pub struct Function {
     pub parameters: Vec<Parameter>,
     pub return_type: Option<TypeRef>,
     pub effects: Vec<String>,
+    /// `true` when an `effects [...]` clause is present, even an empty one.
+    #[allow(dead_code)] // Read by effect checking (Task 5).
+    pub effects_declared: bool,
     pub requires: Vec<String>,
     pub body_kind: BodyKind,
     pub body: Vec<Token>,

@@ -341,7 +341,7 @@ impl Parser {
 
     fn function(&mut self) -> Option<Function> {
         let span = self.peek().span.clone();
-        let mut domain = Domain::Pure;
+        let mut domain = Domain::Inferred;
         let mut suspend = false;
         loop {
             match self.peek_text() {
@@ -415,9 +415,11 @@ impl Parser {
             None
         };
         let mut effects = Vec::new();
+        let mut effects_declared = false;
         let mut requires = Vec::new();
         loop {
             if self.consume("effects") {
+                effects_declared = true;
                 effects = self.name_list();
             } else if self.consume("requires") {
                 requires = self.name_list();
@@ -454,6 +456,7 @@ impl Parser {
             parameters,
             return_type,
             effects,
+            effects_declared,
             requires,
             body_kind,
             body,
@@ -519,6 +522,16 @@ impl Parser {
                 let result = self.type_ref()?;
                 name.push_str("->");
                 name.push_str(&result.display());
+                if self.peek_text() == "!" && self.peek_n(1) == "[" {
+                    self.advance();
+                    self.advance();
+                    let mut effects = Vec::new();
+                    while !self.at_eof() && !self.consume("]") {
+                        effects.push(self.qualified_name());
+                        self.consume(",");
+                    }
+                    name.push_str(&format!("![{}]", effects.join(",")));
+                }
                 return Some(TypeRef {
                     name,
                     nullable: false,
@@ -747,6 +760,45 @@ mod tests {
         let (program, diagnostics) = parse(tokens);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn plain_functions_have_an_inferred_domain() {
+        let program = parse_source(
+            "fun a() = 1\npure fun b() = 1\nserver fun c(): Int effects [] = 1\nserver fun d(): Int = 1\n",
+        );
+        let domains: Vec<Domain> = program
+            .functions
+            .iter()
+            .map(|function| function.domain.clone())
+            .collect();
+        assert_eq!(
+            domains,
+            vec![
+                Domain::Inferred,
+                Domain::Pure,
+                Domain::Server,
+                Domain::Server
+            ]
+        );
+        let declared: Vec<bool> = program
+            .functions
+            .iter()
+            .map(|function| function.effects_declared)
+            .collect();
+        assert_eq!(declared, vec![false, false, true, false]);
+    }
+
+    #[test]
+    fn function_types_carry_effect_rows() {
+        let program =
+            parse_source("fun g(f: (Int) -> Int ! [db.read, e], h: (Int) -> Int): Int = 1\n");
+        let parameters = &program.functions[0].parameters;
+        assert_eq!(
+            parameters[0].declared_type().display(),
+            "(Int)->Int![db.read,e]"
+        );
+        assert_eq!(parameters[1].declared_type().display(), "(Int)->Int");
     }
 
     #[test]

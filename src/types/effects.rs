@@ -21,10 +21,6 @@ pub struct Label {
     pub operation: String,
 }
 
-// Label constructors and parsing (and through `is_known`, the vocabulary above) are consumed
-// by effect annotations and domain ceilings, which build on this representation; until then
-// only tests use them.
-#[allow(dead_code)]
 impl Label {
     pub fn new(resource: &str, operation: &str) -> Label {
         Label {
@@ -33,12 +29,14 @@ impl Label {
         }
     }
 
+    #[allow(dead_code)] // Only tests use it until effect inference (Task 3).
     pub fn of(pair: (&str, &str)) -> Label {
         Label::new(pair.0, pair.1)
     }
 
     /// An effect variable inside the body of a function annotated with `effects [e]`: it only
     /// equals itself and is exempt from domain ceilings (the caller decides what it becomes).
+    #[allow(dead_code)] // Only tests use it until effect inference (Task 3).
     pub fn rigid(name: &str) -> Label {
         Label {
             resource: format!("'{name}"),
