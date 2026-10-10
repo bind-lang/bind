@@ -724,24 +724,143 @@ proptest! {
 
 // ---- 7. inferred effects equal call-graph reachability --------------------------------
 
+/// The argument a call passes to a higher-order function's `g` parameter.
+#[derive(Clone, Debug)]
+enum Arg {
+    /// `{ y -> y }`
+    Identity,
+    /// `{ y -> db.clientes.require(y).id }`
+    Reads,
+    /// `fK` as a value (a first-order function; a higher-order one is passed as `Identity`).
+    Function(usize),
+}
+
 #[derive(Clone, Debug)]
 enum Action {
     Read,
     Write,
-    Call(usize),
-    CallViaLambda(usize),
+    Call(usize, Arg),
+    CallViaLambda(usize, Arg),
+    /// `g(id)`, in a higher-order function.
+    CallParameter,
 }
 
-fn arb_effect_program() -> impl Strategy<Value = Vec<Vec<Action>>> {
-    (1usize..5).prop_flat_map(|count| {
-        let action = prop_oneof![
-            Just(Action::Read),
-            Just(Action::Write),
-            (0..count).prop_map(Action::Call),
-            (0..count).prop_map(Action::CallViaLambda),
-        ];
-        proptest::collection::vec(proptest::collection::vec(action, 0..4), count)
-    })
+#[derive(Clone, Debug)]
+struct EffectFunction {
+    actions: Vec<Action>,
+    /// Declares `: ClienteId` (otherwise the result is inferred).
+    returns: bool,
+    /// Takes `g: (ClienteId) -> ClienteId ! [e]`.
+    higher_order: bool,
+    /// Declares its (expected) effects in the random-clause programs.
+    declared: bool,
+}
+
+impl EffectFunction {
+    fn calls_parameter(&self) -> bool {
+        self.higher_order
+            && self
+                .actions
+                .iter()
+                .any(|action| matches!(action, Action::CallParameter))
+    }
+}
+
+fn arb_effect_program() -> impl Strategy<Value = Vec<EffectFunction>> {
+    (1usize..5)
+        .prop_flat_map(|count| {
+            let arg = prop_oneof![
+                Just(Arg::Identity),
+                Just(Arg::Reads),
+                (0..count).prop_map(Arg::Function),
+            ];
+            let action = prop_oneof![
+                Just(Action::Read),
+                Just(Action::Write),
+                (0..count, arg.clone()).prop_map(|(other, arg)| Action::Call(other, arg)),
+                (0..count, arg).prop_map(|(other, arg)| Action::CallViaLambda(other, arg)),
+                Just(Action::CallParameter),
+            ];
+            let function = (
+                proptest::collection::vec(action, 0..4),
+                any::<bool>(),
+                any::<bool>(),
+                any::<bool>(),
+            )
+                .prop_map(|(actions, returns, higher_order, declared)| {
+                    EffectFunction {
+                        actions,
+                        returns,
+                        higher_order,
+                        declared,
+                    }
+                });
+            proptest::collection::vec(function, count)
+        })
+        .prop_map(normalize)
+}
+
+/// Keeps generated programs inside what monomorphic recursion can type precisely: only
+/// higher-order functions call their parameter, and a call to a higher-order function never
+/// closes a cycle (inside a recursive group, its parameter row would be shared by every
+/// call). Offending actions become reads.
+fn normalize(mut program: Vec<EffectFunction>) -> Vec<EffectFunction> {
+    let count = program.len();
+    let higher: Vec<bool> = program
+        .iter()
+        .map(|function| function.higher_order)
+        .collect();
+    for function in &mut program {
+        if !function.higher_order {
+            for action in &mut function.actions {
+                if matches!(action, Action::CallParameter) {
+                    *action = Action::Read;
+                }
+            }
+        }
+    }
+    let mut reach = vec![vec![false; count]; count];
+    for (index, function) in program.iter().enumerate() {
+        for action in &function.actions {
+            if let Action::Call(other, arg) | Action::CallViaLambda(other, arg) = action {
+                reach[index][*other] = true;
+                if let Arg::Function(value) = arg
+                    && !higher[*value]
+                {
+                    reach[index][*value] = true;
+                }
+            }
+        }
+    }
+    for middle in 0..count {
+        for from in 0..count {
+            for to in 0..count {
+                if reach[from][middle] && reach[middle][to] {
+                    reach[from][to] = true;
+                }
+            }
+        }
+    }
+    for (index, function) in program.iter_mut().enumerate() {
+        for action in &mut function.actions {
+            if let Action::Call(other, _) | Action::CallViaLambda(other, _) = action
+                && higher[*other]
+                && (*other == index || reach[*other][index])
+            {
+                *action = Action::Read;
+            }
+            // A function of the caller's own recursive group passed as `g` would join its own
+            // row with a row that extends it (`'r ~ {db.read | 'r}`), which set-based rows
+            // reject (a known limitation), so it is passed as a lambda instead.
+            if let Action::Call(_, arg) | Action::CallViaLambda(_, arg) = action
+                && let Arg::Function(value) = arg
+                && (*value == index || reach[*value][index])
+            {
+                *arg = Arg::Identity;
+            }
+        }
+    }
+    program
 }
 
 const EFFECT_PRELUDE: &str = "distinct type ClienteId = UUID\nentity Cliente(val id: ClienteId, val nome: String)\nfun aplica(f, x) = f(x)\n";
@@ -759,26 +878,54 @@ fn effect_schema() -> &'static DatabaseSchema {
     })
 }
 
-fn render_effect_program(program: &[Vec<Action>], clauses: Option<&[BTreeSet<String>]>) -> String {
+/// Which functions declare `effects [...]` (with the expected effects).
+#[derive(Clone, Copy, PartialEq)]
+enum Clauses {
+    None,
+    Random,
+    All,
+}
+
+fn render_effect_program(
+    program: &[EffectFunction],
+    clauses: Clauses,
+    expected: &[BTreeSet<String>],
+) -> String {
     let mut source = EFFECT_PRELUDE.to_string();
-    for (index, actions) in program.iter().enumerate() {
-        let clause = clauses
-            .map(|all| {
-                format!(
-                    " effects [{}]",
-                    all[index].iter().cloned().collect::<Vec<_>>().join(", ")
-                )
-            })
-            .unwrap_or_default();
+    for (index, function) in program.iter().enumerate() {
+        let declares = match clauses {
+            Clauses::None => false,
+            Clauses::Random => function.declared,
+            Clauses::All => true,
+        };
+        let clause = if declares {
+            let mut items: Vec<String> = expected[index].iter().cloned().collect();
+            if function.calls_parameter() {
+                items.push("e".into());
+            }
+            format!(" effects [{}]", items.join(", "))
+        } else {
+            String::new()
+        };
+        let parameter = if function.higher_order {
+            ", g: (ClienteId) -> ClienteId ! [e]"
+        } else {
+            ""
+        };
+        let result = if function.returns { ": ClienteId" } else { "" };
         source.push_str(&format!(
-            "fun f{index}(id: ClienteId): ClienteId{clause} {{\n"
+            "fun f{index}(id: ClienteId{parameter}){result}{clause} {{\n"
         ));
-        for action in actions {
+        for action in &function.actions {
             let expr = match action {
                 Action::Read => "db.clientes.require(id)".to_string(),
                 Action::Write => "db.clientes.insert { nome = \"x\" }".to_string(),
-                Action::Call(other) => format!("f{other}(id)"),
-                Action::CallViaLambda(other) => format!("aplica({{ x -> f{other}(x) }}, id)"),
+                Action::CallParameter => "g(id)".to_string(),
+                Action::Call(other, arg) => render_call(program, *other, arg, "id"),
+                Action::CallViaLambda(other, arg) => format!(
+                    "aplica({{ x -> {} }}, id)",
+                    render_call(program, *other, arg, "x")
+                ),
             };
             source.push_str(&format!("    val _ = {expr}\n"));
         }
@@ -787,36 +934,69 @@ fn render_effect_program(program: &[Vec<Action>], clauses: Option<&[BTreeSet<Str
     source
 }
 
-/// The expected effects: each function's own operations plus those of every function it can
-/// reach through calls (directly or through a lambda).
-fn reachable_effects(program: &[Vec<Action>]) -> Vec<BTreeSet<String>> {
-    (0..program.len())
-        .map(|start| {
-            let mut effects = BTreeSet::new();
-            let mut stack = vec![start];
-            let mut seen = BTreeSet::new();
-            while let Some(current) = stack.pop() {
-                if !seen.insert(current) {
-                    continue;
-                }
-                for action in &program[current] {
-                    match action {
-                        Action::Read => {
-                            effects.insert("db.read".to_string());
+fn render_call(program: &[EffectFunction], callee: usize, arg: &Arg, key: &str) -> String {
+    if !program[callee].higher_order {
+        return format!("f{callee}({key})");
+    }
+    let arg = match arg {
+        Arg::Reads => "{ y -> db.clientes.require(y).id }".to_string(),
+        Arg::Function(value) if !program[*value].higher_order => format!("f{value}"),
+        Arg::Identity | Arg::Function(_) => "{ y -> y }".to_string(),
+    };
+    format!("f{callee}({key}, {arg})")
+}
+
+/// The expected effects, computed on the program itself (not by the type checker): each
+/// function's own operations plus those of every function it calls (directly or through a
+/// lambda), plus the effects of the argument it passes to a higher-order function that
+/// calls its parameter; iterated to a fixed point, which covers recursion.
+fn reachable_effects(program: &[EffectFunction]) -> Vec<BTreeSet<String>> {
+    let mut effects = vec![BTreeSet::new(); program.len()];
+    loop {
+        let mut changed = false;
+        for (index, function) in program.iter().enumerate() {
+            let mut next: BTreeSet<String> = effects[index].clone();
+            for action in &function.actions {
+                match action {
+                    Action::Read => {
+                        next.insert("db.read".to_string());
+                    }
+                    Action::Write => {
+                        next.insert("db.write".to_string());
+                    }
+                    // The parameter's effects are the caller's (through `e`).
+                    Action::CallParameter => {}
+                    Action::Call(other, arg) | Action::CallViaLambda(other, arg) => {
+                        next.extend(effects[*other].iter().cloned());
+                        if program[*other].calls_parameter() {
+                            match arg {
+                                Arg::Reads => {
+                                    next.insert("db.read".to_string());
+                                }
+                                Arg::Function(value) if !program[*value].higher_order => {
+                                    next.extend(effects[*value].iter().cloned());
+                                }
+                                Arg::Identity | Arg::Function(_) => {}
+                            }
                         }
-                        Action::Write => {
-                            effects.insert("db.write".to_string());
-                        }
-                        Action::Call(other) | Action::CallViaLambda(other) => stack.push(*other),
                     }
                 }
             }
-            effects
-        })
-        .collect()
+            if next != effects[index] {
+                effects[index] = next;
+                changed = true;
+            }
+        }
+        if !changed {
+            return effects;
+        }
+    }
 }
 
-fn inferred_effects(source: &str) -> Result<BTreeMap<String, Vec<String>>, String> {
+type Checked = (BTreeMap<String, Vec<String>>, BTreeMap<String, String>);
+
+/// Effects and schemes of every function, or the diagnostics.
+fn check_effect_program(source: &str) -> Result<Checked, String> {
     let (tokens, mut diagnostics) = lex("effects.bd", source);
     let (program, mut parse_diagnostics) = parse(tokens);
     diagnostics.append(&mut parse_diagnostics);
@@ -827,7 +1007,7 @@ fn inferred_effects(source: &str) -> Result<BTreeMap<String, Vec<String>>, Strin
     if has_errors(&type_diagnostics) {
         return Err(format!("{type_diagnostics:?}"));
     }
-    Ok(typed.effects)
+    Ok((typed.effects, typed.schemes))
 }
 
 proptest! {
@@ -835,22 +1015,26 @@ proptest! {
 
     #[test]
     fn inferred_effects_equal_call_graph_reachability(program in arb_effect_program()) {
-        let source = render_effect_program(&program, None);
-        let effects = inferred_effects(&source).map_err(|error| TestCaseError::fail(format!("{error}\n{source}")))?;
-        for (index, expected) in reachable_effects(&program).into_iter().enumerate() {
+        let expected = reachable_effects(&program);
+        let source = render_effect_program(&program, Clauses::Random, &expected);
+        let (effects, _) = check_effect_program(&source).map_err(|error| TestCaseError::fail(format!("{error}\n{source}")))?;
+        for (index, expected) in expected.iter().enumerate() {
             let found: BTreeSet<String> = effects[&format!("f{index}")].iter().cloned().collect();
-            prop_assert_eq!(&found, &expected, "f{} in\n{}", index, source);
+            prop_assert_eq!(&found, expected, "f{} in\n{}", index, source);
         }
     }
 
     #[test]
     fn declaring_the_inferred_effects_is_stable(program in arb_effect_program()) {
         let expected = reachable_effects(&program);
-        let source = render_effect_program(&program, Some(&expected));
-        let effects = inferred_effects(&source).map_err(|error| TestCaseError::fail(format!("{error}\n{source}")))?;
+        let plain = render_effect_program(&program, Clauses::None, &expected);
+        let (_, before) = check_effect_program(&plain).map_err(|error| TestCaseError::fail(format!("{error}\n{plain}")))?;
+        let annotated = render_effect_program(&program, Clauses::All, &expected);
+        let (effects, after) = check_effect_program(&annotated).map_err(|error| TestCaseError::fail(format!("{error}\n{annotated}")))?;
         for (index, expected) in expected.iter().enumerate() {
             let found: BTreeSet<String> = effects[&format!("f{index}")].iter().cloned().collect();
-            prop_assert_eq!(&found, expected, "f{} in\n{}", index, source);
+            prop_assert_eq!(&found, expected, "f{} in\n{}", index, annotated);
         }
+        prop_assert_eq!(&before, &after, "schemes changed by annotating:\n{}\n---\n{}", plain, annotated);
     }
 }

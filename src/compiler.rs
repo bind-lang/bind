@@ -1659,6 +1659,40 @@ client component CustomerPage(id: CustomerId) {
     }
 
     #[test]
+    fn capabilities_exclude_effects_of_lambdas_never_called() {
+        let prelude = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\n";
+        let uncalled = format!(
+            "{prelude}client component Page(id: CustomerId) {{\n    val load = {{ -> db.customers.require(id) }}\n    UI {{ Text(\"x\") }}\n}}\n"
+        );
+        let (root, config) = fixture(&uncalled, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert!(
+            !app.required_capabilities.contains("db.read"),
+            "{:?}",
+            app.required_capabilities
+        );
+        fs::remove_dir_all(root).unwrap();
+
+        let called = format!(
+            "{prelude}fun reader(id: CustomerId): Customer {{\n    val load = {{ -> db.customers.require(id) }}\n    return load()\n}}\n"
+        );
+        let (root, config) = fixture(&called, SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert!(
+            app.required_capabilities.contains("db.read"),
+            "{:?}",
+            app.required_capabilities
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn legacy_validation_skips_type_parameters_and_function_types() {
         let source = "pure fun <T> ident(x: T): T = x\npure fun aplica(f: (Int) -> Int, x: Int): Int = f(x)\n";
         let (root, config) = fixture(source, EMPTY_SCHEMA);
