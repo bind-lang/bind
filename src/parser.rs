@@ -513,21 +513,51 @@ impl Parser {
     }
 
     /// Comma-separated qualified names up to and including `]`. A token that is not a name
-    /// is reported once; the rest of the list is skipped (to `]` or the end of the line).
+    /// is reported once; the rest of the list is skipped, up to `]` or the end of the line,
+    /// without consuming a `)` that closes an enclosing parameter list. A list still open at
+    /// the end of the file, or when a declaration starts on a later line, is reported.
     fn names_until_bracket(&mut self, names: &mut Vec<String>) {
-        while !self.at_eof() && !self.consume("]") {
+        let line = self.previous_line();
+        loop {
+            if self.consume("]") {
+                return;
+            }
+            if self.at_eof()
+                || (self.peek().span.line > line && is_top_level_start(self.peek_text()))
+            {
+                self.diagnostics.push(Diagnostic::error(
+                    "E1103",
+                    format!(
+                        "Expected `]` to close the effect list, found `{}`.",
+                        self.peek_text()
+                    ),
+                    self.peek().span.clone(),
+                ));
+                return;
+            }
             let start = self.index;
             let name = self.qualified_name();
             self.consume(",");
             if self.index == start {
                 let line = self.peek().span.line;
-                while !self.at_eof() && self.peek().span.line == line && !self.consume("]") {
+                while !self.at_eof()
+                    && self.peek().span.line == line
+                    && self.peek_text() != ")"
+                    && !self.consume("]")
+                {
                     self.advance();
                 }
                 return;
             }
             names.push(name);
         }
+    }
+
+    /// Line of the token just consumed (the current one at the start of the file).
+    fn previous_line(&self) -> usize {
+        self.tokens
+            .get(self.index.saturating_sub(1))
+            .map_or(0, |token| token.span.line)
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
@@ -786,6 +816,41 @@ mod tests {
             assert!(!diagnostics.is_empty(), "{source}");
             assert_eq!(program.functions.len(), 2, "{source}");
             assert_eq!(program.functions[1].name, "h", "{source}");
+        }
+    }
+
+    #[test]
+    fn unterminated_effect_lists_are_reported() {
+        for source in [
+            "server fun f(): Int effects [",
+            "server fun f(): Int effects [db.read",
+            "server fun f(): Int effects [db.read,",
+            "fun g(f: () -> Int ! [",
+        ] {
+            let (tokens, _) = lex("test.bd", source);
+            let (_, diagnostics) = parse(tokens);
+            assert!(!diagnostics.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn effect_list_recovery_stops_at_the_end_of_the_line() {
+        for source in [
+            "fun g(f: () -> Int ! [)\nfun h() = 2\n",
+            "fun g(f: (Int) -> Int ! [db.read)\nfun h() = 2\n",
+            "server fun f(): Int effects [db.read\nfun h() = 2\n",
+        ] {
+            let (tokens, _) = lex("test.bd", source);
+            let (program, diagnostics) = parse(tokens);
+            assert!(!diagnostics.is_empty(), "{source}");
+            assert_eq!(
+                program
+                    .functions
+                    .last()
+                    .map(|function| function.name.as_str()),
+                Some("h"),
+                "{source}"
+            );
         }
     }
 
