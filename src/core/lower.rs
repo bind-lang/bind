@@ -5,7 +5,7 @@
 //! instead of repeating it. A node the checker did not record gets `Type::Error`, which the
 //! validator reports as an internal error.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ast::{self, Function, Program, TypeDecl, TypeKind};
 use crate::diagnostic::Span;
@@ -14,13 +14,14 @@ use crate::schema::DatabaseSchema;
 use crate::syntax::expr::{
     self as syntax, BinaryOp, Block, FieldInit, NodeId, Pattern, Stmt, TypeExpr, UnaryOp,
 };
-use crate::types::effects::{Label, Row};
-use crate::types::env::UI_NODES;
+use crate::types::effects::{Label, Row, RowVarId};
+use crate::types::env::{UI_NODES, builtin_scheme};
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 use crate::types::{Resolution, TypedProgram};
 
 use super::ir::*;
+use super::specialize::{Specializer, default_vars, map_types};
 
 pub fn lower(program: &Program, typed: &TypedProgram, schema: &DatabaseSchema) -> CoreProgram {
     let types = core_types(program);
@@ -233,7 +234,7 @@ fn replace_markers(ty: &Type, markers: &BTreeMap<String, Type>) -> Type {
 // ---- type helpers ------------------------------------------------------------------------
 
 /// Type variables of `ty`, in order of first appearance.
-fn type_vars(ty: &Type, output: &mut Vec<usize>) {
+pub(super) fn type_vars(ty: &Type, output: &mut Vec<usize>) {
     match ty {
         Type::Var(id) => {
             if !output.contains(id) {
@@ -249,8 +250,21 @@ fn type_vars(ty: &Type, output: &mut Vec<usize>) {
     }
 }
 
+/// Row variables of `ty` (the tails of its function rows).
+fn row_tails(ty: &Type, output: &mut BTreeSet<RowVarId>) {
+    match ty {
+        Type::Con(_, args) => args.iter().for_each(|arg| row_tails(arg, output)),
+        Type::Fun(params, result, row) => {
+            params.iter().for_each(|param| row_tails(param, output));
+            row_tails(result, output);
+            output.extend(row.tail);
+        }
+        Type::Var(_) | Type::Error => {}
+    }
+}
+
 /// Binds the variables of `scheme` to the matching parts of `actual` (rows are ignored).
-fn match_scheme(scheme: &Type, actual: &Type, output: &mut BTreeMap<usize, Type>) {
+pub(super) fn match_scheme(scheme: &Type, actual: &Type, output: &mut BTreeMap<usize, Type>) {
     match (scheme, actual) {
         (Type::Var(id), _) => {
             output.entry(*id).or_insert_with(|| actual.clone());
@@ -302,25 +316,6 @@ fn collect_markers(declared: &Type, actual: &Type, output: &mut BTreeMap<String,
     }
 }
 
-/// Schemes of the builtins, with variables 0, 1, ... (mirrors `Checker::install_builtins`).
-fn builtin_scheme(name: &str) -> Type {
-    let var = Type::Var;
-    let list = Type::list;
-    let fun = |params: Vec<Type>, result: Type| Type::Fun(params, Box::new(result), Row::empty());
-    match name {
-        "first" => fun(vec![list(var(0))], Type::option(var(0))),
-        "get" => fun(vec![list(var(0)), Type::con("Int")], Type::option(var(0))),
-        "length" => fun(vec![list(var(0))], Type::con("Int")),
-        "map" => fun(vec![list(var(0)), fun(vec![var(0)], var(1))], list(var(1))),
-        "fold" => fun(
-            vec![list(var(0)), var(1), fun(vec![var(1), var(0)], var(1))],
-            var(1),
-        ),
-        "emptyList" => fun(Vec::new(), list(var(0))),
-        _ => Type::Error,
-    }
-}
-
 fn option_inner(ty: &Type) -> Option<&Type> {
     match ty {
         Type::Con(name, args) if name == "Option" && args.len() == 1 => args.first(),
@@ -337,8 +332,6 @@ fn scalar_name(ty: &Type) -> Option<&str> {
 
 fn binary_prim(op: BinaryOp, operand: &Type) -> Option<Prim> {
     let simple = match op {
-        BinaryOp::And => Some(Prim::And),
-        BinaryOp::Or => Some(Prim::Or),
         BinaryOp::Eq => Some(Prim::Eq),
         BinaryOp::NotEq => Some(Prim::NotEq),
         BinaryOp::Lt => Some(Prim::Lt),
@@ -495,11 +488,19 @@ impl Lowerer<'_> {
             .cloned()
             .unwrap_or(Type::Error);
         type_vars(&signature, &mut self.generics);
-        let Type::Fun(param_types, result, _) = &signature else {
-            return None;
+        let mut effect_rows = BTreeSet::new();
+        row_tails(&signature, &mut effect_rows);
+        // A signature that is not a function of the declared arity cannot be trusted: the
+        // function is kept, with `Type::Error` where the types are missing, for the validator.
+        let (param_types, result) = match &signature {
+            Type::Fun(params, result, _) if params.len() == function.parameters.len() => {
+                (params.clone(), (**result).clone())
+            }
+            Type::Fun(params, _, _) => (params.clone(), Type::Error),
+            _ => (Vec::new(), Type::Error),
         };
         if !function.type_params.is_empty() {
-            for (parameter, actual) in function.parameters.iter().zip(param_types) {
+            for (parameter, actual) in function.parameters.iter().zip(&param_types) {
                 if let Some(type_ref) = &parameter.type_ref {
                     let declared = declared_type(type_ref, &function.span, &function.type_params);
                     collect_markers(&declared, actual, &mut self.markers);
@@ -507,27 +508,42 @@ impl Lowerer<'_> {
             }
             if let Some(type_ref) = &function.return_type {
                 let declared = declared_type(type_ref, &function.span, &function.type_params);
-                collect_markers(&declared, result, &mut self.markers);
+                collect_markers(&declared, &result, &mut self.markers);
             }
         }
-        let params = function
+        let params: Vec<(LocalId, String, Type)> = function
             .parameters
             .iter()
-            .zip(param_types)
-            .map(|(parameter, ty)| {
+            .enumerate()
+            .map(|(index, parameter)| {
                 let local = self.bind(&parameter.name);
-                (local, parameter.name.clone(), self.normalize(ty))
+                let ty = param_types
+                    .get(index)
+                    .map_or(Type::Error, |ty| self.normalize(ty));
+                (local, parameter.name.clone(), ty)
             })
             .collect();
-        let body = self.block(block);
+        let mut body = self.block(block);
+        let mut specializer = Specializer {
+            generics: &self.generics,
+            effect_rows,
+            next_local: self.next_local,
+        };
+        specializer.run(&mut body);
+        self.next_local = specializer.next_local;
+        let generics = self.generics.clone();
+        let default = |ty: &Type| default_vars(ty, &generics);
+        map_types(&mut body, &default);
         let domain = domain(&function.domain);
         Some(CoreFunction {
             name: function.name.clone(),
             endpoint: domain == Domain::Server && !function.component,
             domain,
-            generics: self.generics.clone(),
-            params,
-            result: self.normalize(result),
+            params: params
+                .into_iter()
+                .map(|(local, name, ty)| (local, name, default(&ty)))
+                .collect(),
+            result: default(&self.normalize(&result)),
             effects: self
                 .typed
                 .effects
@@ -535,15 +551,15 @@ impl Lowerer<'_> {
                 .cloned()
                 .unwrap_or_default(),
             body,
+            generics,
         })
     }
 
-    /// Replaces rigid markers by the scheme's variables and variables outside the scheme by
-    /// `Unit` (an unconstrained variable in monomorphic code: the value is never inspected).
+    /// Replaces the rigid markers of an annotated generic body by the scheme's variables.
+    /// Other variables are kept: generalized local `val`s are specialized afterwards, and the
+    /// variables left over are defaulted to `Unit` (see `specialize`).
     fn normalize(&self, ty: &Type) -> Type {
         match ty {
-            Type::Var(id) if self.generics.contains(id) => Type::Var(*id),
-            Type::Var(_) => Type::con("Unit"),
             Type::Con(name, args) if args.is_empty() && name.starts_with('\'') => self
                 .markers
                 .get(name)
@@ -558,7 +574,7 @@ impl Lowerer<'_> {
                 Box::new(self.normalize(result)),
                 row.clone(),
             ),
-            Type::Error => Type::Error,
+            other => other.clone(),
         }
     }
 
@@ -685,6 +701,28 @@ impl Lowerer<'_> {
                 };
                 return self.prim(prim, vec![operand], ty);
             }
+            K::Binary {
+                op: op @ (BinaryOp::And | BinaryOp::Or),
+                left,
+                right,
+            } => {
+                // Short-circuit kept in the structure: `a && b` is `if (a) b else false`,
+                // `a || b` is `if (a) true else b`.
+                let condition = Box::new(self.expr(left));
+                let right = Box::new(self.expr(right));
+                let boolean =
+                    |value| boxed(Type::con("Boolean"), ExprKind::Lit(Literal::Bool(value)));
+                let (then_branch, else_branch) = if *op == BinaryOp::And {
+                    (right, boolean(false))
+                } else {
+                    (boolean(true), right)
+                };
+                ExprKind::If {
+                    condition,
+                    then_branch,
+                    else_branch,
+                }
+            }
             K::Binary { op, left, right } => {
                 let left = self.expr(left);
                 let right = self.expr(right);
@@ -701,7 +739,10 @@ impl Lowerer<'_> {
                 then_branch: Box::new(self.expr(then_branch)),
                 else_branch: Box::new(self.expr(else_branch)),
             },
-            K::When { scrutinee, arms } => self.when(node.id, scrutinee, arms),
+            K::When { scrutinee, arms } => {
+                let (kind, complete) = self.when(node.id, scrutinee, arms);
+                return expr(if complete { ty } else { Type::Error }, kind);
+            }
             K::Lambda { params, body } => self.lambda(params, body, &ty),
             K::Block(block) => return self.block(block),
             K::Return(value) => ExprKind::Return(Box::new(self.expr(value))),
@@ -710,12 +751,12 @@ impl Lowerer<'_> {
         expr(ty, kind)
     }
 
-    /// An operator the lowering cannot make concrete keeps its operands under `Type::Error`,
-    /// for the validator to report.
+    /// An operator the lowering cannot make concrete becomes an error-typed marker, for the
+    /// validator to report.
     fn prim(&self, prim: Option<Prim>, args: Vec<Expr>, ty: Type) -> Expr {
         match prim {
             Some(op) => expr(ty, ExprKind::Prim { op, args }),
-            None => expr(Type::Error, ExprKind::Prim { op: Prim::Eq, args }),
+            None => expr(Type::Error, ExprKind::Lit(Literal::Unit)),
         }
     }
 
@@ -733,7 +774,10 @@ impl Lowerer<'_> {
                 }
             }
             Some(Resolution::Builtin(builtin)) => ExprKind::Builtin {
-                instance: instance(&builtin_scheme(&builtin), &ty),
+                instance: instance(
+                    &builtin_scheme(&builtin).map_or(Type::Error, |scheme| scheme.ty),
+                    &ty,
+                ),
                 name: builtin,
             },
             Some(Resolution::Constructor(ctor) | Resolution::Variant(ctor)) => {
@@ -759,17 +803,16 @@ impl Lowerer<'_> {
         )
     }
 
-    fn type_name_of(&self, ctor: &str) -> String {
-        self.ctors
-            .get(ctor)
-            .map_or_else(|| ctor.to_string(), |def| def.type_name.clone())
-    }
-
+    /// A constructor application; an unknown constructor is typed `Type::Error`.
     fn ctor(&self, ctor: &str, args: Vec<Expr>, ty: Type) -> Expr {
+        let (type_name, ty) = match self.ctors.get(ctor) {
+            Some(def) => (def.type_name.clone(), ty),
+            None => (ctor.to_string(), Type::Error),
+        };
         expr(
             ty,
             ExprKind::Ctor {
-                type_name: self.type_name_of(ctor),
+                type_name,
                 ctor: ctor.to_string(),
                 args,
             },
@@ -995,14 +1038,19 @@ impl Lowerer<'_> {
             .map_or(Type::Error, |(_, ty)| ty)
     }
 
-    fn when(&mut self, id: NodeId, scrutinee: &syntax::Expr, arms: &[syntax::Arm]) -> ExprKind {
+    /// The `Match`, and whether every arm had its elaborated pattern.
+    fn when(
+        &mut self,
+        id: NodeId,
+        scrutinee: &syntax::Expr,
+        arms: &[syntax::Arm],
+    ) -> (ExprKind, bool) {
         let scrutinee = self.expr(scrutinee);
-        let patterns = self
-            .typed
-            .patterns
-            .get(&(self.function.clone(), id))
-            .cloned()
-            .unwrap_or_default();
+        let recorded = self.typed.patterns.get(&(self.function.clone(), id));
+        // Without one elaborated pattern per arm the match cannot be trusted: the `Match` is
+        // typed `Type::Error` (its arms get `_` placeholders).
+        let complete = recorded.is_some_and(|patterns| patterns.len() == arms.len());
+        let patterns = recorded.cloned().unwrap_or_default();
         let arms = arms
             .iter()
             .enumerate()
@@ -1034,10 +1082,11 @@ impl Lowerer<'_> {
                 }
             })
             .collect();
-        ExprKind::Match {
+        let kind = ExprKind::Match {
             scrutinee: Box::new(scrutinee),
             arms,
-        }
+        };
+        (kind, complete)
     }
 
     /// Walks the written pattern with its elaboration, collecting each variable with its type
@@ -1314,7 +1363,7 @@ mod tests {
         );
         assert_eq!(
             body("fun f(a: Int, b: Int) = !(a < b) || a == b", "f"),
-            "Or:Boolean(Not:Boolean(Lt:Boolean(Local(0), Local(1))), Eq:Boolean(Local(0), Local(1)))"
+            "If(Not:Boolean(Lt:Boolean(Local(0), Local(1))), Lit(true), Eq:Boolean(Local(0), Local(1)))"
         );
     }
 
@@ -1525,6 +1574,206 @@ mod tests {
             body("fun f() = 0x1_0000_0000_0000_0000_0000_0000_0000_0000", "f"),
             "Lit(340282366920938463463374607431768211456)"
         );
+    }
+
+    fn checked(source: &str) -> (Program, TypedProgram) {
+        let (tokens, _) = crate::lexer::lex("test.bd", source);
+        let (program, _) = crate::parser::parse(tokens);
+        let (typed, diagnostics) = crate::types::check(&program, &DatabaseSchema::default());
+        assert!(!has_errors(&diagnostics), "{diagnostics:?}");
+        (program, typed)
+    }
+
+    fn let_value<'e>(expr: &'e Expr, name: &str) -> Vec<&'e Expr> {
+        let mut found = Vec::new();
+        if let ExprKind::Let {
+            name: other,
+            value,
+            body,
+            ..
+        } = &expr.kind
+        {
+            if other == name {
+                found.push(value.as_ref());
+            }
+            found.extend(let_value(body, name));
+        }
+        found
+    }
+
+    #[test]
+    fn generalized_vals_are_specialized_to_their_single_use() {
+        let source = "fun f(): Int {\n val e = emptyList()\n length(map(e, { x -> x + 1 }))\n}";
+        let program = compile(source);
+        let values = let_value(&function(&program, "f").body, "e");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].ty, Type::list(Type::con("Int")));
+        assert_eq!(render(values[0]), "Call(Builtin(emptyList[Int]), [])");
+        assert_eq!(
+            body("fun g(): Int? {\n val n = null\n n\n}", "g"),
+            "Let(0 n = None:Int?; Local(0))"
+        );
+        // Unused: the generalized variable defaults to `Unit`.
+        let program = compile("fun h(): Int {\n val e = emptyList()\n 1\n}");
+        let values = let_value(&function(&program, "h").body, "e");
+        assert_eq!(values[0].ty, Type::list(Type::con("Unit")));
+    }
+
+    #[test]
+    fn effect_free_generalized_vals_are_copied_per_instance() {
+        let source = "fun f(): Int {\n val id = { x -> x }\n val s = id(\"a\")\n id(1)\n}";
+        assert_eq!(
+            body(source, "f"),
+            "Let(1 id = Lambda(0 x: String -> Local(0)); Let(4 id = Lambda(3 x: Int -> Local(3)); Let(2 s = Call(Local(1), [Lit(\"a\")]); Call(Local(4), [Lit(1)]))))"
+        );
+        let program = compile(source);
+        let values = let_value(&function(&program, "f").body, "id");
+        let string = Type::con("String");
+        let int = Type::con("Int");
+        assert!(
+            matches!(&values[0].ty, Type::Fun(params, result, _) if params == &vec![string.clone()] && **result == string)
+        );
+        assert!(
+            matches!(&values[1].ty, Type::Fun(params, result, _) if params == &vec![int.clone()] && **result == int)
+        );
+    }
+
+    #[test]
+    fn effectful_generalized_vals_are_never_copied() {
+        let schema = schema(CLIENTES);
+        let once = "server fun f(id: ClienteId): Int effects [db.read] {\n val xs = if (db.clientes.require(id).nome == \"a\") emptyList() else emptyList()\n return length(map(xs, { x -> x + 1 }))\n}";
+        let program = compile_with(&format!("{ENTIDADE}{once}"), &schema);
+        let values = let_value(&function(&program, "f").body, "xs");
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0].ty, Type::list(Type::con("Int")));
+        let twice = "server fun f(id: ClienteId): Int effects [db.read] {\n val xs = if (db.clientes.require(id).nome == \"a\") emptyList() else emptyList()\n val a = length(map(xs, { x -> x + 1 }))\n return length(map(xs, { x -> x == \"b\" }))\n}";
+        let program = compile_with(&format!("{ENTIDADE}{twice}"), &schema);
+        let values = let_value(&function(&program, "f").body, "xs");
+        assert_eq!(values.len(), 1, "an effectful value must not be duplicated");
+    }
+
+    #[test]
+    fn boolean_operators_keep_short_circuit() {
+        let source = "fun even(n: Int): Boolean = n == 0 || odd(n - 1)\nfun odd(n: Int): Boolean = n != 0 && even(n - 1)";
+        assert_eq!(
+            body(source, "even"),
+            "If(Eq:Boolean(Local(0), Lit(0)), Lit(true), Call(Global(odd[]), [IntSub:Int(Local(0), Lit(1))]))"
+        );
+        assert_eq!(
+            body(source, "odd"),
+            "If(NotEq:Boolean(Local(0), Lit(0)), Call(Global(even[]), [IntSub:Int(Local(0), Lit(1))]), Lit(false))"
+        );
+    }
+
+    #[test]
+    fn arguments_keep_their_written_order() {
+        assert_eq!(
+            body(
+                "fun g(a: Int, b: Int) = a\nfun f(x: Int) = g(x + 1, x * 2)",
+                "f"
+            ),
+            "Call(Global(g[]), [IntAdd:Int(Local(0), Lit(1)), IntMul:Int(Local(0), Lit(2))])"
+        );
+    }
+
+    #[test]
+    fn elvis_fallback_runs_only_in_the_null_arm() {
+        assert_eq!(
+            body("fun d(): Int = 0\nfun f(x: Int?) = x ?: d()", "f"),
+            "Match:Int(Local(0), [null => Call(Global(d[]), []); Some(_) 1 value: Int => Local(1)])"
+        );
+    }
+
+    #[test]
+    fn nested_optionals_unwrap_one_layer_at_a_time() {
+        assert_eq!(
+            body(
+                "fun f(x: Int??) = when (x) {\n null -> 0\n y -> y ?: 1\n}",
+                "f"
+            ),
+            "Match:Int(Local(0), [null => Lit(0); Some(_) 1 y: Int? => Match:Int(Local(1), [null => Lit(1); Some(_) 2 value: Int => Local(2)])])"
+        );
+    }
+
+    #[test]
+    fn return_inside_a_when_arm() {
+        assert_eq!(
+            body(
+                "fun f(x: Int?): Int {\n val y = when (x) {\n null -> return 0\n n -> n\n }\n y + 1\n}",
+                "f"
+            ),
+            "Let(2 y = Match:Int(Local(0), [null => Return(Lit(0)); Some(_) 1 n: Int => Local(1)]); IntAdd:Int(Local(2), Lit(1)))"
+        );
+    }
+
+    #[test]
+    fn patterns_nested_under_some_inside_a_constructor() {
+        let source = "sealed class S {\n data class K(val a: Int?, val n: Int)\n}\nfun f(s: S?) = when (s) {\n null -> 0\n K(null, n) -> n\n K(a, n) -> n\n}";
+        assert_eq!(
+            body(source, "f"),
+            "Match:Int(Local(0), [null => Lit(0); Some(K(null, _)) 1 n: Int => Local(1); Some(K(_, _)) 2 a: Int? 3 n: Int => Local(3)])"
+        );
+        let program = compile(source);
+        let ExprKind::Match { arms, .. } = &function(&program, "f").body.kind else {
+            panic!()
+        };
+        let path = |steps: &[(&str, usize)]| -> Vec<(String, usize)> {
+            steps
+                .iter()
+                .map(|(name, index)| (name.to_string(), *index))
+                .collect()
+        };
+        assert_eq!(arms[1].binding_paths, vec![path(&[("Some", 0), ("K", 1)])]);
+        assert_eq!(
+            arms[2].binding_paths,
+            vec![
+                path(&[("Some", 0), ("K", 0)]),
+                path(&[("Some", 0), ("K", 1)])
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_checker_records_leave_error_types() {
+        let source = "fun f(x: Int?): Int = when (x) {\n null -> 0\n n -> n + 1\n}";
+        let schema = DatabaseSchema::default();
+        let (program, mut typed) = checked(source);
+        typed.patterns.clear();
+        let core = lower(&program, &typed, &schema);
+        assert_eq!(function(&core, "f").body.ty, Type::Error);
+
+        let (program, mut typed) = checked(source);
+        typed.signatures.clear();
+        let core = lower(&program, &typed, &schema);
+        let f = function(&core, "f");
+        assert_eq!(f.result, Type::Error);
+        assert_eq!(f.params[0].2, Type::Error);
+
+        let (program, mut typed) = checked("fun f(a: Int) = a + 1");
+        typed.node_types.retain(|_, ty| *ty != Type::con("Int"));
+        let core = lower(&program, &typed, &schema);
+        let f = function(&core, "f");
+        assert_eq!(f.body.ty, Type::Error);
+        assert_eq!(f.body.kind, ExprKind::Lit(Literal::Unit));
+
+        let (program, mut typed) = checked("fun g() = 1\nfun f() = g()");
+        typed.resolutions.clear();
+        let core = lower(&program, &typed, &schema);
+        let ExprKind::Call { callee, .. } = &function(&core, "f").body.kind else {
+            panic!()
+        };
+        assert_eq!(callee.ty, Type::Error);
+    }
+
+    #[test]
+    fn every_builtin_has_a_shared_scheme() {
+        for name in crate::types::env::BUILTINS {
+            let scheme = builtin_scheme(name).unwrap();
+            let mut vars = Vec::new();
+            type_vars(&scheme.ty, &mut vars);
+            assert_eq!(vars, (0..scheme.vars).collect::<Vec<_>>(), "{name}");
+        }
+        assert!(builtin_scheme("listOf").is_none());
     }
 
     #[test]

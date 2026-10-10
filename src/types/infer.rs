@@ -12,7 +12,7 @@ use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
 
 use super::effects::{DB_READ, DB_WRITE, Label, Row, RowState, RowVarId, SERVER_CALL};
-use super::env::{Env, UI_NODES, rigid_vars};
+use super::env::{BUILTINS, Env, UI_NODES, builtin_scheme, rigid_vars};
 use super::exhaustive::{self, Pat};
 use super::ty::*;
 use super::unify::{UnifyError, constrain, unify, unify_rows};
@@ -266,74 +266,29 @@ impl<'a> Checker<'a> {
     }
 
     fn install_builtins(&mut self) {
-        let table = &mut self.table;
-        let list = |ty: &Type| Type::list(ty.clone());
-        let builtins = [
-            (
-                "first",
-                builtin(table, 1, 0, |v, _| {
-                    Type::Fun(
-                        vec![list(&v[0])],
-                        Box::new(Type::option(v[0].clone())),
-                        Row::empty(),
-                    )
-                }),
-            ),
-            (
-                "get",
-                builtin(table, 1, 0, |v, _| {
-                    Type::Fun(
-                        vec![list(&v[0]), Type::con("Int")],
-                        Box::new(Type::option(v[0].clone())),
-                        Row::empty(),
-                    )
-                }),
-            ),
-            (
-                "length",
-                builtin(table, 1, 0, |v, _| {
-                    Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int")), Row::empty())
-                }),
-            ),
-            (
-                "map",
-                builtin(table, 2, 1, |v, r| {
-                    let mapper = Type::Fun(
-                        vec![v[0].clone()],
-                        Box::new(v[1].clone()),
-                        Row::with_tail([], r[0]),
-                    );
-                    Type::Fun(
-                        vec![list(&v[0]), mapper],
-                        Box::new(list(&v[1])),
-                        Row::with_tail([], r[0]),
-                    )
-                }),
-            ),
-            (
-                "fold",
-                builtin(table, 2, 1, |v, r| {
-                    let step = Type::Fun(
-                        vec![v[1].clone(), v[0].clone()],
-                        Box::new(v[1].clone()),
-                        Row::with_tail([], r[0]),
-                    );
-                    Type::Fun(
-                        vec![list(&v[0]), v[1].clone(), step],
-                        Box::new(v[1].clone()),
-                        Row::with_tail([], r[0]),
-                    )
-                }),
-            ),
-            (
-                "emptyList",
-                builtin(table, 1, 0, |v, _| {
-                    Type::Fun(Vec::new(), Box::new(list(&v[0])), Row::empty())
-                }),
-            ),
-        ];
-        for (name, scheme) in builtins {
-            self.globals.insert(name.into(), scheme);
+        for name in BUILTINS {
+            let Some(builtin) = builtin_scheme(name) else {
+                continue;
+            };
+            let types: BTreeMap<TypeVarId, Type> = (0..builtin.vars)
+                .map(|index| (index, self.table.fresh(GENERIC_LEVEL)))
+                .collect();
+            let rows: BTreeMap<RowVarId, RowVarId> = (0..builtin.rows)
+                .map(|index| (index, self.table.fresh_row_var(GENERIC_LEVEL)))
+                .collect();
+            let vars = types
+                .values()
+                .filter_map(|var| match var {
+                    Type::Var(id) => Some(*id),
+                    _ => None,
+                })
+                .collect();
+            let scheme = Scheme {
+                vars,
+                row_vars: rows.values().copied().collect(),
+                ty: substitute(&builtin.ty, &types, &rows),
+            };
+            self.globals.insert((*name).into(), scheme);
         }
     }
 
@@ -2578,33 +2533,6 @@ fn rigid_effect_names(ty: &Type, names: &mut BTreeSet<String>) {
         }
         Type::Con(_, args) => args.iter().for_each(|arg| rigid_effect_names(arg, names)),
         Type::Var(_) | Type::Error => {}
-    }
-}
-
-fn builtin(
-    table: &mut TypeTable,
-    arity: usize,
-    rows: usize,
-    build: impl Fn(&[Type], &[RowVarId]) -> Type,
-) -> Scheme {
-    let vars: Vec<Type> = (0..arity).map(|_| table.fresh(GENERIC_LEVEL)).collect();
-    let row_vars: Vec<RowVarId> = (0..rows)
-        .map(|_| table.fresh_row_var(GENERIC_LEVEL))
-        .collect();
-    let ids = vars
-        .iter()
-        .filter_map(|var| {
-            if let Type::Var(id) = var {
-                Some(*id)
-            } else {
-                None
-            }
-        })
-        .collect();
-    Scheme {
-        vars: ids,
-        row_vars: row_vars.clone(),
-        ty: build(&vars, &row_vars),
     }
 }
 

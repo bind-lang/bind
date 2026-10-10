@@ -68,6 +68,52 @@ pub const UI_NODES: &[&str] = &[
     "Text",
 ];
 
+/// Builtin functions with a fixed signature. `listOf` is variadic and checked on its own.
+pub const BUILTINS: &[&str] = &["first", "get", "length", "map", "fold", "emptyList"];
+
+/// A builtin's type scheme, numbered locally: type variables `0..vars`, row variables `0..rows`.
+/// The single source for the checker (which instantiates it) and the core lowering (which
+/// matches it against use sites).
+pub struct BuiltinScheme {
+    pub vars: usize,
+    pub rows: usize,
+    pub ty: Type,
+}
+
+pub fn builtin_scheme(name: &str) -> Option<BuiltinScheme> {
+    let var = Type::Var;
+    let list = Type::list;
+    let pure = |params: Vec<Type>, result: Type| Type::Fun(params, Box::new(result), Row::empty());
+    let open = |params: Vec<Type>, result: Type| {
+        Type::Fun(params, Box::new(result), Row::with_tail([], 0))
+    };
+    let (vars, rows, ty) = match name {
+        "first" => (1, 0, pure(vec![list(var(0))], Type::option(var(0)))),
+        "get" => (
+            1,
+            0,
+            pure(vec![list(var(0)), Type::con("Int")], Type::option(var(0))),
+        ),
+        "length" => (1, 0, pure(vec![list(var(0))], Type::con("Int"))),
+        "map" => (
+            2,
+            1,
+            open(vec![list(var(0)), open(vec![var(0)], var(1))], list(var(1))),
+        ),
+        "fold" => (
+            2,
+            1,
+            open(
+                vec![list(var(0)), var(1), open(vec![var(1), var(0)], var(1))],
+                var(1),
+            ),
+        ),
+        "emptyList" => (1, 0, pure(Vec::new(), list(var(0)))),
+        _ => return None,
+    };
+    Some(BuiltinScheme { vars, rows, ty })
+}
+
 /// Types `Text(...)` can display, besides distinct types over them.
 const DISPLAY_SCALARS: &[&str] = &[
     "String", "Int", "Long", "Double", "Float", "Decimal", "Boolean", "UUID", "Date", "DateTime",

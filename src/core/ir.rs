@@ -99,14 +99,13 @@ pub enum Prim {
     DurationNeg,
     StringConcat,
     /// Structural equality / ordering on the operand type (`ty` of the operands).
+    /// `&&` and `||` are not primitives: they are lowered to `If`, which keeps short-circuit.
     Eq,
     NotEq,
     Lt,
     LtEq,
     Gt,
     GtEq,
-    And,
-    Or,
     Not,
 }
 
@@ -185,11 +184,17 @@ pub enum ExprKind {
         table: String,
         args: Vec<Expr>,
     },
+    /// Leaves the enclosing function with the value. A `Return` node diverges: its `ty` carries
+    /// no meaning, and validators and backends must accept it wherever any type is expected.
     Return(Box<Expr>),
     /// A UI tree: never part of server code; carried so client lowering (3c) can reuse the IR.
     Ui,
 }
 
+/// Constructor names in `Arm::pattern` and `Arm::binding_paths` are bare (`"B"`, not `"C.B"`),
+/// as in the checker. `"Some"` (with `"null"`) stands for the `Option` layer only when the type
+/// at that position is `Option`; a user constructor may also be named `Some`, so backends tell
+/// them apart by the type of the scrutinee at that point.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arm {
     /// The elaborated pattern (`Some(...)` explicit) recorded by the type checker.
