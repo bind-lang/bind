@@ -3,6 +3,7 @@ mod certified;
 mod cli;
 mod compiler;
 mod config;
+mod core;
 mod diagnostic;
 mod lexer;
 mod parser;

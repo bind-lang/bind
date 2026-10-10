@@ -333,6 +333,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             module_count: files.len(),
         };
     }
+    // Every type-correct program is lowered to the core IR, so the lowering runs on all verified
+    // input. The IR is validated and kept in `VerifiedApplication` by the next step of the
+    // typed code generation (validator and E9001).
+    let _core = crate::core::lower::lower(&program, &typed, &database);
 
     let mut graph = ApplicationGraph::default();
     let type_map: BTreeMap<_, _> = program
