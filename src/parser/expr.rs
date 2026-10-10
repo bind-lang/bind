@@ -27,6 +27,14 @@ pub fn parse_expression_tokens(tokens: &[Token], fallback: &Span) -> (Block, Vec
     (Block { id, stmts, span }, parser.diagnostics)
 }
 
+pub fn parse_block_tokens(tokens: &[Token], fallback: &Span) -> (Block, Vec<Diagnostic>) {
+    let mut parser = ExprParser::new(tokens, fallback);
+    let span = parser.peek().span.clone();
+    let stmts = parser.statements(None);
+    let id = parser.next_id();
+    (Block { id, stmts, span }, parser.diagnostics)
+}
+
 /// Parses a type written as text, such as the `TypeRef` names of declarations.
 #[allow(clippy::result_large_err)]
 pub fn parse_type_text(text: &str, span: &Span) -> Result<TypeExpr, Diagnostic> {
@@ -269,14 +277,19 @@ impl ExprParser {
         let mut expr = self.primary()?;
         loop {
             if self.is("(") && self.same_line() {
-                let args = self.arguments()?;
+                let mut args = self.arguments()?;
+                let children = self.trailing(&mut args);
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::Call { callee: Box::new(expr), args, children: None }, span);
+                expr = self.node(ExprKind::Call { callee: Box::new(expr), args, children }, span);
             } else if self.is(".") {
                 self.advance();
                 let name = self.identifier()?;
                 let span = expr.span.clone();
-                expr = self.node(ExprKind::Field { target: Box::new(expr), name }, span);
+                expr = self.node(ExprKind::Field { target: Box::new(expr), name }, span.clone());
+                if self.is("{") && self.same_line() && self.looks_like_builder() {
+                    let fields = self.builder_fields()?;
+                    expr = self.node(ExprKind::Builder { target: Box::new(expr), fields }, span);
+                }
             } else if self.adjacent_pair("?", ".") {
                 self.advance();
                 self.advance();
@@ -287,6 +300,11 @@ impl ExprParser {
                 let span = self.advance().span;
                 self.advance();
                 self.removed("!!", span);
+            } else if self.is("{") && self.same_line() && matches!(expr.kind, ExprKind::Name(_)) {
+                let mut args = Vec::new();
+                let children = self.trailing(&mut args);
+                let span = expr.span.clone();
+                expr = self.node(ExprKind::Call { callee: Box::new(expr), args, children }, span);
             } else {
                 break;
             }
@@ -362,6 +380,8 @@ impl ExprParser {
                     self.advance();
                     Some(self.node(ExprKind::Null, token.span))
                 }
+                "if" => self.if_expression(),
+                "when" => self.when_expression(),
                 "return" => {
                     self.advance();
                     let value = self.expression()?;
@@ -386,9 +406,343 @@ impl ExprParser {
                 self.expect(")")?;
                 Some(inner)
             }
+            TokenKind::Symbol if token.text == "{" && self.looks_like_lambda() => self.lambda(),
+            TokenKind::Symbol if token.text == "{" => {
+                self.error(
+                    "E7004",
+                    "A block cannot be used as a value here; write a lambda as `{ x -> ... }`.",
+                    token.span,
+                );
+                None
+            }
             TokenKind::Symbol => {
                 self.error("E7005", format!("Expected an expression, found `{}`.", token.text), token.span);
                 None
+            }
+        }
+    }
+
+    // ---- statements and blocks ----------------------------------------------------
+
+    /// Skips to a plausible statement boundary after an error.
+    fn recover(&mut self) {
+        let mut depth = 0usize;
+        while !self.at_end() {
+            if depth == 0
+                && (self.is(";")
+                    || self.is("}")
+                    || self.is(")")
+                    || (self.nesting == 0 && self.index > 0 && self.peek().span.line != self.previous_line()))
+            {
+                return;
+            }
+            if self.is("(") || self.is("{") || self.is("[") {
+                depth += 1;
+            }
+            if (self.is(")") || self.is("}") || self.is("]")) && depth > 0 {
+                depth -= 1;
+            }
+            self.advance();
+        }
+    }
+
+    fn at_close(&self, close: Option<&str>) -> bool {
+        close.is_some_and(|text| self.is(text))
+    }
+
+    fn end_of_item(&mut self, close: Option<&str>) {
+        if self.at_end() || self.is(";") || self.at_close(close) || !self.same_line() {
+            return;
+        }
+        let token = self.peek().clone();
+        self.error("E7005", format!("Expected a new line or `;` before {}.", describe(&token)), token.span);
+        self.recover();
+    }
+
+    fn statements(&mut self, close: Option<&str>) -> Vec<Stmt> {
+        let mut stmts = Vec::new();
+        loop {
+            while self.consume(";") {}
+            if self.at_end() || self.at_close(close) {
+                break;
+            }
+            let start = self.index;
+            match self.statement() {
+                Some(stmt) => {
+                    stmts.push(stmt);
+                    self.end_of_item(close);
+                }
+                None => self.recover(),
+            }
+            if self.index == start {
+                self.advance();
+            }
+        }
+        stmts
+    }
+
+    fn statement(&mut self) -> Option<Stmt> {
+        if self.is("val") {
+            let span = self.advance().span;
+            let name = self.identifier()?;
+            let annotation = if self.consume(":") { Some(self.type_expr()?) } else { None };
+            self.expect("=")?;
+            let value = self.expression()?;
+            return Some(Stmt::Val { name, annotation, value, span });
+        }
+        self.expression().map(Stmt::Expr)
+    }
+
+    fn block(&mut self) -> Block {
+        let span = self.peek().span.clone();
+        let saved = std::mem::replace(&mut self.nesting, 0);
+        let _ = self.expect("{");
+        let stmts = self.statements(Some("}"));
+        let _ = self.expect("}");
+        self.nesting = saved;
+        Block { id: self.next_id(), stmts, span }
+    }
+
+    /// `{ x, y -> ... }` or `{ -> ... }`.
+    fn looks_like_lambda(&self) -> bool {
+        let mut offset = 1;
+        if self.peek_at(offset).text == "->" {
+            return true;
+        }
+        loop {
+            if self.peek_at(offset).kind != TokenKind::Identifier {
+                return false;
+            }
+            match self.peek_at(offset + 1).text.as_str() {
+                "," => offset += 2,
+                "->" => return true,
+                _ => return false,
+            }
+        }
+    }
+
+    fn lambda(&mut self) -> Option<Expr> {
+        let span = self.peek().span.clone();
+        let saved = std::mem::replace(&mut self.nesting, 0);
+        self.advance(); // `{`, guaranteed by `looks_like_lambda`
+        let mut params = Vec::new();
+        while !self.is("->") {
+            let token = self.advance();
+            params.push((token.text, token.span));
+            self.consume(",");
+        }
+        self.advance(); // `->`
+        let body_span = self.peek().span.clone();
+        let stmts = self.statements(Some("}"));
+        let closed = self.expect("}").is_some();
+        self.nesting = saved;
+        let body = Block { id: self.next_id(), stmts, span: body_span };
+        if !closed {
+            return None;
+        }
+        Some(self.node(ExprKind::Lambda { params, body }, span))
+    }
+
+    /// A `{` on the same line after a call: a trailing lambda argument or a UI child block.
+    fn trailing(&mut self, args: &mut Vec<Expr>) -> Option<Block> {
+        if !(self.is("{") && self.same_line()) {
+            return None;
+        }
+        if self.looks_like_lambda() {
+            if let Some(lambda) = self.lambda() {
+                args.push(lambda);
+            }
+            return None;
+        }
+        Some(self.block())
+    }
+
+    fn looks_like_builder(&self) -> bool {
+        self.peek_at(1).kind == TokenKind::Identifier && self.peek_at(2).text == "="
+    }
+
+    fn builder_fields(&mut self) -> Option<Vec<FieldInit>> {
+        let saved = std::mem::replace(&mut self.nesting, 0);
+        self.advance(); // `{`
+        let mut fields = Vec::new();
+        loop {
+            while self.consume(";") {}
+            if self.is("}") || self.at_end() {
+                break;
+            }
+            let start = self.index;
+            match self.field_init() {
+                Some(field) => {
+                    fields.push(field);
+                    self.end_of_item(Some("}"));
+                }
+                None => self.recover(),
+            }
+            if self.index == start {
+                self.advance();
+            }
+        }
+        let closed = self.expect("}").is_some();
+        self.nesting = saved;
+        closed.then_some(fields)
+    }
+
+    fn field_init(&mut self) -> Option<FieldInit> {
+        let span = self.peek().span.clone();
+        let name = self.identifier()?;
+        self.expect("=")?;
+        let value = self.expression()?;
+        Some(FieldInit { name, value, span })
+    }
+
+    fn branch(&mut self) -> Option<Expr> {
+        if self.is("{") {
+            let span = self.peek().span.clone();
+            let block = self.block();
+            return Some(self.node(ExprKind::Block(block), span));
+        }
+        self.expression()
+    }
+
+    fn parenthesized(&mut self) -> Option<Expr> {
+        self.expect("(")?;
+        self.nesting += 1;
+        let inner = self.expression();
+        self.nesting -= 1;
+        let inner = inner?;
+        self.expect(")")?;
+        Some(inner)
+    }
+
+    fn if_expression(&mut self) -> Option<Expr> {
+        let span = self.advance().span;
+        let condition = self.parenthesized()?;
+        let then_branch = self.branch()?;
+        if !self.consume("else") {
+            let token = self.peek().clone();
+            self.error("E7005", "`if` is an expression in Bind and requires an `else` branch.", token.span);
+            return None;
+        }
+        let else_branch = self.branch()?;
+        Some(self.node(
+            ExprKind::If {
+                condition: Box::new(condition),
+                then_branch: Box::new(then_branch),
+                else_branch: Box::new(else_branch),
+            },
+            span,
+        ))
+    }
+
+    fn when_expression(&mut self) -> Option<Expr> {
+        let span = self.advance().span;
+        if !self.is("(") {
+            self.error("E7004", "`when` without a subject is not supported; write `when (value) { ... }`.", span);
+            return None;
+        }
+        let scrutinee = self.parenthesized()?;
+        let saved = std::mem::replace(&mut self.nesting, 0);
+        if self.expect("{").is_none() {
+            self.nesting = saved;
+            return None;
+        }
+        let mut arms = Vec::new();
+        loop {
+            while self.consume(";") {}
+            if self.is("}") || self.at_end() {
+                break;
+            }
+            let start = self.index;
+            match self.arm() {
+                Some(arm) => {
+                    arms.push(arm);
+                    self.end_of_item(Some("}"));
+                }
+                None => self.recover(),
+            }
+            if self.index == start {
+                self.advance();
+            }
+        }
+        let closed = self.expect("}").is_some();
+        self.nesting = saved;
+        if !closed {
+            return None;
+        }
+        Some(self.node(ExprKind::When { scrutinee: Box::new(scrutinee), arms }, span))
+    }
+
+    fn arm(&mut self) -> Option<Arm> {
+        let span = self.peek().span.clone();
+        let pattern = self.pattern()?;
+        self.expect("->")?;
+        let body = self.branch()?;
+        Some(Arm { pattern, body, span })
+    }
+
+    fn pattern(&mut self) -> Option<Pattern> {
+        if self.is("-") && self.peek_at(1).kind == TokenKind::Number {
+            self.advance();
+            let number = self.advance();
+            return Some(self.number_pattern(&number, "-"));
+        }
+        let token = self.peek().clone();
+        match token.kind {
+            TokenKind::Number => {
+                self.advance();
+                Some(self.number_pattern(&token, ""))
+            }
+            TokenKind::String => {
+                self.advance();
+                if has_interpolation(&token.text) {
+                    self.removed("interpolation", token.span.clone());
+                }
+                Some(Pattern::Str(token.text, token.span))
+            }
+            TokenKind::Identifier => {
+                self.advance();
+                match token.text.as_str() {
+                    "_" | "else" => Some(Pattern::Wildcard),
+                    "null" => Some(Pattern::Null(token.span)),
+                    "true" | "false" => Some(Pattern::Bool(token.text == "true", token.span)),
+                    _ => {
+                        let mut name = token.text.clone();
+                        while self.is(".") && self.peek_at(1).kind == TokenKind::Identifier {
+                            self.advance();
+                            name = self.advance().text;
+                        }
+                        if !(self.is("(") && self.same_line()) {
+                            return Some(Pattern::Name(name, token.span));
+                        }
+                        self.advance();
+                        let mut args = Vec::new();
+                        while !self.is(")") && !self.at_end() {
+                            args.push(self.pattern()?);
+                            if !self.consume(",") {
+                                break;
+                            }
+                        }
+                        self.expect(")")?;
+                        Some(Pattern::Constructor { name, args, span: token.span })
+                    }
+                }
+            }
+            _ => {
+                self.error("E7005", format!("Expected a pattern, found {}.", describe(&token)), token.span);
+                None
+            }
+        }
+    }
+
+    fn number_pattern(&mut self, token: &Token, sign: &str) -> Pattern {
+        match classify_number(&token.text) {
+            Ok(NumberLiteral::Int(text)) => Pattern::Int(format!("{sign}{text}"), token.span.clone()),
+            Ok(NumberLiteral::Double(text) | NumberLiteral::Float(text)) => {
+                Pattern::Double(format!("{sign}{text}"), token.span.clone())
+            }
+            Err(message) => {
+                self.error("E7004", message, token.span.clone());
+                Pattern::Wildcard
             }
         }
     }
@@ -562,5 +916,76 @@ mod tests {
         assert_eq!(render("((Int)->Int)?"), "((Int) -> Int)?");
         assert_eq!(render("Int??"), "Int??");
         assert!(parse_type_text("List<", &span).is_err());
+    }
+
+    fn block(source: &str) -> String {
+        let (block, diagnostics) = parse_block_tokens(&tokens(source), &Span::default());
+        assert!(diagnostics.is_empty(), "{source}: {diagnostics:?}");
+        render_block(&block)
+    }
+
+    fn block_codes(source: &str) -> Vec<&'static str> {
+        let (_, diagnostics) = parse_block_tokens(&tokens(source), &Span::default());
+        diagnostics.iter().map(|item| item.code).collect()
+    }
+
+    #[test]
+    fn parses_statements_separated_by_newlines_and_semicolons() {
+        assert_eq!(block("val x = 1\nval y: Int = x + 1\ny"), "{ val x = 1; val y: Int = (x + 1); y }");
+        assert_eq!(block("a; b"), "{ a; b }");
+        assert_eq!(block(""), "{ }");
+        assert_eq!(block_codes("a b"), vec!["E7005"]);
+    }
+
+    #[test]
+    fn operator_on_next_line_starts_a_new_statement() {
+        assert_eq!(block("val y = a\n    - b\ny"), "{ val y = a; (-b); y }");
+    }
+
+    #[test]
+    fn parses_if_and_requires_else() {
+        assert_eq!(block("if (c) 1 else 2"), "{ (if (c) 1 else 2) }");
+        assert_eq!(block("if (c) {\n    1\n} else {\n    2\n}"), "{ (if (c) { 1 } else { 2 }) }");
+        assert_eq!(block_codes("if (c) 1"), vec!["E7005"]);
+    }
+
+    #[test]
+    fn parses_when_with_patterns() {
+        assert_eq!(
+            block("when (p) {\n    Pago(v, _) -> v\n    Cancelado -> 0\n    else -> 1\n}"),
+            "{ when (p) { Pago(v, _) -> v; Cancelado -> 0; _ -> 1 } }"
+        );
+        assert_eq!(
+            block("when (x) { null -> 0; -1 -> 1; \"a\" -> 2; true -> 3; Status.Ativo -> 4; n -> n }"),
+            "{ when (x) { null -> 0; -1 -> 1; \"a\" -> 2; true -> 3; Ativo -> 4; n -> n } }"
+        );
+        assert_eq!(block_codes("when { x -> 1 }"), vec!["E7004"]);
+    }
+
+    #[test]
+    fn parses_lambdas_and_trailing_blocks() {
+        assert_eq!(block("val f = { x, y -> x + y }"), "{ val f = ({ x, y -> (x + y) }) }");
+        assert_eq!(block("val g = { -> 1 }"), "{ val g = ({ -> 1 }) }");
+        assert_eq!(block("map(xs) { x -> x + 1 }"), "{ map(xs, ({ x -> (x + 1) })) }");
+        assert_eq!(
+            block("UI {\n    Div(\"card\") {\n        Text(\"a\")\n        Text(b.name)\n    }\n}"),
+            "{ UI() { Div(\"card\") { Text(\"a\"); Text(b.name) } } }"
+        );
+        assert_eq!(block_codes("val h = { x }"), vec!["E7004"]);
+    }
+
+    #[test]
+    fn parses_database_insert_builders() {
+        assert_eq!(
+            block("return db.customers.insert {\n    name = name\n    email = email\n}"),
+            "{ (return db.customers.insert { name = name; email = email }) }"
+        );
+    }
+
+    #[test]
+    fn recovers_after_removed_constructs() {
+        assert_eq!(block_codes("var x = 1\nx"), vec!["E7001"]);
+        assert_eq!(block_codes("while (c) {\n    a\n}\nb"), vec!["E7001"]);
+        assert_eq!(block_codes("for (x in xs) {\n    a\n}"), vec!["E7001"]);
     }
 }

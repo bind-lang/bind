@@ -118,9 +118,10 @@ pub struct Function {
     pub return_type: Option<TypeRef>,
     pub effects: Vec<String>,
     pub requires: Vec<String>,
-    #[allow(dead_code)] // consumed by the type checker in later tasks
     pub body_kind: BodyKind,
     pub body: Vec<Token>,
+    /// Parsed body; `None` for functions without a body.
+    pub expr: Option<crate::syntax::expr::Block>,
     pub span: Span,
 }
 

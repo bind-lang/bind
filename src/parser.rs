@@ -424,6 +424,19 @@ impl Parser {
         } else {
             (BodyKind::Absent, Vec::new())
         };
+        let expr = match body_kind {
+            BodyKind::Block => {
+                let (block, mut diagnostics) = expr::parse_block_tokens(&body, &span);
+                self.diagnostics.append(&mut diagnostics);
+                Some(block)
+            }
+            BodyKind::Expression => {
+                let (block, mut diagnostics) = expr::parse_expression_tokens(&body, &span);
+                self.diagnostics.append(&mut diagnostics);
+                Some(block)
+            }
+            BodyKind::Absent => None,
+        };
         Some(Function {
             name,
             domain,
@@ -436,6 +449,7 @@ impl Parser {
             requires,
             body_kind,
             body,
+            expr,
             span,
         })
     }
@@ -746,5 +760,28 @@ mod tests {
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_eq!(program.types.len(), 2);
         assert_eq!(program.functions[0].effects, vec!["db.read"]);
+    }
+
+    #[test]
+    fn attaches_parsed_bodies_to_functions() {
+        let program = parse_source(
+            "fun um() = 1\nfun dois(): Int {\n    val x = 1\n    x + 1\n}\nexternal fun tres(): Int\n",
+        );
+        let rendered: Vec<Option<String>> = program
+            .functions
+            .iter()
+            .map(|function| function.expr.as_ref().map(crate::syntax::expr::render_block))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![Some("{ 1 }".into()), Some("{ val x = 1; (x + 1) }".into()), None]
+        );
+    }
+
+    #[test]
+    fn reports_body_syntax_errors() {
+        let (tokens, _) = lex("test.bd", "fun f(): Int {\n    var x = 1\n    x\n}\n");
+        let (_, diagnostics) = parse(tokens);
+        assert_eq!(diagnostics.iter().map(|item| item.code).collect::<Vec<_>>(), vec!["E7001"]);
     }
 }
