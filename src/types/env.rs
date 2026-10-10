@@ -584,15 +584,11 @@ fn contains_non_equatable(te: &TypeExpr, params: &[String], set: &BTreeSet<Strin
     }
 }
 
-/// Type parameters inside the body of an annotated function: they only equal themselves.
-/// Identifier segments (ASCII letters, digits, `_`) separated by at most one dot.
+/// Identifier segments (letters, digits, `_`) separated by at most one dot.
 fn is_effect_name(name: &str) -> bool {
     name.split('.').count() <= 2
         && name.split('.').all(|segment| {
-            !segment.is_empty()
-                && segment
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            !segment.is_empty() && segment.chars().all(|c| c.is_alphanumeric() || c == '_')
         })
 }
 
@@ -604,6 +600,7 @@ fn type_span(te: &TypeExpr) -> Span {
     }
 }
 
+/// Type parameters inside the body of an annotated function: they only equal themselves.
 pub fn rigid_vars(params: &[String]) -> BTreeMap<String, Type> {
     params
         .iter()

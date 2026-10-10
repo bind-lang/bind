@@ -508,11 +508,26 @@ impl Parser {
         if !self.consume("[") {
             return names;
         }
-        while !self.at_eof() && !self.consume("]") {
-            names.push(self.qualified_name());
-            self.consume(",");
-        }
+        self.names_until_bracket(&mut names);
         names
+    }
+
+    /// Comma-separated qualified names up to and including `]`. A token that is not a name
+    /// is reported once; the rest of the list is skipped (to `]` or the end of the line).
+    fn names_until_bracket(&mut self, names: &mut Vec<String>) {
+        while !self.at_eof() && !self.consume("]") {
+            let start = self.index;
+            let name = self.qualified_name();
+            self.consume(",");
+            if self.index == start {
+                let line = self.peek().span.line;
+                while !self.at_eof() && self.peek().span.line == line && !self.consume("]") {
+                    self.advance();
+                }
+                return;
+            }
+            names.push(name);
+        }
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
@@ -526,10 +541,7 @@ impl Parser {
                     self.advance();
                     self.advance();
                     let mut effects = Vec::new();
-                    while !self.at_eof() && !self.consume("]") {
-                        effects.push(self.qualified_name());
-                        self.consume(",");
-                    }
+                    self.names_until_bracket(&mut effects);
                     name.push_str(&format!("![{}]", effects.join(",")));
                 }
                 return Some(TypeRef {
@@ -760,6 +772,21 @@ mod tests {
         let (program, diagnostics) = parse(tokens);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn non_identifier_in_effect_lists_terminates_with_an_error() {
+        for source in [
+            "fun g(f: (Int) -> Int ! [1]): Int = 1\nfun h() = 2\n",
+            "server fun f(): Int effects [1] = 1\nfun h() = 2\n",
+            "server fun f(): Int requires [1] = 1\nfun h() = 2\n",
+        ] {
+            let (tokens, _) = lex("test.bd", source);
+            let (program, diagnostics) = parse(tokens);
+            assert!(!diagnostics.is_empty(), "{source}");
+            assert_eq!(program.functions.len(), 2, "{source}");
+            assert_eq!(program.functions[1].name, "h", "{source}");
+        }
     }
 
     #[test]
