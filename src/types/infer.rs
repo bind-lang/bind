@@ -1306,6 +1306,11 @@ mod tests {
     const PEDIDO: &str = "sealed class Pedido {\n    data class Pendente(val itens: Int)\n    data class Pago(val valor: Money)\n    data object Cancelado\n}\n";
 
     #[test]
+    fn nested_optional_annotation_is_supported() {
+        assert_eq!(scheme("fun f(a: Int??): Int? = a ?: null", "f"), "(Int??) -> Int?");
+    }
+
+    #[test]
     fn infers_principal_types() {
         assert_eq!(scheme("fun ident(x) = x", "ident"), "('a) -> 'a");
         assert_eq!(scheme("fun constante(x, y) = x", "constante"), "('a, 'b) -> 'a");

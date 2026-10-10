@@ -516,7 +516,7 @@ impl Parser {
                     nullable: false,
                 });
             }
-            let nullable = self.consume("?");
+            let nullable = self.question_marks(&mut name);
             return Some(TypeRef { name, nullable });
         }
         let mut name = self.identifier()?;
@@ -534,8 +534,21 @@ impl Parser {
                 name.push_str(&text);
             }
         }
-        let nullable = self.consume("?");
+        let nullable = self.question_marks(&mut name);
         Some(TypeRef { name, nullable })
+    }
+
+    /// Consumes trailing `?` markers; the first sets nullability, each extra one nests another
+    /// option by appending `?` to the name (so `Int??` is `{ name: "Int?", nullable: true }`).
+    fn question_marks(&mut self, name: &mut String) -> bool {
+        let mut nullable = false;
+        while self.consume("?") {
+            if nullable {
+                name.push('?');
+            }
+            nullable = true;
+        }
+        nullable
     }
 
     fn block_contents(&mut self) -> Vec<Token> {
@@ -704,6 +717,14 @@ mod tests {
         let (program, diagnostics) = parse(tokens);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    #[test]
+    fn parses_nested_optional_types() {
+        let program = parse_source("fun f(a: Int??, b: Int?): Int? = a ?: b\n");
+        let function = &program.functions[0];
+        assert_eq!(function.parameters[0].declared_type().display(), "Int??");
+        assert_eq!(function.parameters[1].declared_type().display(), "Int?");
     }
 
     #[test]

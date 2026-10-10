@@ -555,7 +555,8 @@ fn validate_type(
         .name
         .split(['<', ','])
         .next()
-        .unwrap_or(&type_ref.name);
+        .unwrap_or(&type_ref.name)
+        .trim_end_matches('?');
     let builtins = [
         "Unit",
         "String",
@@ -770,7 +771,7 @@ fn valid_environment_name(value: &str) -> bool {
 }
 
 fn certified_wire_type(name: &str, program: &Program) -> bool {
-    let base = name.split('<').next().unwrap_or(name);
+    let base = name.split('<').next().unwrap_or(name).trim_end_matches('?');
     let scalar = [
         "Unit", "String", "Int", "Float", "Double", "Decimal", "Boolean", "UUID", "Date",
         "DateTime", "Instant", "Duration", "Money", "Email", "Url",
