@@ -8,9 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::ast::{Function, Program, TypeKind, TypeRef};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::parser::expr::parse_type_text;
+use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
 
-use super::env::{Env, rigid_vars};
+use super::env::{Env, UI_NODES, rigid_vars};
 use super::exhaustive::{self, Pat};
 use super::ty::*;
 use super::unify::{UnifyError, constrain, unify};
@@ -29,8 +30,8 @@ pub struct TypedProgram {
     pub node_types: BTreeMap<(String, NodeId), Type>,
 }
 
-pub fn check_program(program: &Program, env: &Env) -> (TypedProgram, Vec<Diagnostic>) {
-    let mut checker = Checker::new(env);
+pub fn check_program(program: &Program, env: &Env, schema: &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>) {
+    let mut checker = Checker::new(env, schema);
     checker.run(program);
     let typed = checker.finish(program);
     (typed, checker.diagnostics)
@@ -38,6 +39,7 @@ pub fn check_program(program: &Program, env: &Env) -> (TypedProgram, Vec<Diagnos
 
 struct Checker<'a> {
     env: &'a Env,
+    schema: &'a DatabaseSchema,
     table: TypeTable,
     level: u32,
     globals: BTreeMap<String, Scheme>,
@@ -53,9 +55,10 @@ struct Checker<'a> {
 }
 
 impl<'a> Checker<'a> {
-    fn new(env: &'a Env) -> Self {
+    fn new(env: &'a Env, schema: &'a DatabaseSchema) -> Self {
         Self {
             env,
+            schema,
             table: TypeTable::default(),
             level: 0,
             globals: BTreeMap::new(),
@@ -74,6 +77,7 @@ impl<'a> Checker<'a> {
 
     fn run(&mut self, program: &Program) {
         self.install_builtins();
+        self.install_environment(program);
         for function in &program.functions {
             self.function_spans.insert(function.name.clone(), function.span.clone());
         }
@@ -89,6 +93,14 @@ impl<'a> Checker<'a> {
         }
         for function in annotated {
             self.check_annotated(function);
+        }
+    }
+
+    fn install_environment(&mut self, program: &Program) {
+        for declaration in &program.environment {
+            let base = self.lower_ref(&declaration.type_ref, &declaration.span, &BTreeMap::new(), true);
+            let ty = if declaration.optional { Type::option(base) } else { base };
+            self.globals.insert(declaration.name.clone(), Scheme::mono(ty));
         }
     }
 
@@ -522,7 +534,7 @@ impl<'a> Checker<'a> {
                 }
                 self.fresh()
             }
-            ExprKind::Builder { fields, .. } => self.infer_builder(fields, &expr.span),
+            ExprKind::Builder { target, fields } => self.infer_builder(target, fields, &expr.span),
         };
         self.record(expr.id, &ty, &expr.span);
         ty
@@ -538,6 +550,10 @@ impl<'a> Checker<'a> {
         if self.env.ctors.contains_key(name) {
             return self.constructor_value(name);
         }
+        if UI_NODES.contains(&name) {
+            self.error("E7004", format!("UI node `{name}` must be called, e.g. `{name}(...)`."), span);
+            return Type::Error;
+        }
         self.error("E7103", format!("Unknown name `{name}`."), span);
         Type::Error
     }
@@ -549,10 +565,19 @@ impl<'a> Checker<'a> {
 
     fn infer_call(&mut self, callee: &Expr, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
         if let ExprKind::Name(name) = &callee.kind
-            && name == "listOf"
             && !self.is_shadowed(name)
         {
-            return self.infer_list_of(args, children, span);
+            if UI_NODES.contains(&name.as_str()) {
+                return self.infer_ui(name, args, children, span);
+            }
+            if name == "listOf" {
+                return self.infer_list_of(args, children, span);
+            }
+        }
+        if let Some((table, method)) = db_method(callee)
+            && !self.is_shadowed("db")
+        {
+            return self.infer_db_call(table, method, args, span);
         }
         if let Some(block) = children {
             self.error("E7004", "Only UI nodes accept a child block.", &block.span);
@@ -656,6 +681,27 @@ impl<'a> Checker<'a> {
     }
 
     fn infer_field(&mut self, target: &Expr, name: &str, span: &Span) -> Type {
+        if let ExprKind::Name(base) = &target.kind
+            && !self.is_shadowed(base)
+        {
+            if base == "server" {
+                return match self.globals.get(name).cloned() {
+                    Some(scheme) => instantiate(&mut self.table, &scheme, self.level),
+                    None => {
+                        self.error("E7103", format!("`server.{name}` does not name a function."), span);
+                        Type::Error
+                    }
+                };
+            }
+            if base == "db" {
+                self.error(
+                    "E7004",
+                    "Database tables are used through `db.<table>.require(...)`, `find(...)` or `insert { ... }`.",
+                    span,
+                );
+                return Type::Error;
+            }
+        }
         if let ExprKind::Name(base) = &target.kind
             && !self.is_shadowed(base)
             && let Some(info) = self.env.types.get(base)
@@ -785,12 +831,160 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_builder(&mut self, fields: &[FieldInit], span: &Span) -> Type {
+    fn infer_builder(&mut self, target: &Expr, fields: &[FieldInit], span: &Span) -> Type {
+        let insert = db_method(target).filter(|(_, method)| *method == "insert" && !self.is_shadowed("db"));
+        let Some((table, _)) = insert else {
+            for field in fields {
+                self.infer(&field.value);
+            }
+            self.error("E7004", "`{ field = value }` blocks are only supported on `db.<table>.insert`.", span);
+            return Type::Error;
+        };
+        let schema = self.schema;
+        let Some((_, model)) = self.db_table(table, span) else {
+            for field in fields {
+                self.infer(&field.value);
+            }
+            return Type::Error;
+        };
+        let columns = &schema.tables[table].columns;
+        let mut seen = BTreeSet::new();
         for field in fields {
-            self.infer(&field.value);
+            let found = self.infer(&field.value);
+            if !seen.insert(field.name.as_str()) {
+                self.error("E7110", format!("Column `{}` is assigned more than once.", field.name), &field.span);
+                continue;
+            }
+            match columns.get(&field.name) {
+                Some(column) => {
+                    let expected = self.column_type(column, &field.span);
+                    let reason = Some(format!("column `{table}.{}`", field.name));
+                    self.unify_at(&expected, &found, &field.value.span, reason);
+                }
+                None => self.error("E7104", format!("Table `{table}` has no column `{}`.", field.name), &field.span),
+            }
         }
-        self.error("E7004", "`{ field = value }` blocks are only supported on `db.<table>.insert`.", span);
-        Type::Error
+        model
+    }
+
+    fn infer_db_call(&mut self, table: &str, method: &str, args: &[Expr], span: &Span) -> Type {
+        let Some((key, model)) = self.db_table(table, span) else {
+            for arg in args {
+                self.infer(arg);
+            }
+            return Type::Error;
+        };
+        if !matches!(method, "require" | "find") {
+            for arg in args {
+                self.infer(arg);
+            }
+            self.error(
+                "E7004",
+                format!("Unsupported table operation `{method}`; use `require`, `find` or `insert {{ ... }}`."),
+                span,
+            );
+            return Type::Error;
+        }
+        if args.len() != 1 {
+            for arg in args {
+                self.infer(arg);
+            }
+            self.error(
+                "E7102",
+                format!("`db.{table}.{method}` expects 1 argument (the primary key), but {} were given.", args.len()),
+                span,
+            );
+            return Type::Error;
+        }
+        let found = self.infer(&args[0]);
+        self.unify_at(&key, &found, &args[0].span, Some(format!("the primary key of table `{table}`")));
+        if method == "find" { Type::option(model) } else { model }
+    }
+
+    /// The primary-key type and model type of a table, which must map to a declared entity.
+    fn db_table(&mut self, table: &str, span: &Span) -> Option<(Type, Type)> {
+        let schema = self.schema;
+        let Some(definition) = schema.tables.get(table) else {
+            self.error("E7104", format!("Unknown database table `{table}`."), span);
+            return None;
+        };
+        let is_entity = self.env.types.get(&definition.model).is_some_and(|info| info.kind == TypeKind::Entity);
+        if !is_entity {
+            self.error(
+                "E7103",
+                format!("Table `{table}` maps to `{}`, which is not a declared entity.", definition.model),
+                span,
+            );
+            return None;
+        }
+        let key = match definition.columns.get(&definition.primary_key) {
+            Some(column) => self.column_type(column, span),
+            None => Type::Error,
+        };
+        Some((key, Type::con(&definition.model)))
+    }
+
+    fn column_type(&mut self, column: &Column, span: &Span) -> Type {
+        let base = match parse_type_text(&column.type_name, span) {
+            Ok(te) => self.env.lower(&te, &BTreeMap::new(), &mut self.diagnostics),
+            Err(diagnostic) => {
+                self.diagnostics.push(diagnostic);
+                Type::Error
+            }
+        };
+        if column.nullable { Type::option(base) } else { base }
+    }
+
+    fn infer_ui(&mut self, name: &str, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
+        if name == "Text" {
+            if args.len() != 1 {
+                self.error("E7102", format!("`Text` expects 1 argument, but {} were given.", args.len()), span);
+            }
+            for arg in args {
+                let ty = self.infer(arg);
+                let resolved = self.table.resolve(&ty);
+                if !self.env.is_displayable(&resolved) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            "E7105",
+                            format!("`Text` cannot display a value of type `{}`.", display(&resolved)),
+                            arg.span.clone(),
+                        )
+                        .with_hint("Display a String, number, Boolean, domain scalar or a distinct type over one of them."),
+                    );
+                }
+            }
+            if let Some(block) = children {
+                self.error("E7004", "`Text` cannot have children.", &block.span);
+            }
+            return Type::con("Ui");
+        }
+        for arg in args {
+            let ty = self.infer(arg);
+            match self.table.shallow(&ty) {
+                Type::Error => {}
+                Type::Con(type_name, type_args) if type_args.is_empty() && (type_name == "String" || type_name == "Int") => {}
+                other => {
+                    let shown = self.shown(&other);
+                    self.error("E7101", format!("UI node arguments must be `String` or `Int`, found `{shown}`."), &arg.span);
+                }
+            }
+        }
+        if let Some(block) = children {
+            let mark = self.locals.len();
+            for stmt in &block.stmts {
+                match stmt {
+                    Stmt::Val { name, annotation, value, span } => self.bind_val(name, annotation.as_ref(), value, span),
+                    Stmt::Expr(expr) => {
+                        let ty = self.infer(expr);
+                        self.unify_at(&Type::con("Ui"), &ty, &expr.span, Some("a UI child block".into()));
+                    }
+                }
+            }
+            self.locals.truncate(mark);
+            self.record(block.id, &Type::con("Ui"), &block.span);
+        }
+        Type::con("Ui")
     }
 
     // ---- when and patterns ---------------------------------------------------------
@@ -910,6 +1104,16 @@ impl<'a> Checker<'a> {
                 Pat::Ctor(name.clone(), patterns)
             }
         }
+    }
+}
+
+/// `db.<table>.<method>` as written, before any shadowing check.
+fn db_method(expr: &Expr) -> Option<(&str, &str)> {
+    let ExprKind::Field { target, name: method } = &expr.kind else { return None };
+    let ExprKind::Field { target: root, name: table } = &target.kind else { return None };
+    match &root.kind {
+        ExprKind::Name(db) if db == "db" => Some((table.as_str(), method.as_str())),
+        _ => None,
     }
 }
 
@@ -1249,5 +1453,81 @@ mod tests {
     fn boundaries_require_annotations() {
         assert_eq!(errors("server fun f(x) = x"), vec!["E7003"]);
         assert_eq!(errors("external fun g(x: Int)"), vec!["E7003"]);
+    }
+
+    use crate::schema::DatabaseSchema;
+    use crate::types::testing::infer_with_schema;
+
+    const CLIENTES: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\nclientes,Cliente,id,id,ClienteId,false,true,true,postgresql\nclientes,Cliente,id,nome,String,false,true,false,postgresql\nclientes,Cliente,id,apelido,String,true,false,false,postgresql\n";
+
+    const ENTIDADE: &str = "distinct type ClienteId = UUID\nentity Cliente(val id: ClienteId, val nome: String, val apelido: String?)\n";
+
+    fn schema(csv: &str) -> DatabaseSchema {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("bind-types-{}-{id}.csv", std::process::id()));
+        std::fs::write(&path, csv).unwrap();
+        let schema = DatabaseSchema::load(&path).unwrap();
+        std::fs::remove_file(path).unwrap();
+        schema
+    }
+
+    fn with_db(source: &str) -> Result<Vec<(String, String)>, Vec<String>> {
+        infer_with_schema(&format!("{ENTIDADE}{source}"), &schema(CLIENTES))
+    }
+
+    fn db_scheme(source: &str, name: &str) -> String {
+        let schemes = with_db(source).unwrap_or_else(|codes| panic!("{codes:?}"));
+        schemes.into_iter().find(|(other, _)| other == name).unwrap().1
+    }
+
+    #[test]
+    fn database_operations() {
+        assert_eq!(
+            db_scheme("server fun buscar(id: ClienteId): Cliente {\n    return db.clientes.require(id)\n}", "buscar"),
+            "(ClienteId) -> Cliente"
+        );
+        assert_eq!(db_scheme("server fun talvez(id: ClienteId): Cliente? = db.clientes.find(id)", "talvez"), "(ClienteId) -> Cliente?");
+        assert_eq!(
+            db_scheme("server fun criar(nome: String): Cliente {\n    return db.clientes.insert {\n        nome = nome\n        apelido = null\n    }\n}", "criar"),
+            "(String) -> Cliente"
+        );
+    }
+
+    #[test]
+    fn database_errors() {
+        assert_eq!(with_db("server fun f(id: ClienteId): Cliente = db.pedidos.require(id)"), Err(vec!["E7104".into()]));
+        assert_eq!(with_db("server fun f(id: String): Cliente = db.clientes.require(id)"), Err(vec!["E7101".into()]));
+        assert_eq!(with_db("server fun f(n: Int): Cliente = db.clientes.insert { nome = n }"), Err(vec!["E7101".into()]));
+        assert_eq!(with_db("server fun f(n: String): Cliente = db.clientes.insert { idade = n }"), Err(vec!["E7104".into()]));
+        assert_eq!(with_db("server fun f(id: ClienteId): Cliente = db.clientes.delete(id)"), Err(vec!["E7004".into()]));
+        assert_eq!(with_db("fun f(c: Cliente) = c.nome { x = 1 }"), Err(vec!["E7004".into()]));
+    }
+
+    #[test]
+    fn server_calls_and_environment_values() {
+        let source = "environment development {\n    secret val token: String = env(\"T\", default = \"x\")\n    runtime val porta: Int = envOrNull(\"PORT\")\n}\nserver fun eco(x: Int): Int = x\nclient fun usa(): Int = server.eco(1)\nclient fun segredo(): String = token\nfun porta2() = porta ?: 80\n";
+        assert_eq!(scheme(source, "usa"), "() -> Int");
+        assert_eq!(scheme(source, "segredo"), "() -> String");
+        assert_eq!(scheme(source, "porta2"), "() -> Int");
+        assert_eq!(errors("client fun f(): Int = server.nada(1)"), vec!["E7103"]);
+    }
+
+    #[test]
+    fn ui_trees() {
+        let page = "data class Item(val nome: String, val preco: Money)\nclient component Pagina(item: Item) {\n    UI {\n        Section(\"hero\", \"top\") {\n            Heading(1, \"titulo\") { Text(item.nome) }\n            Text(item.preco)\n        }\n    }\n}\n";
+        assert_eq!(scheme(page, "Pagina"), "(Item) -> Ui");
+        assert_eq!(errors("client component P(xs: List<String>) {\n    UI { Text(xs) }\n}"), vec!["E7105"]);
+        assert_eq!(errors("client component P() {\n    UI { Div(true) { Text(\"a\") } }\n}"), vec!["E7101"]);
+        assert_eq!(errors("client component P() {\n    1\n}"), vec!["E7101"]);
+        assert_eq!(errors("client component P() {\n    UI { 1 }\n}"), vec!["E7101"]);
+        assert_eq!(errors("fun f(x: Int) = f(x) { Text(\"a\") }"), vec!["E7004"]);
+    }
+
+    #[test]
+    fn user_names_shadow_bind_forms() {
+        assert_eq!(scheme("fun Text(x: Int): Int = x\nfun f() = Text(1)", "f"), "() -> Int");
+        assert_eq!(scheme("data class D(val clientes: Int)\nfun f(db: D) = db.clientes", "f"), "(D) -> Int");
+        assert_eq!(scheme("data class S(val eco: Int)\nfun f(server: S) = server.eco", "f"), "(S) -> Int");
     }
 }

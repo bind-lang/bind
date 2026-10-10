@@ -13,11 +13,11 @@ use crate::schema::DatabaseSchema;
 pub use infer::TypedProgram;
 
 /// Type-checks a whole program. Diagnostics are sorted by file, line, column and code.
-pub fn check(program: &Program, _schema: &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>) {
+pub fn check(program: &Program, schema: &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>) {
     let mut diagnostics = Vec::new();
     check_boundaries(program, &mut diagnostics);
     let env = env::Env::build(program, &mut diagnostics);
-    let (typed, mut inferred) = infer::check_program(program, &env);
+    let (typed, mut inferred) = infer::check_program(program, &env, schema);
     diagnostics.append(&mut inferred);
     diagnostics.sort_by(|a, b| {
         (&a.span.file, a.span.line, a.span.column, a.code).cmp(&(&b.span.file, b.span.line, b.span.column, b.code))
