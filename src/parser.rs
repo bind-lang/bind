@@ -86,9 +86,11 @@ impl Parser {
         Some(TypeDecl {
             name,
             kind: TypeKind::Distinct,
+            type_params: vec![],
             underlying: Some(underlying),
             fields: vec![],
             variants: vec![],
+            cases: vec![],
             span,
         })
     }
@@ -99,6 +101,7 @@ impl Parser {
             self.advance();
         }
         let name = self.identifier()?;
+        let type_params = self.type_params();
         let fields = if self.consume("(") {
             self.fields(")")
         } else if self.consume("{") {
@@ -109,9 +112,11 @@ impl Parser {
         Some(TypeDecl {
             name,
             kind,
+            type_params,
             underlying: None,
             fields,
             variants: vec![],
+            cases: vec![],
             span,
         })
     }
@@ -156,25 +161,64 @@ impl Parser {
         self.advance();
         self.advance();
         let name = self.identifier()?;
-        let mut variants = Vec::new();
+        let type_params = self.type_params();
+        let mut cases = Vec::new();
         if self.consume("{") {
-            let body = self.block_contents();
-            for window in body.windows(3) {
-                if window[0].text == "data"
-                    && (window[1].text == "class" || window[1].text == "object")
-                {
-                    variants.push(window[2].text.clone());
+            while !self.at_eof() && !self.consume("}") {
+                if self.consume(";") {
+                    continue;
+                }
+                match self.sealed_case() {
+                    Some(case) => cases.push(case),
+                    None => self.recover_to(&["data", "class", "object", "}"]),
                 }
             }
         }
         Some(TypeDecl {
             name,
             kind: TypeKind::Sealed,
+            type_params,
             underlying: None,
             fields: vec![],
-            variants,
+            variants: cases.iter().map(|case| case.name.clone()).collect(),
+            cases,
             span,
         })
+    }
+
+    fn sealed_case(&mut self) -> Option<Variant> {
+        let span = self.peek().span.clone();
+        self.consume("data");
+        let has_fields = if self.consume("class") {
+            true
+        } else if self.consume("object") {
+            false
+        } else {
+            self.diagnostics.push(Diagnostic::error(
+                "E1104",
+                format!(
+                    "Expected a sealed variant (`data class` or `data object`), found `{}`.",
+                    self.peek_text()
+                ),
+                self.peek().span.clone(),
+            ));
+            self.advance();
+            return None;
+        };
+        let name = self.identifier()?;
+        let fields = if has_fields && self.consume("(") {
+            self.fields(")")
+        } else {
+            Vec::new()
+        };
+        if self.consume(":") {
+            let _ = self.type_ref();
+            if self.consume("(") {
+                self.recover_to(&[")"]);
+                self.consume(")");
+            }
+        }
+        Some(Variant { name, fields, span })
     }
 
     fn enum_type(&mut self) -> Option<TypeDecl> {
@@ -182,11 +226,16 @@ impl Parser {
         self.advance();
         self.advance();
         let name = self.identifier()?;
-        let mut variants = Vec::new();
+        let mut cases = Vec::new();
         if self.consume("{") {
             while !self.at_eof() && !self.consume("}") {
                 if self.peek().kind == TokenKind::Identifier {
-                    variants.push(self.advance().text.clone());
+                    let token = self.advance().clone();
+                    cases.push(Variant {
+                        name: token.text,
+                        fields: vec![],
+                        span: token.span,
+                    });
                 } else {
                     self.advance();
                 }
@@ -196,9 +245,11 @@ impl Parser {
         Some(TypeDecl {
             name,
             kind: TypeKind::Enum,
+            type_params: vec![],
             underlying: None,
             fields: vec![],
-            variants,
+            variants: cases.iter().map(|case| case.name.clone()).collect(),
+            cases,
             span,
         })
     }
@@ -323,19 +374,22 @@ impl Parser {
                 _ => break,
             }
         }
-        let component = if self.consume("component") {
-            true
+        let (component, type_params) = if self.consume("component") {
+            (true, Vec::new())
         } else {
             self.expect("fun")?;
-            false
+            (false, self.type_params())
         };
         let name = self.identifier()?;
         self.expect("(")?;
         let mut parameters = Vec::new();
         while !self.at_eof() && !self.consume(")") {
             let parameter_name = self.identifier()?;
-            self.expect(":")?;
-            let type_ref = self.type_ref()?;
+            let type_ref = if self.consume(":") {
+                Some(self.type_ref()?)
+            } else {
+                None
+            };
             parameters.push(Parameter {
                 name: parameter_name,
                 type_ref,
@@ -346,9 +400,9 @@ impl Parser {
             self.consume(",");
         }
         let return_type = if self.consume(":") {
-            self.type_ref()?
+            Some(self.type_ref()?)
         } else {
-            TypeRef::unit()
+            None
         };
         let mut effects = Vec::new();
         let mut requires = Vec::new();
@@ -361,25 +415,65 @@ impl Parser {
                 break;
             }
         }
-        let body = if self.consume("{") {
-            self.block_contents()
+        let (body_kind, body) = if self.consume("{") {
+            (BodyKind::Block, self.block_contents())
         } else if self.consume("=") {
-            self.expression_body(span.line)
+            (BodyKind::Expression, self.expression_body(span.line))
         } else {
-            Vec::new()
+            (BodyKind::Absent, Vec::new())
         };
         Some(Function {
             name,
             domain,
             component,
             suspend,
+            type_params,
             parameters,
             return_type,
             effects,
             requires,
+            body_kind,
             body,
             span,
         })
+    }
+
+    fn type_params(&mut self) -> Vec<String> {
+        let mut params = Vec::new();
+        if !self.consume("<") {
+            return params;
+        }
+        while !self.at_eof() && !self.consume(">") {
+            if let Some(name) = self.identifier() {
+                params.push(name);
+            } else {
+                self.recover_to(&[",", ">"]);
+            }
+            self.consume(",");
+        }
+        params
+    }
+
+    fn balanced_group(&mut self) -> String {
+        let mut text = String::new();
+        let mut depth = 0usize;
+        loop {
+            let token = self.advance().text.clone();
+            if token == "(" {
+                depth += 1;
+            }
+            if token == ")" {
+                depth = depth.saturating_sub(1);
+            }
+            text.push_str(&token);
+            if token == "," {
+                text.push(' ');
+            }
+            if depth == 0 || self.at_eof() {
+                break;
+            }
+        }
+        text
     }
 
     fn name_list(&mut self) -> Vec<String> {
@@ -395,6 +489,20 @@ impl Parser {
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
+        if self.peek_text() == "(" {
+            let mut name = self.balanced_group();
+            if self.consume("->") {
+                let result = self.type_ref()?;
+                name.push_str("->");
+                name.push_str(&result.display());
+                return Some(TypeRef {
+                    name,
+                    nullable: false,
+                });
+            }
+            let nullable = self.consume("?");
+            return Some(TypeRef { name, nullable });
+        }
         let mut name = self.identifier()?;
         if self.consume("<") {
             let mut depth = 1;
@@ -563,6 +671,8 @@ fn is_top_level_start(text: &str) -> bool {
         "server",
         "worker",
         "fun",
+        "external",
+        "database",
     ]
     .contains(&text)
 }
@@ -571,6 +681,54 @@ fn is_top_level_start(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::lexer::lex;
+
+    fn parse_source(source: &str) -> Program {
+        let (tokens, lex_diagnostics) = lex("test.bd", source);
+        assert!(lex_diagnostics.is_empty(), "{lex_diagnostics:?}");
+        let (program, diagnostics) = parse(tokens);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        program
+    }
+
+    #[test]
+    fn parses_unannotated_parameters_and_generics() {
+        let program =
+            parse_source("fun dobro(x) = x * 2\nfun <T> primeiro(xs: List<T>): T? = first(xs)\n");
+        assert_eq!(program.functions[0].parameters[0].type_ref, None);
+        assert_eq!(program.functions[0].return_type, None);
+        assert_eq!(program.functions[0].body_kind, BodyKind::Expression);
+        assert_eq!(program.functions[1].type_params, vec!["T"]);
+        assert_eq!(program.functions[1].declared_return().display(), "T?");
+    }
+
+    #[test]
+    fn parses_sealed_variants_with_fields_and_type_parameters() {
+        let program = parse_source(
+            "sealed class Arvore<T> {\n    data class No(val esq: Arvore<T>, val valor: T, val dir: Arvore<T>)\n    data object Folha\n}\n",
+        );
+        let declaration = &program.types[0];
+        assert_eq!(declaration.type_params, vec!["T"]);
+        assert_eq!(declaration.variants, vec!["No", "Folha"]);
+        assert_eq!(declaration.cases[0].fields.len(), 3);
+        assert_eq!(declaration.cases[0].fields[1].type_ref.display(), "T");
+        assert!(declaration.cases[1].fields.is_empty());
+    }
+
+    #[test]
+    fn parses_function_types_in_annotations() {
+        let program =
+            parse_source("fun aplica(f: (Int) -> Int, g: ((Int) -> Int)?, x: Int): Int = f(x)\n");
+        let parameters = &program.functions[0].parameters;
+        assert_eq!(parameters[0].declared_type().display(), "(Int)->Int");
+        assert_eq!(parameters[1].declared_type().display(), "((Int)->Int)?");
+        assert_eq!(program.functions[0].body_kind, BodyKind::Expression);
+    }
+
+    #[test]
+    fn functions_without_body_are_absent() {
+        let program = parse_source("external fun relogio(): Int\n");
+        assert_eq!(program.functions[0].body_kind, BodyKind::Absent);
+    }
 
     #[test]
     fn parses_core_declarations() {

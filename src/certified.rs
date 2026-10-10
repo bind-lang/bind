@@ -348,7 +348,7 @@ fn rust_server_function(
             Ok(format!(
                 "{}: {}",
                 rust_identifier(&parameter.name),
-                rust_type(&parameter.type_ref, app)?
+                rust_type(&parameter.declared_type(), app)?
             ))
         })
         .collect::<Result<Vec<_>, String>>()?
@@ -358,7 +358,7 @@ fn rust_server_function(
         snake_case(&function.name),
         if parameters.is_empty() { "" } else { ", " },
         parameters,
-        rust_type(&function.return_type, app)?
+        rust_type(&function.declared_return(), app)?
     );
     let projection = model
         .fields
@@ -459,7 +459,7 @@ fn rust_request_type(function: &Function, app: &VerifiedApplication) -> Result<S
         output.push_str(&format!(
             "    {}: {},\n",
             rust_identifier(&parameter.name),
-            rust_type(&parameter.type_ref, app)?
+            rust_type(&parameter.declared_type(), app)?
         ));
     }
     output.push_str("}\n\n");
@@ -631,15 +631,15 @@ fn expression_type(
         .find(|parameter| parameter.name == parts[0])
         .ok_or_else(|| format!("`{expression}` is not rooted in a function parameter"))?;
     if parts.len() == 1 {
-        return Ok(parameter.type_ref.clone());
+        return Ok(parameter.declared_type());
     }
     if parts.len() == 2 {
         let declaration = app
             .program
             .types
             .iter()
-            .find(|declaration| declaration.name == parameter.type_ref.name)
-            .ok_or_else(|| format!("`{}` is not a record", parameter.type_ref.name))?;
+            .find(|declaration| declaration.name == parameter.declared_type().name)
+            .ok_or_else(|| format!("`{}` is not a record", parameter.declared_type().name))?;
         return declaration
             .fields
             .iter()
@@ -1012,11 +1012,11 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
         .find(|function| function.name == procedure_name)
         .ok_or_else(|| format!("Missing server procedure `{procedure_name}`"))?;
     for parameter in &component.parameters {
-        if !elm_text_input_type(&parameter.type_ref, app) {
+        if !elm_text_input_type(&parameter.declared_type(), app) {
             return Err(format!(
                 "Component input `{}` uses `{}`, which has no lossless text-input decoder yet",
                 parameter.name,
-                parameter.type_ref.display()
+                parameter.declared_type().display()
             ));
         }
     }
@@ -1035,7 +1035,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
         "type RemoteData a\n    = Idle\n    | Loading\n    | Loaded a\n    | Failed String\n\n",
     );
     output.push_str("type alias Model =\n    { state : RemoteData ");
-    output.push_str(&elm_type(&procedure.return_type, app)?);
+    output.push_str(&elm_type(&procedure.declared_return(), app)?);
     for parameter in &component.parameters {
         output.push_str(&format!(
             "\n    , input{} : String",
@@ -1052,7 +1052,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
     }
     output.push_str(&format!(
         "    | GotResponse (Result Http.Error {})\n\n",
-        elm_type(&procedure.return_type, app)?
+        elm_type(&procedure.declared_return(), app)?
     ));
     output.push_str("main : Program () Model Msg\nmain =\n    Browser.element\n        { init = \\_ -> ( initialModel, Cmd.none )\n        , update = update\n        , subscriptions = \\_ -> Sub.none\n        , view = view\n        }\n\ninitialModel : Model\ninitialModel =\n    { state = Idle");
     for parameter in &component.parameters {
@@ -1089,14 +1089,14 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
             "( \"{}\", {} )",
             parameter.name,
             elm_encode_text_input(
-                &parameter.type_ref,
+                &parameter.declared_type(),
                 &format!("model.input{}", pascal_case(&parameter.name)),
                 app
             )?
         ));
     }
     output.push_str("\n                    ]\n                  )\n                , expect = Http.expectJson GotResponse ");
-    output.push_str(&elm_decoder(&procedure.return_type, app)?);
+    output.push_str(&elm_decoder(&procedure.declared_return(), app)?);
     output.push_str("\n                }\n            )\n\n        GotResponse result ->\n            case result of\n                Ok response ->\n                    ( { model | state = Loaded response }, Cmd.none )\n\n                Err error ->\n                    ( { model | state = Failed (httpError error) }, Cmd.none )\n\n");
     output.push_str("view : Model -> Html Msg\nview model =\n    main_ [ class \"shell\" ]\n        [ div [ class \"panel\" ]\n            [ p [ class \"eyebrow\" ] [ text \"BIND CERTIFIED APPLICATION\" ]\n            , h1 [] [ text \"");
     output.push_str(&elm_escape(&plan.component));
@@ -1108,7 +1108,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
         output.push_str(&format!(
             "label [] [ text \"{}\", input [ type_ \"text\", placeholder \"{}\", value model.input{}, onInput Set{} ] [] ]",
             elm_escape(&humanize(&parameter.name)),
-            elm_escape(&parameter.type_ref.display()),
+            elm_escape(&parameter.declared_type().display()),
             pascal_case(&parameter.name),
             pascal_case(&parameter.name)
         ));
@@ -1119,7 +1119,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
     output.push_str("button [ type_ \"submit\" ] [ text \"Execute verified call\" ]\n                ]\n            , viewState model.state\n            ]\n        ]\n\n");
     output.push_str(&format!(
         "viewState : RemoteData {} -> Html Msg\nviewState state =\n    case state of\n        Idle ->\n            p [ class \"muted\" ] [ text \"Ready.\" ]\n\n        Loading ->\n            p [ class \"muted\" ] [ text \"Loading…\" ]\n\n        Failed message ->\n            p [ class \"error\" ] [ text message ]\n\n        Loaded value ->\n            div [ class \"result\" ]\n                [ ",
-        elm_type(&procedure.return_type, app)?
+        elm_type(&procedure.declared_return(), app)?
     ));
     for (index, expression) in plan.text_expressions.iter().enumerate() {
         if index > 0 {
@@ -1129,7 +1129,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
         output.push_str(&elm_ui_text(
             expression,
             binding,
-            &procedure.return_type,
+            &procedure.declared_return(),
             app,
         )?);
         output.push_str(" ]");
@@ -1482,7 +1482,7 @@ fn contract_schema(app: &VerifiedApplication) -> String {
                     .map(|parameter| format!(
                         "{}:{}",
                         json(&parameter.name),
-                        json(&parameter.type_ref.display())
+                        json(&parameter.declared_type().display())
                     ))
                     .collect::<Vec<_>>()
                     .join(","),
@@ -1508,7 +1508,7 @@ fn contract_vectors(app: &VerifiedApplication) -> String {
                     format!(
                         "{}:{}",
                         json(&parameter.name),
-                        sample_json(&parameter.type_ref, app)
+                        sample_json(&parameter.declared_type(), app)
                     )
                 })
                 .collect::<Vec<_>>()

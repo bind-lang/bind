@@ -443,7 +443,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         .map(|function| RpcContract {
             name: function.name.clone(),
             parameters: function.parameters.clone(),
-            return_type: function.return_type.clone(),
+            return_type: function.declared_return(),
             path: format!("/api/{}", function.name),
         })
         .collect();
@@ -490,8 +490,14 @@ fn validate_declarations(
         if let Some(underlying) = &item.underlying {
             validate_type(underlying, types, &item.span, diagnostics);
         }
-        for field in &item.fields {
-            validate_type(&field.type_ref, types, &field.span, diagnostics);
+        for field in item
+            .fields
+            .iter()
+            .chain(item.cases.iter().flat_map(|case| &case.fields))
+        {
+            if !mentions_type_param(&field.type_ref, &item.type_params) {
+                validate_type(&field.type_ref, types, &field.span, diagnostics);
+            }
         }
     }
     seen.clear();
@@ -503,12 +509,29 @@ fn validate_declarations(
                 item.span.clone(),
             ));
         }
-        validate_type(&item.return_type, types, &item.span, diagnostics);
+        if let Some(return_type) = &item.return_type
+            && !mentions_type_param(return_type, &item.type_params)
+        {
+            validate_type(return_type, types, &item.span, diagnostics);
+        }
         for parameter in &item.parameters {
-            validate_type(&parameter.type_ref, types, &item.span, diagnostics);
+            if let Some(type_ref) = &parameter.type_ref
+                && !mentions_type_param(type_ref, &item.type_params)
+            {
+                validate_type(type_ref, types, &item.span, diagnostics);
+            }
         }
     }
     let _ = functions;
+}
+
+/// Type parameters and function types are verified by the type checker (`types`), not here.
+fn mentions_type_param(type_ref: &TypeRef, params: &[String]) -> bool {
+    type_ref.name.starts_with('(')
+        || type_ref
+            .name
+            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
+            .any(|part| params.iter().any(|param| param == part))
 }
 
 fn validate_type(
@@ -611,8 +634,8 @@ fn validate_certified_surface(
         for type_ref in function
             .parameters
             .iter()
-            .map(|parameter| &parameter.type_ref)
-            .chain(std::iter::once(&function.return_type))
+            .map(Parameter::declared_type)
+            .chain(std::iter::once(function.declared_return()))
         {
             if !certified_wire_type(&type_ref.name, program) {
                 diagnostics.push(Diagnostic::error(
@@ -800,7 +823,11 @@ fn analyze_function(
     let mut locals: BTreeMap<String, TypeRef> = function
         .parameters
         .iter()
-        .map(|item| (item.name.clone(), item.type_ref.clone()))
+        .filter_map(|item| {
+            item.type_ref
+                .clone()
+                .map(|type_ref| (item.name.clone(), type_ref))
+        })
         .collect();
     let mut inferred_effects = BTreeSet::new();
     let body = &function.body;
@@ -933,10 +960,10 @@ fn analyze_function(
                     ));
                 }
                 Some(table) => {
-                    if function.return_type.name != table.model {
+                    if function.declared_return().name != table.model {
                         diagnostics.push(Diagnostic::error(
                             "E5205",
-                            format!("Database operation on `{}` produces `{}`, but function `{}` declares `{}`.", table.name, table.model, function.name, function.return_type.display()),
+                            format!("Database operation on `{}` produces `{}`, but function `{}` declares `{}`.", table.name, table.model, function.name, function.declared_return().display()),
                             function.span.clone(),
                         ));
                     }
@@ -1113,7 +1140,7 @@ fn validate_return_contract(
     database: &DatabaseSchema,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    if function.return_type.name == "Unit" {
+    if function.declared_return().name == "Unit" {
         return;
     }
     let return_positions: Vec<_> = function
@@ -1133,7 +1160,7 @@ fn validate_return_contract(
             format!(
                 "Function `{}` declares return type `{}` but has no return expression.",
                 function.name,
-                function.return_type.display()
+                function.declared_return().display()
             ),
             function.span.clone(),
         ));
@@ -1142,14 +1169,14 @@ fn validate_return_contract(
     for position in expression_positions {
         if let Some(actual) =
             infer_expression(&function.body, position, locals, functions, database)
-            && !compatible(&function.return_type, &actual)
+            && !compatible(&function.declared_return(), &actual)
         {
             diagnostics.push(Diagnostic::error(
                 "E2302",
                 format!(
                     "Function `{}` declares `{}` but returns `{}`.",
                     function.name,
-                    function.return_type.display(),
+                    function.declared_return().display(),
                     actual.display()
                 ),
                 function.body[position].span.clone(),
@@ -1288,7 +1315,7 @@ fn validate_call_arguments(
     }
     for ((start, _), parameter) in arguments.into_iter().zip(&callee.parameters) {
         if let Some(actual) = infer_expression(body, start, locals, functions, database)
-            && !compatible(&parameter.type_ref, &actual)
+            && !compatible(&parameter.declared_type(), &actual)
         {
             diagnostics.push(Diagnostic::error(
                 "E2202",
@@ -1296,7 +1323,7 @@ fn validate_call_arguments(
                     "Argument `{}` of `{}` expects `{}`, received `{}`.",
                     parameter.name,
                     callee.name,
-                    parameter.type_ref.display(),
+                    parameter.declared_type().display(),
                     actual.display()
                 ),
                 body[start].span.clone(),
@@ -1341,7 +1368,7 @@ fn infer_expression(
         &token.text
     };
     if let Some(function) = functions.get(function_name) {
-        return Some(function.return_type.clone());
+        return Some(function.declared_return());
     }
     if token.text == "db" && body.get(index + 1)?.text == "." {
         let table = database.tables.get(&body.get(index + 2)?.text)?;
@@ -1483,7 +1510,7 @@ pub fn ir_json(app: &VerifiedApplication) -> String {
         if index > 0 {
             output.push(',');
         }
-        output.push_str(&format!("\n    {{\"name\":{},\"domain\":{},\"returnType\":{},\"suspend\":{},\"effects\":{},\"requires\":{}}}", json(&function.name), json(function.domain.as_str()), json(&function.return_type.display()), function.suspend, json_array(&function.effects), json_array(&function.requires)));
+        output.push_str(&format!("\n    {{\"name\":{},\"domain\":{},\"returnType\":{},\"suspend\":{},\"effects\":{},\"requires\":{}}}", json(&function.name), json(function.domain.as_str()), json(&function.declared_return().display()), function.suspend, json_array(&function.effects), json_array(&function.requires)));
     }
     output.push_str("\n  ],\n  \"rpcContracts\": [");
     for (index, rpc) in app.rpc_contracts.iter().enumerate() {
@@ -1568,6 +1595,22 @@ client component CustomerPage(id: CustomerId) {
 "#;
 
     const SCHEMA: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Customer,id,id,CustomerId,false,true,true,postgresql\ncustomers,Customer,id,name,String,false,true,false,postgresql\n";
+
+    const EMPTY_SCHEMA: &str =
+        "table,model,primary_key,column,type,nullable,required,has_default,engine\n";
+
+    #[test]
+    fn legacy_validation_skips_type_parameters_and_function_types() {
+        let source = "pure fun <T> ident(x: T): T = x\npure fun aplica(f: (Int) -> Int, x: Int): Int = f(x)\n";
+        let (root, config) = fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(
+            !result.diagnostics.iter().any(|item| item.code == "E2003"),
+            "{:?}",
+            result.diagnostics
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn binds_complete_application() {
