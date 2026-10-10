@@ -1,6 +1,6 @@
 //! Type representation, union-find variables with levels, schemes and rendering.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type TypeVarId = usize;
 
@@ -90,9 +90,20 @@ pub enum VarState {
 #[derive(Clone, Debug, Default)]
 pub struct TypeTable {
     vars: Vec<VarState>,
+    /// Type constructors that never support equality: `Ui` and user types whose fields
+    /// contain a function or another such type (see `Env::build`).
+    non_equatable: BTreeSet<String>,
 }
 
 impl TypeTable {
+    pub fn set_non_equatable(&mut self, names: BTreeSet<String>) {
+        self.non_equatable = names;
+    }
+
+    pub fn is_non_equatable(&self, name: &str) -> bool {
+        self.non_equatable.contains(name)
+    }
+
     pub fn fresh(&mut self, level: u32) -> Type {
         self.vars.push(VarState::Unbound { level, constraint: None });
         Type::Var(self.vars.len() - 1)

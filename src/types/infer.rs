@@ -56,10 +56,12 @@ struct Checker<'a> {
 
 impl<'a> Checker<'a> {
     fn new(env: &'a Env, schema: &'a DatabaseSchema) -> Self {
+        let mut table = TypeTable::default();
+        table.set_non_equatable(env.non_equatable.clone());
         Self {
             env,
             schema,
-            table: TypeTable::default(),
+            table,
             level: 0,
             globals: BTreeMap::new(),
             function_spans: BTreeMap::new(),
@@ -393,18 +395,26 @@ impl<'a> Checker<'a> {
                     span.clone(),
                 )
             }
-            UnifyError::Constraint { constraint, ty } => Diagnostic::error(
-                "E7301",
-                format!("`{}` does not support {}.", display(&ty), constraint.describe()),
-                span.clone(),
-            ),
+            UnifyError::Constraint { constraint, ty } => self.constraint_error(constraint, &ty, span),
         };
         self.diagnostics.push(diagnostic);
     }
 
     fn require(&mut self, constraint: Constraint, ty: &Type, span: &Span) {
         if let Err(UnifyError::Constraint { constraint, ty }) = constrain(&mut self.table, constraint, ty) {
-            self.error("E7301", format!("`{}` does not support {}.", display(&ty), constraint.describe()), span);
+            let diagnostic = self.constraint_error(constraint, &ty, span);
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn constraint_error(&self, constraint: Constraint, ty: &Type, span: &Span) -> Diagnostic {
+        let diagnostic =
+            Diagnostic::error("E7301", format!("`{}` does not support {}.", display(ty), constraint.describe()), span.clone());
+        match ty {
+            Type::Con(name, _) if constraint == Constraint::Eq && name != "Ui" && self.table.is_non_equatable(name) => {
+                diagnostic.with_hint(format!("`{name}` has a field that contains a function or a UI tree."))
+            }
+            _ => diagnostic,
         }
     }
 
@@ -1341,6 +1351,25 @@ mod tests {
         assert_eq!(errors("fun f(a: String, b: String) = a - b"), vec!["E7301"]);
         assert_eq!(errors("fun g(x: Int): Int = x\nfun f(): Boolean = g == g"), vec!["E7301"]);
         assert_eq!(errors("fun <T> igual(a: T, b: T): Boolean = a == b"), vec!["E7301"]);
+    }
+
+    #[test]
+    fn equality_rejects_types_that_contain_functions() {
+        let holder = "data class H(val run: (Int) -> Int)\n";
+        assert_eq!(errors(&format!("{holder}fun f(a: H, b: H): Boolean = a == b")), vec!["E7301"]);
+        let wrapper = format!("{holder}data class W(val h: H)\nfun f(a: W, b: W): Boolean = a == b");
+        assert_eq!(errors(&wrapper), vec!["E7301"]);
+        let sealed = "sealed class S {\n    data class C(val k: () -> Int)\n    data object D\n}\n";
+        assert_eq!(errors(&format!("{sealed}fun f(a: S, b: S): Boolean = a == b")), vec!["E7301"]);
+        assert_eq!(errors("fun f(a: Ui, b: Ui): Boolean = a == b"), vec!["E7301"]);
+        let plain = "data class P(val x: Int)\nfun f(a: P, b: P): Boolean = a == b";
+        assert_eq!(scheme(plain, "f"), "(P, P) -> Boolean");
+        let boxed = "data class Box<T>(val v: T)\n";
+        assert_eq!(scheme(&format!("{boxed}fun f(a: Box<Int>, b: Box<Int>): Boolean = a == b"), "f"), "(Box<Int>, Box<Int>) -> Boolean");
+        let functions = format!("{boxed}fun f(a: Box<(Int) -> Int>, b: Box<(Int) -> Int>): Boolean = a == b");
+        assert_eq!(errors(&functions), vec!["E7301"]);
+        let local = format!("{holder}fun f(x: H): Boolean {{\n    val y = x\n    y == x\n}}");
+        assert_eq!(errors(&local), vec!["E7301"]);
     }
 
     #[test]

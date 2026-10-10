@@ -56,6 +56,8 @@ pub struct CtorInfo {
 pub struct Env {
     pub types: BTreeMap<String, TypeInfo>,
     pub ctors: BTreeMap<String, CtorInfo>,
+    /// `Ui` and the user types that cannot support equality (see `non_equatable_types`).
+    pub non_equatable: BTreeSet<String>,
 }
 
 impl Env {
@@ -164,7 +166,33 @@ impl Env {
                 env.lower(field, &rigid, diagnostics);
             }
         }
+        env.non_equatable = env.non_equatable_types();
         env
+    }
+
+    /// A type is non-equatable when a field of one of its constructors contains a function,
+    /// `Ui` or another non-equatable type (a fixpoint, so wrappers and recursion are covered).
+    /// The type's own parameters do not count: equality checks the type arguments instead.
+    fn non_equatable_types(&self) -> BTreeSet<String> {
+        let mut set = BTreeSet::from(["Ui".to_string()]);
+        loop {
+            let mut changed = false;
+            for (name, info) in &self.types {
+                if set.contains(name) {
+                    continue;
+                }
+                let contains = info.ctors.iter().filter_map(|ctor| self.ctors.get(ctor)).any(|ctor| {
+                    ctor.fields.iter().any(|(_, field)| contains_non_equatable(field, &ctor.type_params, &set))
+                });
+                if contains {
+                    set.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return set;
+            }
+        }
     }
 
     fn install_result(&mut self) {
@@ -331,6 +359,17 @@ impl Signatures for Env {
                         .collect(),
                 )
             }
+        }
+    }
+}
+
+fn contains_non_equatable(te: &TypeExpr, params: &[String], set: &BTreeSet<String>) -> bool {
+    match te {
+        TypeExpr::Function { .. } => true,
+        TypeExpr::Nullable(inner) => contains_non_equatable(inner, params, set),
+        TypeExpr::Named { name, args, .. } => {
+            (!params.contains(name) && set.contains(name))
+                || args.iter().any(|arg| contains_non_equatable(arg, params, set))
         }
     }
 }

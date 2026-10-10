@@ -119,7 +119,7 @@ pub fn constrain(table: &mut TypeTable, constraint: Constraint, ty: &Type) -> Re
             Ok(())
         }
         Type::Con(name, args) => {
-            if !constraint.accepts(&name) {
+            if !constraint.accepts(&name) || (constraint == Constraint::Eq && table.is_non_equatable(&name)) {
                 return Err(fail(table));
             }
             if constraint == Constraint::Eq {
@@ -215,6 +215,18 @@ mod tests {
         let a = table.fresh(1);
         constrain(&mut table, Constraint::Eq, &Type::list(a.clone())).unwrap();
         assert!(unify(&mut table, &a, &Type::Fun(vec![], Box::new(int()))).is_err());
+    }
+
+    #[test]
+    fn equality_rejects_non_equatable_constructors() {
+        let mut table = TypeTable::default();
+        table.set_non_equatable(["H".to_string(), "Ui".to_string()].into());
+        assert!(constrain(&mut table, Constraint::Eq, &Type::con("H")).is_err());
+        assert!(constrain(&mut table, Constraint::Eq, &Type::list(Type::con("Ui"))).is_err());
+        assert!(constrain(&mut table, Constraint::Eq, &Type::con("P")).is_ok());
+        let a = table.fresh(1);
+        constrain(&mut table, Constraint::Eq, &a).unwrap();
+        assert!(unify(&mut table, &a, &Type::con("H")).is_err());
     }
 
     #[test]
