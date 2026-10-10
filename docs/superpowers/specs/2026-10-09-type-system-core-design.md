@@ -1,7 +1,7 @@
 # Núcleo da linguagem: expressões, inferência Hindley-Milner e exaustividade
 
 - Data: 2026-10-09
-- Status: aprovado em conversa, aguardando revisão da spec escrita
+- Status: aprovado (com adendos A a D)
 - Subprojeto: 1 de 3
 
 ## Objetivo
@@ -44,7 +44,7 @@ Léxico compatível com Kotlin (sem mudanças no lexer), semântica no estilo OC
 ```kotlin
 sealed class Pedido {
     data class Pendente(val itens: List<Item>)
-    data class Pago(val valor: Money, val em: Timestamp)
+    data class Pago(val valor: Money, val em: Instant)
     data object Cancelado
 }
 
@@ -71,7 +71,7 @@ Em `server fun`, `client component` e `entity`, cada parâmetro e o retorno prec
 
 ### Expressões
 
-- Literais (`Int`, `Float`, `String`, `Bool`, `null`), variáveis, chamadas, acesso a campo, construtores (`Pago(valor, agora)`).
+- Literais (`Int`, `Double`, `String`, `Boolean`, `null`), variáveis, chamadas, acesso a campo, construtores (`Pago(valor, agora)`).
 - Operadores aritméticos, de comparação (`== != < <= > >=`) e lógicos (`&& || !`).
 - `val x = e` (sem `var`).
 - Blocos `{ ...; e }`: o valor do bloco é a última expressão; um bloco vazio vale `Unit`.
@@ -95,8 +95,8 @@ Nenhum arquivo `.bd` existente (`examples/commerce`, `website/src/site.bd`) usa 
 
 ### Tipos
 
-- Primitivos: `Int` (precisão arbitrária), `Float` (IEEE 754 de 64 bits), `Bool`, `String`, `Unit`.
-- Escalares de domínio que já existem no perfil: `UUID`, `Email`, `Money`, `Timestamp` e os demais de `certified_wire_type`.
+- Primitivos: `Int` (precisão arbitrária), `Double` (IEEE 754 de 64 bits), `Float` (IEEE 754 de 32 bits), `Decimal`, `Boolean`, `String`, `Unit`.
+- Escalares de domínio que já existem em `certified_wire_type`: `UUID`, `Date`, `DateTime`, `Instant`, `Duration`, `Money`, `Email`, `Url`.
 - Nominais do usuário: `data class`, `entity`, `sealed class`, `enum class`, `distinct type`. A igualdade de tipos é nominal: nomes diferentes nunca unificam, e não há conversão implícita.
 - Embutidos: `List<T>`, `Result<T, E>` (`Ok(T)`, `Err(E)`), `Option<T>` escrito `T?` (`null`, valor). `T??` é `Option<Option<T>>`, sem colapsar.
 - Funções: `(A, B) -> C`.
@@ -110,7 +110,7 @@ Nenhum arquivo `.bd` existente (`examples/commerce`, `website/src/site.bd`) usa 
 - A recursão polimórfica exige anotação.
 - Funções anotadas: o tipo declarado é instanciado e unificado com o tipo inferido do corpo (verificação, não inferência).
 - `return e`: `e` é unificado com o tipo de retorno da função, e a expressão `return` recebe uma variável de tipo nova.
-- Literais não são polimórficos: `2 : Int`, `2.0 : Float`.
+- Literais não são polimórficos: `2 : Int`, `2.0 : Double`.
 
 ### Restrições fechadas para operadores
 
@@ -118,14 +118,14 @@ Não há typeclasses. Os operadores sobrecarregados geram restrições sobre con
 
 | Restrição | Tipos aceitos | Operadores |
 |---|---|---|
-| `Num` | `Int`, `Float` | `* /`, `%` (só `Int`) |
-| `Ord` | `Int`, `Float`, `Money`, `String`, `Timestamp` | `< <= > >=` |
-| `Add` | `Int`, `Float`, `Money`, `String` | `+`; `-` exceto para `String` |
+| `Num` | `Int`, `Double`, `Float`, `Decimal` | `* /`, `%` (só `Int`) |
+| `Add` | `Num` + `Money`, `Duration`, `String` | `+`; `-` exceto para `String` |
+| `Ord` | `Add` + `Date`, `DateTime`, `Instant` | `< <= > >=` |
 | `Eq` | qualquer tipo concreto que não contenha função | `== !=` |
 
 - Quando a variável restrita é resolvida para um tipo concreto, o tipo é verificado contra o conjunto. Se não pertencer, o resultado é o erro E7301.
 - Se uma variável chega à generalização ainda restrita, o resultado é o erro E7302 (tipo ambíguo, anote). Não existe escolha padrão silenciosa.
-- `Int / Int : Int?` e `Int % Int : Int?` (divisão por zero vira `null`). `Float / Float : Float`.
+- `Int / Int : Int?` e `Int % Int : Int?` (divisão por zero vira `null`). `Double / Double : Double`, `Float / Float : Float`, `Decimal / Decimal : Decimal?`.
 
 ### Correção
 
@@ -136,7 +136,7 @@ Não há typeclasses. Os operadores sobrecarregados geram restrições sobre con
 - Algoritmo de matrizes de Maranget ("Warnings for pattern matching", 2007).
 - `when` incompleto gera o erro E7201, com um contraexemplo impresso como padrão (por exemplo `Pago(_, _)`).
 - Braço redundante (inalcançável) gera o erro E7202.
-- Tipos com construtores finitos: `sealed class`, `enum class`, `Bool`, `T?`, `Result`. Tipos com infinitos valores (`Int`, `Float`, `String` e escalares) exigem `_` ou uma variável.
+- Tipos com construtores finitos: `sealed class`, `enum class`, `Boolean`, `T?`, `Result`. Tipos com infinitos valores (`Int`, `Double`, `String` e escalares) exigem `_` ou uma variável.
 - `List` não tem padrões na v1. Funções embutidas totais: `first(xs): T?`, `get(xs, i): T?`, `map`, `fold`, `length`.
 
 Nenhuma operação embutida pode falhar em tempo de execução:
@@ -146,7 +146,7 @@ Nenhuma operação embutida pode falhar em tempo de execução:
 | Acesso a lista | `first`/`get` retornam `T?` |
 | Divisão e resto inteiros | `Int?` (`null` quando o divisor é zero) |
 | Aritmética de `Int` | Precisão arbitrária, sem overflow |
-| Divisão de `Float` | IEEE 754 (`Infinity`/`NaN`) |
+| Divisão de `Double`/`Float` | IEEE 754 (`Infinity`/`NaN`) |
 
 O mapeamento de `Int` para `bigint` na fronteira do PostgreSQL é decidido no subprojeto 3. A única forma restante de um programa bem tipado não produzir valor é recursão infinita.
 
@@ -158,7 +158,7 @@ O mapeamento de `Int` para `bigint` na fronteira do PostgreSQL é decidido no su
 lexer (sem mudança)
   → parser de declarações (sealed com campos, genéricos, sem `var`)
   → parser de expressões: Function.body (tokens) → Function.expr (Block)
-  → types::check(&Program) → (TypedProgram, Vec<Diagnostic>)
+  → types::check(&Program, &DatabaseSchema) → (TypedProgram, Vec<Diagnostic>)
   → qualquer erro E7xxx aborta antes da análise atual e de todo gerador
   → análise atual por tokens e codegen (sem mudança)
 ```
@@ -176,7 +176,7 @@ lexer (sem mudança)
 | `src/types/env.rs` | Tipos declarados, construtores, assinaturas embutidas | `ast`, `ty` |
 | `src/types/infer.rs` | Inferência sobre a AST, coleta e resolução de restrições | `ty`, `unify`, `env` |
 | `src/types/exhaustive.rs` | Maranget: exaustividade e redundância | `ty`, `syntax` |
-| `src/types/mod.rs` | `check(&Program) -> (TypedProgram, Vec<Diagnostic>)` | todos |
+| `src/types/mod.rs` | `check(&Program, &DatabaseSchema) -> (TypedProgram, Vec<Diagnostic>)` | todos |
 
 `parser.rs` e `compiler.rs` recebem apenas os pontos de integração.
 
@@ -205,7 +205,7 @@ TDD: cada regra entra primeiro como um teste que falha.
    - estabilidade: anotar com os tipos inferidos e verificar de novo produz o mesmo resultado;
    - exaustividade contra força bruta: para tipos algébricos gerados, o veredito de Maranget coincide com a enumeração de valores até a profundidade *n*;
    - ida e volta do parser: `parse(print(ast)) == ast`.
-4. **Regressão.** Os 24 testes atuais continuam passando; `examples/commerce` e `website/src/site.bd` passam no `check`; o `certify` produz artefatos com hashes idênticos aos anteriores.
+4. **Regressão.** Os 24 testes atuais continuam passando (exceto `nominal_ids_do_not_mix`, que passa a esperar E7101; ver adendo C); `examples/commerce` e `website/src/site.bd` passam no `check`; o `certify` produz artefatos com hashes idênticos aos anteriores.
 
 ### Critérios de aceite
 
@@ -215,3 +215,31 @@ TDD: cada regra entra primeiro como um teste que falha.
 4. Todas as propriedades passam com pelo menos 1.000 casos.
 5. `cargo clippy --all-targets -- -D warnings` limpo e `cargo test` verde.
 6. `docs/type-system.md` publicado com as regras formais e os limites conhecidos.
+
+## Adendos (aprovados após a revisão do código)
+
+### A. Construções existentes que recebem tipo
+
+| Construção | Regra |
+|---|---|
+| `db.<tabela>.require(id)` | A tabela é resolvida no `DatabaseSchema` e o modelo dela deve ser uma `entity` declarada. Tipo `(Pk) -> Modelo`, onde `Pk` é o tipo da coluna de chave primária. |
+| `db.<tabela>.find(id)` | Tipo `(Pk) -> Modelo?`. |
+| `db.<tabela>.insert { coluna = expr ... }` | Cada `expr` é verificada contra o tipo da coluna (`T?` se a coluna for anulável). Resultado: `Modelo`. Coluna desconhecida: E7104. Colunas obrigatórias faltando continuam no E5303. |
+| `server.<fun>` | Resolve para a função de topo com esse nome e tem o mesmo esquema. Regras de domínio continuam no verificador atual. |
+| Valores de `environment` | Variáveis globais com o tipo declarado. |
+| DSL de UI | `UI { ... }` e os nós `Page Container Div Grid Stack Header Nav Main Section Article Aside Footer Paragraph Span Strong Emphasis Small List Item Pre Code Heading Link Rule Text` (a lista de `certified.rs`). Cada argumento deve ter tipo `String` ou `Int`. O bloco de filhos é uma sequência em que cada item tem tipo `Ui`. `Text(x)` exige `x` exibível: `String`, `Int`, `Double`, `Float`, `Decimal`, `Boolean`, um escalar de domínio ou um `distinct type` sobre um deles (E7105 caso contrário). O nó resultante tem tipo `Ui`. O corpo de um `component` deve ter tipo `Ui`. |
+| Interpolação `"$nome"` e `"${expr}"` | Rejeitada com E7001, sugerindo `+`. Um `$` não seguido de identificador ou `{` é literal. |
+
+Os nomes de nós de UI só são especiais em posição de valor; `List<T>` em posição de tipo continua sendo a lista embutida.
+
+### B. Nomes de tipos
+
+Os nomes seguem a lista já usada pelo compilador (`Boolean`, `Double`, `Instant`...). As seções 1 a 3 já foram ajustadas.
+
+### C. Teste existente
+
+`nominal_ids_do_not_mix` passa a esperar E7101 em vez de E2202, porque o novo verificador roda antes e interrompe a análise antiga quando há erros de tipo.
+
+### D. Anotações ausentes no parser de declarações
+
+`Parameter.type_ref` e `Function.return_type` passam a ser `Option<TypeRef>`. Os consumidores atuais usam `Unit` quando o retorno está ausente, preservando o comportamento. Parâmetros sem tipo deixam de ser erro de parse; a falta de anotação em `server fun`, `component` ou `entity` gera E7003.
