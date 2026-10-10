@@ -274,7 +274,7 @@ impl<'a> Checker<'a> {
         let mut effects = BTreeMap::new();
         let mut row_vars = Vec::new();
         for name in effect_variable_names(function) {
-            let var = self.table.fresh_row_var(GENERIC_LEVEL, None);
+            let var = self.table.fresh_row_var(GENERIC_LEVEL);
             row_vars.push(var);
             effects.insert(name, Row::with_tail([], var));
         }
@@ -589,7 +589,7 @@ impl<'a> Checker<'a> {
     /// An operation's effect joins the current context row.
     fn perform(&mut self, pair: (&str, &str), text: String, span: &Span) {
         let label = Label::of(pair);
-        let tail = self.table.fresh_row_var(self.level, None);
+        let tail = self.table.fresh_row_var(self.level);
         let produced = Row::with_tail([label.clone()], tail);
         let context = self.context.clone();
         match unify_rows(&mut self.table, &context, &produced) {
@@ -613,7 +613,7 @@ impl<'a> Checker<'a> {
         let opened = match resolved.tail {
             Some(_) => resolved.clone(),
             None => {
-                let tail = self.table.fresh_row_var(self.level, None);
+                let tail = self.table.fresh_row_var(self.level);
                 Row::with_tail(resolved.labels.iter().cloned(), tail)
             }
         };
@@ -812,7 +812,7 @@ impl<'a> Checker<'a> {
         if row.tail.is_some() {
             return Type::Fun(params, result, row);
         }
-        let tail = self.table.fresh_row_var(self.level, None);
+        let tail = self.table.fresh_row_var(self.level);
         Type::Fun(params, result, Row::with_tail(row.labels, tail))
     }
 
@@ -830,7 +830,7 @@ impl<'a> Checker<'a> {
         row_occurrences(&resolved, true, &mut occurrences);
         if let Some(tail) = row.tail
             && occurrences.get(&tail).is_some_and(|(count, _)| *count == 1)
-            && let RowState::Unbound { level, .. } = self.table.row_state(tail).clone()
+            && let RowState::Unbound { level } = self.table.row_state(tail).clone()
             && level > self.level
         {
             self.table.set_row(tail, RowState::Link(Row::empty()));
@@ -1013,13 +1013,6 @@ impl<'a> Checker<'a> {
                 &self.table.resolve(found),
                 span,
                 reason,
-            ),
-            // Unreachable: the checker never puts a ceiling on a row variable (domains are
-            // checked after each body, in `check_effects`); kept as a defensive fallback.
-            UnifyError::Ceiling { label, .. } => Diagnostic::error(
-                "E7401",
-                format!("This code cannot perform `{label}`."),
-                span.clone(),
             ),
             UnifyError::Infinite { var, ty } => {
                 let names = display_all(&[&Type::Var(var), &ty]);
@@ -1494,7 +1487,7 @@ impl<'a> Checker<'a> {
                         // Open, like any instantiated function, so it fits where more
                         // effects are allowed.
                         Type::Fun(params, result, _) => {
-                            let tail = self.table.fresh_row_var(self.level, None);
+                            let tail = self.table.fresh_row_var(self.level);
                             Type::Fun(
                                 params,
                                 result,
@@ -2223,7 +2216,7 @@ fn builtin(
 ) -> Scheme {
     let vars: Vec<Type> = (0..arity).map(|_| table.fresh(GENERIC_LEVEL)).collect();
     let row_vars: Vec<RowVarId> = (0..rows)
-        .map(|_| table.fresh_row_var(GENERIC_LEVEL, None))
+        .map(|_| table.fresh_row_var(GENERIC_LEVEL))
         .collect();
     let ids = vars
         .iter()

@@ -102,23 +102,8 @@ impl Row {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RowState {
-    /// `ceiling`: the most labels this variable may ever stand for (domains), `None` = any.
-    Unbound {
-        level: u32,
-        ceiling: Option<BTreeSet<Label>>,
-    },
+    Unbound { level: u32 },
     Link(Row),
-}
-
-pub fn intersect(
-    a: &Option<BTreeSet<Label>>,
-    b: &Option<BTreeSet<Label>>,
-) -> Option<BTreeSet<Label>> {
-    match (a, b) {
-        (Some(x), Some(y)) => Some(x.intersection(y).cloned().collect()),
-        (Some(x), None) | (None, Some(x)) => Some(x.clone()),
-        (None, None) => None,
-    }
 }
 
 #[cfg(test)]
@@ -137,17 +122,5 @@ mod tests {
         let rigid = Label::rigid("e");
         assert!(rigid.is_rigid());
         assert_eq!(rigid.to_string(), "e");
-    }
-
-    #[test]
-    fn intersects_ceilings() {
-        let read: BTreeSet<Label> = [Label::new("db", "read")].into();
-        let both: BTreeSet<Label> = [Label::new("db", "read"), Label::new("db", "write")].into();
-        assert_eq!(
-            intersect(&Some(both.clone()), &Some(read.clone())),
-            Some(read.clone())
-        );
-        assert_eq!(intersect(&None, &Some(both.clone())), Some(both));
-        assert_eq!(intersect(&None, &None), None);
     }
 }

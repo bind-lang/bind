@@ -7,31 +7,15 @@
 
 use std::collections::BTreeSet;
 
-use super::effects::{Label, Row, RowState, RowVarId, intersect};
+use super::effects::{Label, Row, RowState, RowVarId};
 use super::ty::{Constraint, Type, TypeTable, TypeVarId, VarState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UnifyError {
-    Mismatch {
-        expected: Type,
-        found: Type,
-    },
-    Infinite {
-        var: TypeVarId,
-        ty: Type,
-    },
-    Constraint {
-        constraint: Constraint,
-        ty: Type,
-    },
-    RowMismatch {
-        expected: Row,
-        found: Row,
-    },
-    Ceiling {
-        label: Label,
-        ceiling: BTreeSet<Label>,
-    },
+    Mismatch { expected: Type, found: Type },
+    Infinite { var: TypeVarId, ty: Type },
+    Constraint { constraint: Constraint, ty: Type },
+    RowMismatch { expected: Row, found: Row },
 }
 
 pub fn unify(table: &mut TypeTable, expected: &Type, found: &Type) -> Result<(), UnifyError> {
@@ -164,13 +148,10 @@ fn occurs_and_adjust(
 
 fn adjust_row_level(table: &mut TypeTable, row: &Row, level: u32) {
     if let Some(tail) = table.resolve_row(row).tail
-        && let RowState::Unbound {
-            level: tail_level,
-            ceiling,
-        } = table.row_state(tail).clone()
+        && let RowState::Unbound { level: tail_level } = table.row_state(tail).clone()
         && tail_level > level
     {
-        table.set_row(tail, RowState::Unbound { level, ceiling });
+        table.set_row(tail, RowState::Unbound { level });
     }
 }
 
@@ -197,13 +178,15 @@ pub fn unify_rows(table: &mut TypeTable, expected: &Row, found: &Row) -> Result<
             if !only_a.is_empty() {
                 return Err(mismatch());
             }
-            bind_row(table, x, Row::closed(only_b))
+            bind_row(table, x, Row::closed(only_b));
+            Ok(())
         }
         (None, Some(y)) => {
             if !only_b.is_empty() {
                 return Err(mismatch());
             }
-            bind_row(table, y, Row::closed(only_a))
+            bind_row(table, y, Row::closed(only_a));
+            Ok(())
         }
         (Some(x), Some(y)) if x == y => {
             if only_a.is_empty() && only_b.is_empty() {
@@ -213,62 +196,34 @@ pub fn unify_rows(table: &mut TypeTable, expected: &Row, found: &Row) -> Result<
             }
         }
         (Some(x), Some(y)) => {
-            let (x_level, x_ceiling) = unbound_row(table, x);
-            let (y_level, y_ceiling) = unbound_row(table, y);
-            // Check both ceilings before touching the table, so a failure leaves no
-            // partial state behind.
-            check_ceiling(&only_b, x_ceiling.as_ref())?;
-            check_ceiling(&only_a, y_ceiling.as_ref())?;
-            let fresh =
-                table.fresh_row_var(x_level.min(y_level), intersect(&x_ceiling, &y_ceiling));
-            bind_row(table, x, Row::with_tail(only_b, fresh))?;
-            bind_row(table, y, Row::with_tail(only_a, fresh))
+            let fresh = table.fresh_row_var(unbound_level(table, x).min(unbound_level(table, y)));
+            bind_row(table, x, Row::with_tail(only_b, fresh));
+            bind_row(table, y, Row::with_tail(only_a, fresh));
+            Ok(())
         }
     }
 }
 
-fn unbound_row(table: &TypeTable, id: RowVarId) -> (u32, Option<BTreeSet<Label>>) {
+fn unbound_level(table: &TypeTable, id: RowVarId) -> u32 {
     match table.row_state(id) {
-        RowState::Unbound { level, ceiling } => (*level, ceiling.clone()),
+        RowState::Unbound { level } => *level,
         RowState::Link(_) => unreachable!("`resolve_row` never returns a linked tail"),
     }
 }
 
-/// Fails when `labels` holds a non-rigid label outside `ceiling` (rigid labels are exempt).
-fn check_ceiling(
-    labels: &BTreeSet<Label>,
-    ceiling: Option<&BTreeSet<Label>>,
-) -> Result<(), UnifyError> {
-    if let Some(ceiling) = ceiling
-        && let Some(label) = labels
-            .iter()
-            .find(|label| !label.is_rigid() && !ceiling.contains(label))
-    {
-        return Err(UnifyError::Ceiling {
-            label: label.clone(),
-            ceiling: ceiling.clone(),
-        });
-    }
-    Ok(())
-}
-
-/// Links a row variable, enforcing its ceiling (rigid labels are exempt) and handing the
-/// ceiling and level down to the new tail.
-fn bind_row(table: &mut TypeTable, var: RowVarId, row: Row) -> Result<(), UnifyError> {
-    let (level, ceiling) = unbound_row(table, var);
-    check_ceiling(&row.labels, ceiling.as_ref())?;
+/// Links a row variable, handing its level down to the new tail.
+fn bind_row(table: &mut TypeTable, var: RowVarId, row: Row) {
+    let level = unbound_level(table, var);
     if let Some(tail) = row.tail {
-        let (tail_level, tail_ceiling) = unbound_row(table, tail);
+        let tail_level = unbound_level(table, tail);
         table.set_row(
             tail,
             RowState::Unbound {
                 level: tail_level.min(level),
-                ceiling: intersect(&tail_ceiling, &ceiling),
             },
         );
     }
     table.set_row(var, RowState::Link(row));
-    Ok(())
 }
 
 /// Requires `ty` to satisfy `constraint`; an unbound variable records it for later.
@@ -344,8 +299,8 @@ mod tests {
     #[test]
     fn open_rows_unify_by_exchanging_missing_labels() {
         let mut table = TypeTable::default();
-        let x = table.fresh_row_var(1, None);
-        let y = table.fresh_row_var(1, None);
+        let x = table.fresh_row_var(1);
+        let y = table.fresh_row_var(1);
         let a = Row::with_tail([read()], x);
         let b = Row::with_tail([write()], y);
         unify_rows(&mut table, &a, &b).unwrap();
@@ -364,7 +319,7 @@ mod tests {
             unify_rows(&mut table, &Row::closed([read()]), &Row::closed([write()])),
             Err(UnifyError::RowMismatch { .. })
         ));
-        let x = table.fresh_row_var(1, None);
+        let x = table.fresh_row_var(1);
         unify_rows(
             &mut table,
             &Row::with_tail([read()], x),
@@ -375,14 +330,14 @@ mod tests {
             table.resolve_row(&Row::with_tail([], x)),
             Row::closed([write()])
         );
-        let y = table.fresh_row_var(1, None);
+        let y = table.fresh_row_var(1);
         assert!(unify_rows(&mut table, &Row::with_tail([read()], y), &Row::empty()).is_err());
     }
 
     #[test]
     fn same_tail_with_different_labels_is_a_mismatch() {
         let mut table = TypeTable::default();
-        let x = table.fresh_row_var(1, None);
+        let x = table.fresh_row_var(1);
         assert!(
             unify_rows(
                 &mut table,
@@ -394,81 +349,9 @@ mod tests {
     }
 
     #[test]
-    fn open_open_ceiling_failure_leaves_no_partial_state() {
-        let mut table = TypeTable::default();
-        let x = table.fresh_row_var(1, None);
-        let y = table.fresh_row_var(1, Some([Label::new("server", "call")].into()));
-        let error = unify_rows(
-            &mut table,
-            &Row::with_tail([read()], x),
-            &Row::with_tail([], y),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            UnifyError::Ceiling {
-                label: read(),
-                ceiling: [Label::new("server", "call")].into()
-            }
-        );
-        assert_eq!(
-            table.resolve_row(&Row::with_tail([], x)),
-            Row::with_tail([], x)
-        );
-        assert!(matches!(
-            table.row_state(x),
-            RowState::Unbound { ceiling: None, .. }
-        ));
-    }
-
-    #[test]
-    fn ceilings_reject_labels_and_propagate_by_intersection() {
-        let mut table = TypeTable::default();
-        let client = table.fresh_row_var(1, Some([Label::new("server", "call")].into()));
-        let error = unify_rows(
-            &mut table,
-            &Row::with_tail([], client),
-            &Row::closed([read()]),
-        )
-        .unwrap_err();
-        assert_eq!(
-            error,
-            UnifyError::Ceiling {
-                label: read(),
-                ceiling: [Label::new("server", "call")].into()
-            }
-        );
-        let server = table.fresh_row_var(1, Some([read(), write()].into()));
-        let free = table.fresh_row_var(1, None);
-        unify_rows(
-            &mut table,
-            &Row::with_tail([], server),
-            &Row::with_tail([], free),
-        )
-        .unwrap();
-        assert!(
-            unify_rows(
-                &mut table,
-                &Row::with_tail([], free),
-                &Row::closed([Label::new("server", "call")])
-            )
-            .is_err()
-        );
-        let rigid = table.fresh_row_var(1, Some(BTreeSet::new()));
-        assert!(
-            unify_rows(
-                &mut table,
-                &Row::with_tail([], rigid),
-                &Row::closed([Label::rigid("e")])
-            )
-            .is_ok()
-        );
-    }
-
-    #[test]
     fn function_types_unify_their_rows() {
         let mut table = TypeTable::default();
-        let x = table.fresh_row_var(1, None);
+        let x = table.fresh_row_var(1);
         let a = Type::Fun(vec![int()], Box::new(int()), Row::with_tail([], x));
         let b = Type::Fun(vec![int()], Box::new(int()), Row::closed([read()]));
         unify(&mut table, &a, &b).unwrap();
@@ -484,7 +367,7 @@ mod tests {
     fn row_variables_are_generalized_and_instantiated() {
         let mut table = TypeTable::default();
         let a = table.fresh(2);
-        let e = table.fresh_row_var(2, None);
+        let e = table.fresh_row_var(2);
         let inner = Type::Fun(vec![a.clone()], Box::new(a.clone()), Row::with_tail([], e));
         let ty = Type::Fun(
             vec![inner, a],
@@ -507,7 +390,7 @@ mod tests {
         let reads = Type::Fun(vec![], Box::new(int()), read_row);
         assert_eq!(display(&reads), "() -> Int ! {db.read}");
         let mut table = TypeTable::default();
-        let e = table.fresh_row_var(1, None);
+        let e = table.fresh_row_var(1);
         let both = Type::Fun(
             vec![],
             Box::new(int()),

@@ -714,7 +714,7 @@ proptest! {
     fn row_unification_produces_a_unifier(a in arb_row(3), b in arb_row(3)) {
         let mut table = TypeTable::default();
         for _ in 0..3 {
-            table.fresh_row_var(1, None);
+            table.fresh_row_var(1);
         }
         if unify_rows(&mut table, &a, &b).is_ok() {
             prop_assert_eq!(table.resolve_row(&a), table.resolve_row(&b));

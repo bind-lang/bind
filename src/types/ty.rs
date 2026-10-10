@@ -124,14 +124,14 @@ impl TypeTable {
         Type::Var(self.vars.len() - 1)
     }
 
-    pub fn fresh_row_var(&mut self, level: u32, ceiling: Option<BTreeSet<Label>>) -> RowVarId {
-        self.rows.push(RowState::Unbound { level, ceiling });
+    pub fn fresh_row_var(&mut self, level: u32) -> RowVarId {
+        self.rows.push(RowState::Unbound { level });
         self.rows.len() - 1
     }
 
     /// An open row with no labels yet (consumed by effect inference, which builds on this).
     pub fn fresh_row(&mut self, level: u32) -> Row {
-        let var = self.fresh_row_var(level, None);
+        let var = self.fresh_row_var(level);
         Row::with_tail([], var)
     }
 
@@ -281,7 +281,7 @@ pub fn generalize(
     }
     let row_vars = free_row_vars(table, &resolved)
         .into_iter()
-        .filter(|id| matches!(table.row_state(*id), RowState::Unbound { level: var_level, .. } if *var_level > level))
+        .filter(|id| matches!(table.row_state(*id), RowState::Unbound { level: var_level } if *var_level > level))
         .collect();
     (
         Scheme {
@@ -304,11 +304,7 @@ pub fn instantiate(table: &mut TypeTable, scheme: &Scheme, level: u32) -> Type {
         .collect();
     let mut rows = BTreeMap::new();
     for id in &scheme.row_vars {
-        let ceiling = match table.row_state(*id) {
-            RowState::Unbound { ceiling, .. } => ceiling.clone(),
-            RowState::Link(_) => None,
-        };
-        rows.insert(*id, table.fresh_row_var(level, ceiling));
+        rows.insert(*id, table.fresh_row_var(level));
     }
     substitute(&scheme.ty, &types, &rows)
 }
