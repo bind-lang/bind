@@ -1,0 +1,21 @@
+[package]
+name = "bindc"
+version = "0.1.0"
+edition = "2024"
+description = "Bind whole-application compiler"
+license = "MIT"
+repository = "https://github.com/bind-lang/bind"
+homepage = "https://github.com/bind-lang/bind"
+
+[dependencies]
+sha2 = "=0.10.9"
+unicode-general-category = "=1.1.0"
+
+[[bin]]
+name = "bind"
+path = "src/main.rs"
+
+[profile.release]
+strip = true
+lto = "thin"
+codegen-units = 1

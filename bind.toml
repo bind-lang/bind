@@ -1,0 +1,29 @@
+[project]
+name = "commerce"
+version = "0.1.0"
+source = "examples/commerce/src"
+output = ".bind/generated"
+
+[compiler]
+strict = true
+warnings_as_errors = true
+
+[database.main]
+engine = "postgresql"
+schema = "examples/commerce/schema/main.csv"
+env = "DATABASE_URL"
+verification = "static"
+
+[target.aws-lambda]
+client = "elm"
+server = "rust"
+deployment = "aws-lambda"
+certified = true
+capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
+
+[target.vercel]
+client = "elm"
+server = "rust"
+deployment = "vercel"
+certified = true
+capabilities = ["ui.dom", "server.http", "db.read", "db.write"]

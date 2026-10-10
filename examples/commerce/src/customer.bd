@@ -1,0 +1,29 @@
+package app.customers
+
+distinct type CustomerId = UUID
+
+entity Customer(
+    val id: CustomerId,
+    val name: String,
+    val email: Email,
+    val balance: Money
+)
+
+environment development {
+    public val applicationName: String = env("APP_NAME", default = "Commerce")
+    runtime secret val databaseUrl: DatabaseUrl = env("DATABASE_URL")
+}
+
+server fun getCustomer(id: CustomerId): Customer
+    effects [db.read] {
+    return db.customers.require(id)
+}
+
+client component CustomerPage(id: CustomerId) {
+    val customer = server.getCustomer(id)
+
+    UI {
+        Text(customer.name)
+        Text(customer.email)
+    }
+}

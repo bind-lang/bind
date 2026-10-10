@@ -1,0 +1,7 @@
+# Deterministic PostgreSQL schema snapshot consumed by bindc v0.1.
+table,model,primary_key,column,type,nullable,required,has_default,engine
+customers,Customer,id,id,CustomerId,false,true,true,postgresql
+customers,Customer,id,name,String,false,true,false,postgresql
+customers,Customer,id,email,Email,false,true,false,postgresql
+customers,Customer,id,balance,Money,false,true,false,postgresql
+
