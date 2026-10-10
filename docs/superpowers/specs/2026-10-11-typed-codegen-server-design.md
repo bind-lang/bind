@@ -141,7 +141,7 @@ Crate `runtime/bind-runtime/` no repositório do `bindc`, com testes próprios. 
   - sai a restrição de uma operação de banco por `server fun` (E8304);
   - endpoints usam a linguagem inteira, com várias operações de banco na mesma transação;
   - o Rust inclui as funções alcançáveis a partir de algum endpoint pelo grafo de chamadas da IR;
-  - parâmetros e retorno de endpoints precisam ser tipos de fio (sem funções, sem `Duration`), E8xxx caso contrário.
+  - parâmetros e retorno de endpoints precisam ser tipos de fio (sem funções, sem `Duration`); caso contrário **E8309**. `Duration` como coluna de banco também gera E8309.
 - Fluxo:
 ```text
 verify → types::check → core::lower → core::validate → VerifiedApplication { core, … }
@@ -169,4 +169,4 @@ TDD, como nos subprojetos anteriores.
 4. Nenhum `panic!`, `unreachable!` ou `unwrap` alcançável no código gerado ou no runtime; overflow de `Decimal` e recursão profunda viram erros tipados.
 5. Teste diferencial com ≥ 1.000 programas e 0 divergências.
 6. `certify` aprovado nos dois targets com o `commerce` ampliado; site aprovado.
-7. `cargo test`, clippy e fmt limpos; documentação do perfil `rust-elm-web-v2` publicada.
+7. `cargo test`, clippy e fmt limpos; documentação do perfil em `docs/certified-profile-v0.2.md` (o `v0.1` é mantido como histórico).
