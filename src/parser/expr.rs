@@ -306,7 +306,9 @@ impl ExprParser {
             for _ in 0..width {
                 self.advance();
             }
-            let right = self.binary(precedence + 1)?;
+            // `?:` is right-associative (`a ?: b ?: c` is `a ?: (b ?: c)`); the rest are left-associative.
+            let next = if matches!(infix, Infix::Elvis) { precedence } else { precedence + 1 };
+            let right = self.binary(next)?;
             let span = left.span.clone();
             let kind = match infix {
                 Infix::Op(op) => ExprKind::Binary { op, left: Box::new(left), right: Box::new(right) },
@@ -925,6 +927,8 @@ mod tests {
         assert_eq!(expression("a || b && c == d"), "{ (a || (b && (c == d))) }");
         assert_eq!(expression("a < b + 1"), "{ (a < (b + 1)) }");
         assert_eq!(expression("a ?: b + 1"), "{ (a ?: (b + 1)) }");
+        assert_eq!(expression("a ?: b ?: c"), "{ (a ?: (b ?: c)) }");
+        assert_eq!(expression("a ?: b == c ?: d"), "{ ((a ?: b) == (c ?: d)) }");
         assert_eq!(expression("a - b - c"), "{ ((a - b) - c) }");
         assert_eq!(expression("-a * !b"), "{ ((-a) * (!b)) }");
         assert_eq!(expression("(a + b) * c"), "{ ((a + b) * c) }");

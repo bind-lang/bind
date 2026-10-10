@@ -1316,6 +1316,11 @@ mod tests {
     const PEDIDO: &str = "sealed class Pedido {\n    data class Pendente(val itens: Int)\n    data class Pago(val valor: Money)\n    data object Cancelado\n}\n";
 
     #[test]
+    fn elvis_chains_are_right_associative() {
+        assert_eq!(scheme("fun f(a: Int?, b: Int?): Int = a ?: b ?: 0", "f"), "(Int?, Int?) -> Int");
+    }
+
+    #[test]
     fn nested_optional_annotation_is_supported() {
         assert_eq!(scheme("fun f(a: Int??): Int? = a ?: null", "f"), "(Int??) -> Int?");
     }
