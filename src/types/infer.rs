@@ -73,6 +73,8 @@ struct Checker<'a> {
     domain: Domain,
     /// Declared domain of each function, to recognize server endpoints used by clients.
     function_domains: BTreeMap<String, Domain>,
+    /// `server fun`s that are not components: the only targets of `server.f`.
+    endpoints: BTreeSet<String>,
     /// Calls each function makes to program functions, in order, for effect paths.
     calls: BTreeMap<String, Vec<(String, Span)>>,
 }
@@ -124,6 +126,7 @@ impl<'a> Checker<'a> {
             effect_scope: BTreeMap::new(),
             domain: Domain::Inferred,
             function_domains: BTreeMap::new(),
+            endpoints: BTreeSet::new(),
             calls: BTreeMap::new(),
         }
     }
@@ -138,6 +141,9 @@ impl<'a> Checker<'a> {
                 .insert(function.name.clone(), function.span.clone());
             self.function_domains
                 .insert(function.name.clone(), function.domain.clone());
+            if function.domain == Domain::Server && !function.component {
+                self.endpoints.insert(function.name.clone());
+            }
         }
         let (annotated, inferred): (Vec<&Function>, Vec<&Function>) = program
             .functions
@@ -1570,6 +1576,16 @@ impl<'a> Checker<'a> {
         {
             if base == "server" {
                 let declared = self.function_spans.contains_key(name);
+                if declared && !self.endpoints.contains(name) {
+                    self.error(
+                        "E7404",
+                        format!(
+                            "`server.{name}` is not a server endpoint; declare it `server fun`."
+                        ),
+                        span,
+                    );
+                    return Type::Error;
+                }
                 return match self.globals.get(name).cloned().filter(|_| declared) {
                     Some(scheme) => match instantiate(&mut self.table, &scheme, self.level) {
                         // Open, like any instantiated function, so it fits where more
@@ -3759,5 +3775,25 @@ mod tests {
             "(Int, () -> Int ! 'e) -> Int ! 'e"
         );
         assert_eq!(scheme_in(&schemes, "use"), "(ClienteId) -> Int ! {db.read}");
+    }
+
+    #[test]
+    fn server_calls_require_a_server_endpoint() {
+        for target in [
+            "fun ler(id: ClienteId) = db.clientes.require(id)\n",
+            "pure fun ler(id: ClienteId): ClienteId = id\n",
+            "client fun ler(id: ClienteId): ClienteId = id\n",
+            "client component ler(id: ClienteId) {\n    UI { Text(\"x\") }\n}\n",
+        ] {
+            let diagnostics = db_diagnostics(&format!(
+                "{target}client fun t(id: ClienteId) = server.ler(id)\n"
+            ));
+            let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+            assert_eq!(codes, vec!["E7404"], "{target}: {diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].message,
+                "`server.ler` is not a server endpoint; declare it `server fun`."
+            );
+        }
     }
 }
