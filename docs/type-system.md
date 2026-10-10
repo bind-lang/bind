@@ -23,7 +23,8 @@ Option<T>` (written `T?`) and `Result<T, E>` with constructors `Ok(value: T)` an
 
 `Int` has arbitrary precision. `Double` and `Float` are IEEE 754. User types (`data class`, `entity`,
 `sealed class`, `enum class`, `distinct type`) are nominal: two types are equal only if they have the
-same name and equal arguments.
+same name and equal arguments. An `entity` cannot have type parameters, because it maps to a concrete
+database table (E7004).
 
 ## Judgements
 
@@ -54,11 +55,19 @@ Operator constraints are closed sets, ordered from weakest to strongest:
 
 | Constraint | Accepted types | Operators |
 |---|---|---|
-| `Eq` | every type that contains no function and no type parameter | `==` `!=` |
+| `Eq` | every type that contains no function, no `Ui` and no type parameter | `==` `!=` |
 | `Ord` | `Add` ∪ {Date, DateTime, Instant} | `<` `<=` `>` `>=` |
 | `Add` | `Sub` ∪ {String} | `+` |
 | `Sub` | `Num` ∪ {Money, Duration} | `-` (binary and unary) |
 | `Num` | {Int, Double, Float, Decimal} | `*` `/` |
+
+`Eq` looks inside user types: a type whose constructor fields contain a function, `Ui` or another
+such type (directly, through a wrapper such as `data class W(val h: H)`, or in one variant of a sealed
+class) does not support equality (E7301). The type's own parameters do not count, because they are
+checked through the type arguments: `Box<Int>` supports `==`, `Box<(Int) -> Int>` does not.
+
+`?:` is right-associative: `a ?: b ?: c` is `a ?: (b ?: c)`, so
+`fun f(a: Int?, b: Int?): Int = a ?: b ?: 0` type-checks.
 
 `%` requires `Int` operands and has type `Int?`. If the operand type of `/` is still an unresolved variable
 when the division is checked, the result type cannot be decided and the program is rejected (E7302):
@@ -95,7 +104,8 @@ A name declared by the program takes precedence over them.
 Without mutation the value restriction is unnecessary: every `val` is generalized.
 
 `server fun`, `client component` and functions without a body must annotate every parameter and the
-result (E7003). A component's result is `Ui`.
+result (E7003). A component's result is `Ui`. Default parameter values (`x: Int = 1`) are not
+supported (E7004).
 
 A block's value is its last expression (`Unit` if it ends with `val` or is empty). Any other
 expression statement must have type `Unit`; discarding a value is an error (E7108). Write
@@ -108,9 +118,22 @@ allowed inside lambdas (E7111).
 p ::= _ | x | literal | null | C | C(p1, …, pn)
 ```
 
-A pattern is checked against the scrutinee's type. At a type already known to be `T?`, every pattern
-other than `_` and `null` describes a non-null value and is checked against `T`; therefore
-`when (x) { n -> … }` over `Int?` is incomplete, and `n` has type `Int`.
+A pattern is checked against the scrutinee's type (or, inside a constructor pattern, the field's type):
+
+- `_` and a variable `x` are irrefutable. A variable binds the type at its position as is, at any
+  depth: in `when (u) { U(n, e) -> … }` with `data class U(val nome: String, val email: String?)`,
+  `e : String?`, and `when (x) { n -> n }` over `Int?` gives `n : Int?`.
+- Smart cast: in a `when` whose scrutinee has type `T?`, a top-level variable arm that comes after a
+  top-level `null` arm binds `T`, and for exhaustiveness it counts as the non-null case (`null` is
+  already covered). So `when (x) { null -> 0; n -> n }` over `Int?` has `n : Int`, and over `Int??`
+  `when (x) { null -> 0; y -> y ?: 1 }` has `y : Int?`.
+- A constructor or literal pattern checked against a type already known to be `T?` describes a non-null
+  value and is checked against `T`. Exactly one optional layer is unwrapped per pattern level: over
+  `Int??`, the pattern `1` is checked against `Int?` and rejected.
+
+The rule is independent of arm order except for the smart cast, which by definition applies only after
+a `null` arm. The elaborated patterns of each `when`, with optional layers explicit, are recorded in the
+typed program for later passes.
 
 A bare pattern name that is not a constructor and starts with an uppercase letter is rejected as an
 unknown constructor (E7103), so a misspelled constructor cannot become a catch-all. A name bound twice in
@@ -158,10 +181,20 @@ UI form. `a?.f` requires `a : A?` and has type `F?`.
 Target property: a well-typed program does not get stuck (progress and preservation). The rules above
 are the specification; the implementation is tested rule by rule (`src/types/infer.rs`), by golden
 cases (`tests/typecheck/`) and by properties (`src/types/props.rs`): unification yields a unifier,
-inferred types are principal and stable under re-annotation, exhaustiveness agrees with brute-force
-enumeration, and the parser round-trips its own output. There is no mechanized proof yet.
+inferred types are stable under re-annotation, exhaustiveness agrees with brute-force enumeration, and
+the parser round-trips its own output. There is no mechanized proof yet.
+
+Inference is principal (every accepted annotation is an instance of the inferred type) except for two
+documented, order-dependent conveniences: the flattening of `?.` (see below) and the resolution of a
+field access on a value of still unknown type to the only record type that declares the field. Both
+depend on what is known when the expression is checked; annotating the value restores principality.
 
 ## Known limits
+
+- Nesting is bounded so that hostile input is reported rather than crashing the compiler: expressions,
+  patterns and types nest at most 256 levels deep ("Expression is nested too deeply (limit 256).",
+  E7004), and the operator chains being parsed hold at most 1000 operators ("Operator chain is too long
+  (limit 1000).", E7004).
 
 - `a?.f` flattens to `F?` when the field type `F` is already known to be nullable at that point. When
   that is only learned later (an unannotated generic receiver), the result may be `F??`.
