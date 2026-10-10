@@ -396,8 +396,16 @@ impl Parser {
                 name: parameter_name,
                 type_ref,
             });
-            if self.consume("=") {
-                self.recover_to(&[",", ")"]);
+            if self.peek_text() == "=" {
+                self.diagnostics.push(Diagnostic::error(
+                    "E7004",
+                    "Default parameter values are not supported.",
+                    self.peek().span.clone(),
+                ));
+                self.advance();
+                if !self.skip_default_value() {
+                    return None;
+                }
             }
             self.consume(",");
         }
@@ -649,6 +657,27 @@ impl Parser {
         self.peek().kind == TokenKind::Eof
     }
 
+    /// Skips a default parameter value up to the `,` or `)` that ends it (outside nested
+    /// brackets). Stops early, returning false, at a new line that starts a top-level
+    /// declaration, so an unclosed parameter list does not swallow the next declaration.
+    fn skip_default_value(&mut self) -> bool {
+        let mut depth = 0usize;
+        while !self.at_eof() {
+            let starts_line = self.index > 0 && self.peek().span.line != self.tokens[self.index - 1].span.line;
+            if starts_line && is_top_level_start(self.peek_text()) {
+                return false;
+            }
+            match self.peek_text() {
+                "," | ")" if depth == 0 => return true,
+                "(" | "[" | "{" => depth += 1,
+                ")" | "]" | "}" => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+            self.advance();
+        }
+        false
+    }
+
     fn recover_to(&mut self, texts: &[&str]) {
         while !self.at_eof() && !texts.contains(&self.peek_text()) {
             self.advance();
@@ -797,6 +826,27 @@ mod tests {
             rendered,
             vec![Some("{ 1 }".into()), Some("{ val x = 1; (x + 1) }".into()), None]
         );
+    }
+
+    fn parse_with_codes(source: &str) -> (Program, Vec<&'static str>) {
+        let (tokens, _) = lex("test.bd", source);
+        let (program, diagnostics) = parse(tokens);
+        (program, diagnostics.iter().map(|item| item.code).collect())
+    }
+
+    #[test]
+    fn default_parameter_values_are_rejected() {
+        let (program, codes) = parse_with_codes("fun f(x: Int = \"oops\"): Int = x\n");
+        assert_eq!(codes, vec!["E7004"]);
+        assert_eq!(program.functions[0].parameters.len(), 1);
+        let (program, codes) = parse_with_codes("fun f(x: Int = g(1, 2), y: Int): Int = x\n");
+        assert_eq!(codes, vec!["E7004"]);
+        assert_eq!(program.functions[0].parameters.len(), 2);
+        let (program, codes) = parse_with_codes("fun f(x: Int = 1\nfun g(): Int = 2\n");
+        assert_eq!(codes, vec!["E7004"]);
+        let names: Vec<&str> = program.functions.iter().map(|function| function.name.as_str()).collect();
+        assert!(names.contains(&"g"), "{names:?}");
+        assert_eq!(program.functions.iter().find(|function| function.name == "g").unwrap().body_kind, BodyKind::Expression);
     }
 
     #[test]
