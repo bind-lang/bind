@@ -112,6 +112,149 @@ expression statement must have type `Unit`; discarding a value is an error (E710
 `val _ = e` to discard deliberately. `return e` checks `e` against the function's result and is not
 allowed inside lambdas (E7111).
 
+## Effects and domains
+
+Function types carry the effects that calling them performs. Effects are inferred, never guessed
+from tokens, and `effects [...]` is a contract the checker verifies exactly.
+
+### Labels
+
+An effect label is a pair `resource.operation`. The v1 labels are `db.read`, `db.write` and
+`server.call`. The resource is a declared name (today only `db`); the technology behind it stays in
+the declaration. Caches, queues and files will get their own operations (`read`/`write`,
+`publish`/`consume`); they have none yet. An unknown resource, operation or effect variable is E7405.
+
+### Rows
+
+A function type is `Fun(params, result, row)`, written `(τ1, …, τn) -> τ ! row`. A row is a set of
+labels plus an optional row variable: `{db.read}`, `{db.read | 'e}`, `'e`. A closed empty row (a pure
+function) shows nothing.
+
+```text
+dobro  : (Int) -> Int
+buscar : (ClienteId) -> Cliente ! {db.read}
+aplica : (('a) -> 'b ! 'e, 'a) -> 'b ! 'e
+map    : (List<'a>, ('a) -> 'b ! 'e) -> List<'b> ! 'e
+```
+
+Row variables render as `'e`, `'e1`, `'e2`, …; type variables skip the letter `e` (`'a 'b 'c 'd 'f`).
+Display hides a row variable that occurs once and only in result positions (a function's own row or
+the row of a returned function), because it constrains nothing; a row variable in a parameter
+position is always shown.
+
+### Annotations
+
+```kotlin
+fun aplica(f: (Int) -> Int, x: Int): Int = f(x)                       // f is pure
+fun lê(f: (Int) -> Int ! [db.read], x: Int): Int = f(x)               // effects in a parameter
+fun <A, B> mapear(xs: List<A>, f: (A) -> B ! [e]): List<B> effects [e] = map(xs, f)
+server fun buscar(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)
+```
+
+- In a function type, `! [r1, r2, e]` lists the effects; no `!` means pure.
+- Inside `[...]`, a lowercase name without a dot is an effect variable; `resource.operation` is a label.
+- `effects [...]` is the row of the function itself. A `server fun` without a clause means `effects []`.
+- A row holds at most one effect variable (two distinct ones are E7004).
+- Effect variables are generic in the function's scheme, rigid in the body of an annotated function
+  (like `T` in `fun <T> f(x: T)`), and flexible in inferred functions.
+- A `pure` or `server` function without an `effects` clause implicitly carries the effect variables
+  named in its parameter types.
+
+### Rules
+
+Every function or lambda body is inferred under a context row, an open row `{| ρ}` into which each
+effect it produces is unified.
+
+| Construct | Effect in the current context |
+|---|---|
+| `db.t.require(k)`, `db.t.find(k)` | `db.read` |
+| `db.t.insert { … }` | `db.write` |
+| `server.f(args)` | `server.call`; the row of `f` does not reach the caller |
+| `f(args)` | the row of `f`'s type |
+| lambda `{ x -> … }` | none when created; its body has its own row, which becomes the row of the lambda's type |
+| UI, literals, `if`, `when`, `val`, operators | only the effects of the subexpressions |
+
+```text
+          f : (τ1, …, τn) -> τ ! ρ        Γ ⊢ ei : τi
+ (App) ──────────────────────────────────────────────────   context row ⊇ ρ
+                  Γ ⊢ f(e1, …, en) : τ
+
+          Γ, x1 : τ1, …, xn : τn ⊢ b : τ ! ρ
+ (Lam) ───────────────────────────────────────────────   no effect at creation
+        Γ ⊢ { x1, …, xn -> b } : (τ1, …, τn) -> τ ! ρ
+```
+
+- Absorption: calling a function adds its row to the context row.
+- Row unification treats labels as an unordered set: `{L1 | ρ1} ~ {L2 | ρ2}` gives
+  `ρ1 := {L2 \ L1 | ρ3}` and `ρ2 := {L1 \ L2 | ρ3}`. A closed row only unifies with an equal set. There
+  is an occurs check and level adjustment.
+- Instantiation opens: instantiating a name opens a closed row at the top of its function type with a
+  fresh variable. A pure function can be passed where effects are accepted; a lambda that performs
+  an effect cannot be passed to a parameter annotated pure (E7101).
+- Generalization closes only a function's own top row. The rows of returned functions stay open.
+- `server.f` used as a value has the open row `{server.call | …}` (never `f`'s own effects), so
+  `map(ids, server.buscar)` in client code performs only `server.call`.
+
+### Domains as ceilings
+
+| Function | Ceiling |
+|---|---|
+| `pure fun` | `{}` |
+| `server fun` | `{db.read, db.write}` |
+| `client fun`, `client component` | `{server.call}` |
+| `fun` (no modifier), `worker`, `database`, `external` | none |
+
+Ceilings are checked after each function body (after the whole recursive group for mutually
+recursive functions): a concrete label outside the ceiling is E7401 at the function, with the path to
+the operation and a hint chosen by (domain, label). Ceilings never travel to callers. They constrain
+only concrete labels: effect variables are polymorphic in every domain, and the caller is charged when
+it instantiates the variable.
+
+```text
+BIND ERROR E7401
+`tela` is client code and cannot perform `db.read`.
+Binding path:
+    tela
+      -> buscar (src/app.bd:9:5)
+      -> db.clientes.require (src/app.bd:4:40)
+```
+
+E7404 is structural: any use of a `server fun` name in client code, as a call or as a value, is
+rejected, even if it has no effects. Reach it with `server.f(...)`.
+
+`pure` means effect-free: a pure function may call any effect-free function, including an effect-free
+`server fun`.
+
+### Exact contracts
+
+The body is inferred under a fresh row (with the domain's ceiling) and then compared with the
+declaration. An effect produced but not declared is E7402; one declared but not produced is E7403.
+Both E7401 and E7402 carry the binding path from the function to the operation.
+
+A function has its signature known in advance, so it is rigid and joins the annotated path, when its
+parameters and result are annotated and its effects are known: it has an `effects [...]` clause, it is
+`pure fun` (`[]`), or it is `server fun` (no clause means `[]`). All others, including
+`client component` and `fun` without a clause, have their effects inferred with the call-graph
+components; their type annotations still apply as constraints. Consequence: polymorphic recursion needs
+`effects [...]` (or `pure`).
+
+### Capabilities
+
+The capabilities a program requires come from the typed effects: the existing domain capabilities
+(`ui.dom` for client code, `server.http` for server code) plus the inferred resource labels
+(`db.read`, `db.write`). `server.call` is not a capability. The typed program records the resolved,
+sorted labels of each function; the generated artifacts, including `bind-manifest.json`, are unchanged.
+
+### Diagnostics
+
+| Code | When |
+|---|---|
+| E7401 | an effect exceeds the domain's ceiling |
+| E7402 | an effect is performed but not declared |
+| E7403 | an effect is declared but not performed |
+| E7404 | a `server fun` is used directly in `client` code |
+| E7405 | unknown effect label or effect variable |
+
 ## Patterns and exhaustiveness
 
 ```text
@@ -201,8 +344,14 @@ depend on what is known when the expression is checked; annotating the value res
 - UI node and `Text` arguments must have a known type: unannotated helper parameters used there need
   annotations.
 - Non-termination: a recursive function may loop forever; termination is not checked.
-- Effects (`effects [db.read]`) and deployment domains are still verified by the legacy analysis, not
-  by the type system.
+- Effects of caches, queues and files have no operations yet; there is a single database (`db`).
+- A row holds at most one effect variable (two distinct ones are E7004). So `f: () -> A ! [db.read, e]`
+  and `g: () -> A ! [db.write, e]` cannot be called in the same inferred function: set-based rows
+  cannot share a tail with different labels.
+- A declared effect can be justified by a recursive cycle (an over-approximation, so safe).
+- Diagnostic paths stop at locals, and E7401 is reported at the function (the path gives the operation).
+- Known gap: the body of an effect-free `server fun` can be reached without `server.` through `pure`
+  or plain helpers, since `pure` only means effect-free.
 - No refinement types: properties of values (`balance >= 0`) are not checked.
 - `"\$name"` (an escaped dollar followed by a letter) is rejected as interpolation, because the lexer
   has already decoded the escape. Write `"$" + "name"`.

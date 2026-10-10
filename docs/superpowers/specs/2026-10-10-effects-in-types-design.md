@@ -48,7 +48,7 @@ aplica : (('a) -> 'b ! 'e, 'a) -> 'b ! 'e
 map    : (List<'a>, ('a) -> 'b ! 'e) -> List<'b> ! 'e
 ```
 
-Linha vazia fechada: nada é exibido. Variáveis de linha são renderizadas como `'e`, `'f`… em ordem de aparição, separadas das variáveis de tipo.
+Linha vazia fechada: nada é exibido. Variáveis de linha são renderizadas como `'e`, `'e1`, `'e2`… em ordem de aparição; as variáveis de tipo pulam a letra `e` (`'a 'b 'c 'd 'f`…).
 
 ### Sintaxe nas anotações
 
@@ -162,3 +162,11 @@ TDD, como no subprojeto 1.
 5. Capacidades derivadas dos efeitos tipados, com hashes idênticos.
 6. `cargo clippy --all-targets -- -D warnings` e `cargo fmt --check` limpos.
 7. `docs/type-system.md` com uma seção de efeitos: regras formais, domínios e o modelo `recurso.operação`.
+
+## Desvios aprovados durante a implementação
+
+1. **Tetos checados depois do corpo.** Os tetos são verificados ao fim de cada função (ao fim do grupo recursivo, em recursão mútua): rótulos concretos fora do teto geram E7401 na função, com o caminho até a operação e uma dica por (domínio, rótulo). Tetos nunca viajam para quem chama.
+2. **Variáveis de efeito polimórficas em todo domínio.** Tetos restringem só rótulos concretos; quem chama paga ao instanciar a variável. Uma função `pure`/`server` sem cláusula `effects` carrega implicitamente as variáveis de efeito citadas nos tipos dos parâmetros.
+3. **Generalização fecha só a linha de topo da própria função.** As linhas de funções retornadas ficam abertas. A exibição esconde uma variável de linha que ocorre uma só vez e só em posição de resultado; em posição de parâmetro ela sempre aparece.
+4. **`server.f` como valor** tem linha aberta `{server.call | …}`. E7404 vale para qualquer uso do nome de uma `server fun` em código `client` (chamada ou valor).
+5. **`pure` significa livre de efeitos:** uma função pura pode chamar qualquer função sem efeitos, inclusive uma `server fun` sem efeitos (o antigo E6102 deixou de existir). Lacuna conhecida: o corpo de um endpoint sem efeitos pode ser alcançado sem `server.` por auxiliares `pure` ou comuns.

@@ -110,6 +110,7 @@ Neither command is run automatically because both require the user's cloud accou
 - nominal and nullable types across Bind, Rust, JSON, Elm, and PostgreSQL;
 - declared function returns and argument compatibility;
 - effect declarations and client/server domain rules;
+- effects (`db.read`, `db.write`, `server.call`) and deployment domains in the type system, with exact `effects [...]` contracts (see [type system](docs/type-system.md));
 - typed environment declarations and secret-to-client rejection;
 - database table, field, type, nullability, and required-insert checks against a deterministic schema snapshot;
 - compiler-owned RPC paths, strict request decoding, response codecs, and generated malformed-contract tests;
