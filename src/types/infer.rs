@@ -5,17 +5,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ast::{Function, Program, TypeKind, TypeRef};
+use crate::ast::{Domain, Function, Program, TypeKind, TypeRef};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::parser::expr::parse_type_text;
 use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
 
-use super::effects::Row;
+use super::effects::{DB_READ, DB_WRITE, Label, Row, RowState, RowVarId, SERVER_CALL};
 use super::env::{Env, UI_NODES, rigid_vars};
 use super::exhaustive::{self, Pat};
 use super::ty::*;
-use super::unify::{UnifyError, constrain, unify};
+use super::unify::{UnifyError, constrain, unify, unify_rows};
 
 /// Level of quantified variables in schemes; never adjusted by unification.
 const GENERIC_LEVEL: u32 = u32::MAX;
@@ -32,6 +32,8 @@ pub struct TypedProgram {
     /// Elaborated patterns of each `when`, keyed by function and the `when` node, with the
     /// optional layers made explicit (`Some(...)`), so later passes need not re-derive them.
     pub patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
+    /// Resolved effect labels of each function (e.g. `["db.read"]`), sorted.
+    pub effects: BTreeMap<String, Vec<String>>,
 }
 
 pub fn check_program(
@@ -61,6 +63,19 @@ struct Checker<'a> {
     nodes: BTreeMap<(String, NodeId), (Type, Span)>,
     patterns: BTreeMap<(String, NodeId), Vec<Pat>>,
     diagnostics: Vec<Diagnostic>,
+    /// Effects performed so far by the body being checked (the function's or a lambda's).
+    context: Row,
+    /// Where each effect of each function first comes from.
+    effect_origins: BTreeMap<String, BTreeMap<Label, Origin>>,
+    /// Effect variables of the signature whose body is being checked.
+    effect_scope: BTreeMap<String, Row>,
+}
+
+/// Where a function's effect first comes from, for diagnostics that show the path.
+#[derive(Clone, Debug)]
+enum Origin {
+    Operation { text: String, span: Span },
+    Call { callee: String, span: Span },
 }
 
 impl<'a> Checker<'a> {
@@ -82,6 +97,9 @@ impl<'a> Checker<'a> {
             nodes: BTreeMap::new(),
             patterns: BTreeMap::new(),
             diagnostics: Vec::new(),
+            context: Row::empty(),
+            effect_origins: BTreeMap::new(),
+            effect_scope: BTreeMap::new(),
         }
     }
 
@@ -131,6 +149,7 @@ impl<'a> Checker<'a> {
                 &declaration.type_ref,
                 &declaration.span,
                 &BTreeMap::new(),
+                &BTreeMap::new(),
                 true,
             );
             let ty = if declaration.optional {
@@ -149,7 +168,7 @@ impl<'a> Checker<'a> {
         let builtins = [
             (
                 "first",
-                builtin(table, 1, |v| {
+                builtin(table, 1, 0, |v, _| {
                     Type::Fun(
                         vec![list(&v[0])],
                         Box::new(Type::option(v[0].clone())),
@@ -159,7 +178,7 @@ impl<'a> Checker<'a> {
             ),
             (
                 "get",
-                builtin(table, 1, |v| {
+                builtin(table, 1, 0, |v, _| {
                     Type::Fun(
                         vec![list(&v[0]), Type::con("Int")],
                         Box::new(Type::option(v[0].clone())),
@@ -169,40 +188,43 @@ impl<'a> Checker<'a> {
             ),
             (
                 "length",
-                builtin(table, 1, |v| {
+                builtin(table, 1, 0, |v, _| {
                     Type::Fun(vec![list(&v[0])], Box::new(Type::con("Int")), Row::empty())
                 }),
             ),
             (
                 "map",
-                builtin(table, 2, |v| {
-                    let mapper =
-                        Type::Fun(vec![v[0].clone()], Box::new(v[1].clone()), Row::empty());
+                builtin(table, 2, 1, |v, r| {
+                    let mapper = Type::Fun(
+                        vec![v[0].clone()],
+                        Box::new(v[1].clone()),
+                        Row::with_tail([], r[0]),
+                    );
                     Type::Fun(
                         vec![list(&v[0]), mapper],
                         Box::new(list(&v[1])),
-                        Row::empty(),
+                        Row::with_tail([], r[0]),
                     )
                 }),
             ),
             (
                 "fold",
-                builtin(table, 2, |v| {
+                builtin(table, 2, 1, |v, r| {
                     let step = Type::Fun(
                         vec![v[1].clone(), v[0].clone()],
                         Box::new(v[1].clone()),
-                        Row::empty(),
+                        Row::with_tail([], r[0]),
                     );
                     Type::Fun(
                         vec![list(&v[0]), v[1].clone(), step],
                         Box::new(v[1].clone()),
-                        Row::empty(),
+                        Row::with_tail([], r[0]),
                     )
                 }),
             ),
             (
                 "emptyList",
-                builtin(table, 1, |v| {
+                builtin(table, 1, 0, |v, _| {
                     Type::Fun(Vec::new(), Box::new(list(&v[0])), Row::empty())
                 }),
             ),
@@ -222,10 +244,17 @@ impl<'a> Checker<'a> {
             }
             vars.insert(name.clone(), var);
         }
-        let ty = self.signature(function, &vars, true);
+        let mut effects = BTreeMap::new();
+        let mut row_vars = Vec::new();
+        for name in effect_variable_names(function) {
+            let var = self.table.fresh_row_var(GENERIC_LEVEL, None);
+            row_vars.push(var);
+            effects.insert(name, Row::with_tail([], var));
+        }
+        let ty = self.signature(function, &vars, &effects, true);
         Scheme {
             vars: ids,
-            row_vars: Vec::new(),
+            row_vars,
             ty,
         }
     }
@@ -235,12 +264,13 @@ impl<'a> Checker<'a> {
         &mut self,
         function: &Function,
         vars: &BTreeMap<String, Type>,
+        effects: &BTreeMap<String, Row>,
         report: bool,
     ) -> Type {
         let mut params = Vec::new();
         for parameter in &function.parameters {
             let ty = match &parameter.type_ref {
-                Some(type_ref) => self.lower_ref(type_ref, &function.span, vars, report),
+                Some(type_ref) => self.lower_ref(type_ref, &function.span, vars, effects, report),
                 None => self.fresh(),
             };
             params.push(ty);
@@ -249,11 +279,23 @@ impl<'a> Checker<'a> {
             Type::con("Ui")
         } else {
             match &function.return_type {
-                Some(type_ref) => self.lower_ref(type_ref, &function.span, vars, report),
+                Some(type_ref) => self.lower_ref(type_ref, &function.span, vars, effects, report),
                 None => self.fresh(),
             }
         };
-        Type::Fun(params, Box::new(result), Row::empty())
+        let row = if effects_known(function) {
+            let mut sink = Vec::new();
+            let diagnostics = if report {
+                &mut self.diagnostics
+            } else {
+                &mut sink
+            };
+            self.env
+                .lower_row(&function.effects, effects, &function.span, diagnostics)
+        } else {
+            self.table.fresh_row(self.level)
+        };
+        Type::Fun(params, Box::new(result), row)
     }
 
     fn lower_ref(
@@ -261,6 +303,7 @@ impl<'a> Checker<'a> {
         type_ref: &TypeRef,
         span: &Span,
         vars: &BTreeMap<String, Type>,
+        effects: &BTreeMap<String, Row>,
         report: bool,
     ) -> Type {
         let mut sink = Vec::new();
@@ -270,7 +313,7 @@ impl<'a> Checker<'a> {
             &mut sink
         };
         match parse_type_text(&type_ref.display(), span) {
-            Ok(te) => self.env.lower(&te, vars, diagnostics),
+            Ok(te) => self.env.lower_with_effects(&te, vars, effects, diagnostics),
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 Type::Error
@@ -282,19 +325,29 @@ impl<'a> Checker<'a> {
         self.level += 1;
         let mut types = Vec::new();
         let mut scopes = Vec::new();
+        let mut effect_scopes = Vec::new();
         for function in group {
             let mut scope = BTreeMap::new();
             for name in &function.type_params {
                 scope.insert(name.clone(), self.fresh());
             }
-            let ty = self.signature(function, &scope, true);
+            // Effect variables of an inferred function are flexible, like its type parameters.
+            let effects: BTreeMap<String, Row> = effect_variable_names(function)
+                .into_iter()
+                .map(|name| (name, self.table.fresh_row(self.level)))
+                .collect();
+            let ty = self.signature(function, &scope, &effects, true);
             self.globals
                 .insert(function.name.clone(), Scheme::mono(ty.clone()));
             types.push(ty);
             scopes.push(scope);
+            effect_scopes.push(effects);
         }
-        for ((function, ty), scope) in group.iter().zip(&types).zip(&scopes) {
+        for (((function, ty), scope), effects) in
+            group.iter().zip(&types).zip(&scopes).zip(effect_scopes)
+        {
             self.rigid = scope.clone();
+            self.effect_scope = effects;
             self.check_body(function, ty);
         }
         self.rigid.clear();
@@ -305,6 +358,9 @@ impl<'a> Checker<'a> {
             self.report_ambiguous(&function.name);
         }
         self.level -= 1;
+        for ty in &types {
+            self.close_positive_rows(ty);
+        }
         for (function, ty) in group.iter().zip(&types) {
             let (scheme, ambiguous) = generalize(&self.table, self.level, ty);
             self.report_constraints(ambiguous, &function.span);
@@ -318,7 +374,28 @@ impl<'a> Checker<'a> {
         let mut seen: BTreeMap<TypeVarId, &str> = BTreeMap::new();
         for name in &function.type_params {
             let Some(var) = scope.get(name) else { continue };
-            let requirement = match self.table.shallow(var) {
+            let shallow = self.table.shallow(var);
+            // An operator constraint left on the variable specializes the parameter just as a
+            // concrete type would (e.g. `a == b` on a declared `T`).
+            if let Type::Var(id) = shallow
+                && let VarState::Unbound {
+                    constraint: Some(constraint),
+                    ..
+                } = self.table.state(id).clone()
+            {
+                self.error(
+                    "E7301",
+                    format!(
+                        "Type parameter `{name}` of `{}` is declared generic, but the body requires {}.",
+                        function.name,
+                        constraint.describe()
+                    ),
+                    &function.span,
+                );
+                self.table.set(id, VarState::Link(Type::Error));
+                continue;
+            }
+            let requirement = match shallow {
                 Type::Error => continue,
                 Type::Var(id) => match seen.get(&id) {
                     Some(other) => format!("it to equal `{other}`"),
@@ -344,7 +421,16 @@ impl<'a> Checker<'a> {
         self.level += 1;
         self.rigid = rigid_vars(&function.type_params);
         let rigid = self.rigid.clone();
-        let ty = self.signature(function, &rigid, false);
+        // Inside the body, an effect variable only equals itself (like a rigid type parameter).
+        let effects: BTreeMap<String, Row> = effect_variable_names(function)
+            .into_iter()
+            .map(|name| {
+                let row = Row::closed([Label::rigid(&name)]);
+                (name, row)
+            })
+            .collect();
+        let ty = self.signature(function, &rigid, &effects, false);
+        self.effect_scope = effects;
         self.check_body(function, &ty);
         self.report_ambiguous(&function.name);
         self.rigid.clear();
@@ -352,7 +438,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_body(&mut self, function: &Function, ty: &Type) {
-        let Type::Fun(params, result, _) = ty else {
+        let Type::Fun(params, result, row) = ty else {
             return;
         };
         let mut names = BTreeSet::new();
@@ -376,6 +462,12 @@ impl<'a> Checker<'a> {
             self.locals
                 .push((parameter.name.clone(), Scheme::mono(param.clone())));
         }
+        let declared = effects_known(function);
+        self.context = if declared {
+            self.table.fresh_row(self.level)
+        } else {
+            row.clone()
+        };
         let body = self.infer_block(block);
         let reason = if function.component {
             "a component body, which must end with a UI tree".to_string()
@@ -383,8 +475,13 @@ impl<'a> Checker<'a> {
             format!("the declared result of `{}`", function.name)
         };
         self.unify_at(result, &body, &result_span(block), Some(reason));
+        if declared {
+            self.check_declared_effects(function, row);
+        }
         self.locals.clear();
         self.return_type = None;
+        self.context = Row::empty();
+        self.effect_scope.clear();
     }
 
     fn finish(&self, program: &Program) -> TypedProgram {
@@ -393,6 +490,16 @@ impl<'a> Checker<'a> {
             if let Some(scheme) = self.globals.get(&function.name) {
                 let ty = self.table.resolve(&scheme.ty);
                 typed.schemes.insert(function.name.clone(), display(&ty));
+                let labels = match &ty {
+                    Type::Fun(_, _, row) => row
+                        .labels
+                        .iter()
+                        .filter(|label| !label.is_rigid())
+                        .map(Label::to_string)
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                typed.effects.insert(function.name.clone(), labels);
                 typed.signatures.insert(function.name.clone(), ty);
             }
         }
@@ -403,6 +510,166 @@ impl<'a> Checker<'a> {
             .collect();
         typed.patterns = self.patterns.clone();
         typed
+    }
+
+    // ---- effects ---------------------------------------------------------------------
+
+    /// An operation's effect joins the current context row.
+    fn perform(&mut self, pair: (&str, &str), text: String, span: &Span) {
+        let label = Label::of(pair);
+        let tail = self.table.fresh_row_var(self.level, None);
+        let produced = Row::with_tail([label.clone()], tail);
+        let context = self.context.clone();
+        match unify_rows(&mut self.table, &context, &produced) {
+            Ok(()) => self.note_origin(
+                label,
+                Origin::Operation {
+                    text,
+                    span: span.clone(),
+                },
+            ),
+            Err(error) => self.effect_error(error, span),
+        }
+    }
+
+    /// Calling a function brings its row into the current context. A closed row is opened
+    /// first, so a pure callee never closes the caller's row.
+    fn absorb(&mut self, row: &Row, callee: Option<&str>, span: &Span) {
+        let resolved = self.table.resolve_row(row);
+        let opened = match resolved.tail {
+            Some(_) => resolved.clone(),
+            None => {
+                let tail = self.table.fresh_row_var(self.level, None);
+                Row::with_tail(resolved.labels.iter().cloned(), tail)
+            }
+        };
+        let context = self.context.clone();
+        match unify_rows(&mut self.table, &context, &opened) {
+            Ok(()) => {
+                if let Some(callee) = callee {
+                    for label in &resolved.labels {
+                        let origin = Origin::Call {
+                            callee: callee.to_string(),
+                            span: span.clone(),
+                        };
+                        self.note_origin(label.clone(), origin);
+                    }
+                }
+            }
+            Err(error) => self.effect_error(error, span),
+        }
+    }
+
+    fn note_origin(&mut self, label: Label, origin: Origin) {
+        self.effect_origins
+            .entry(self.function.clone())
+            .or_default()
+            .entry(label)
+            .or_insert(origin);
+    }
+
+    /// Placeholder reporting until domains arrive (Task 4 replaces it with E7401 and paths).
+    fn effect_error(&mut self, error: UnifyError, span: &Span) {
+        let message = match error {
+            UnifyError::Ceiling { label, .. } => format!("This code cannot perform `{label}`."),
+            other => format!("Effect mismatch: {other:?}."),
+        };
+        self.error("E7401", message, span);
+    }
+
+    /// Opens the top row of an instantiated function type, so a function whose effects are
+    /// fixed can still be used where more effects are allowed.
+    fn open_top(&mut self, ty: Type) -> Type {
+        let Type::Fun(params, result, row) = ty else {
+            return ty;
+        };
+        let row = self.table.resolve_row(&row);
+        if row.tail.is_some() {
+            return Type::Fun(params, result, row);
+        }
+        let tail = self.table.fresh_row_var(self.level, None);
+        Type::Fun(params, result, Row::with_tail(row.labels, tail))
+    }
+
+    /// Before generalization, a row variable that occurs exactly once, in a positive position
+    /// (the function's own row, or the row of a function it returns), stands for nothing more:
+    /// close it, so schemes read `! {db.read}` instead of `! {db.read | 'e}`. Variables that
+    /// occur in parameters or inside type arguments are left open (closing them would make the
+    /// function less general).
+    fn close_positive_rows(&mut self, ty: &Type) {
+        let resolved = self.table.resolve(ty);
+        let mut occurrences: BTreeMap<RowVarId, (usize, bool)> = BTreeMap::new();
+        row_occurrences(&resolved, true, &mut occurrences);
+        for (tail, (count, positive)) in occurrences {
+            if count == 1
+                && positive
+                && let RowState::Unbound { level, .. } = self.table.row_state(tail).clone()
+                && level > self.level
+            {
+                self.table.set_row(tail, RowState::Link(Row::empty()));
+            }
+        }
+    }
+
+    /// `effects [...]` must equal what the body performs.
+    fn check_declared_effects(&mut self, function: &Function, declared: &Row) {
+        let produced = self.table.resolve_row(&self.context);
+        let declared = self.table.resolve_row(declared);
+        let listed: Vec<String> = declared.labels.iter().map(Label::to_string).collect();
+        for label in produced.labels.difference(&declared.labels) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E7402",
+                    format!(
+                        "`{}` performs `{label}`, but its effects declare only [{}].",
+                        function.name,
+                        listed.join(", ")
+                    ),
+                    function.span.clone(),
+                )
+                .with_hint(self.add_effect_hint(&function.name, label)),
+            );
+        }
+        for label in declared.labels.difference(&produced.labels) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    "E7403",
+                    format!(
+                        "`{}` declares `{label}`, but never performs it.",
+                        function.name
+                    ),
+                    function.span.clone(),
+                )
+                .with_hint(format!("Remove `{label}` from `effects [...]`.")),
+            );
+        }
+        if let Some(tail) = produced.tail
+            && matches!(self.table.row_state(tail), RowState::Unbound { .. })
+        {
+            self.table.set_row(tail, RowState::Link(Row::empty()));
+        }
+    }
+
+    /// Suggests declaring `label`, pointing at where the body first produces it.
+    fn add_effect_hint(&self, function: &str, label: &Label) -> String {
+        let origin = self
+            .effect_origins
+            .get(function)
+            .and_then(|origins| origins.get(label));
+        let source = match origin {
+            Some(Origin::Operation { text, span }) => {
+                format!(
+                    " (it comes from `{text}` at {}:{}:{})",
+                    span.file, span.line, span.column
+                )
+            }
+            Some(Origin::Call { callee, span }) => format!(
+                " (it comes from the call to `{callee}` at {}:{}:{})",
+                span.file, span.line, span.column
+            ),
+            None => String::new(),
+        };
+        format!("Add `{label}` to `effects [...]`{source}.")
     }
 
     // ---- ambiguity -----------------------------------------------------------------
@@ -469,7 +736,7 @@ impl<'a> Checker<'a> {
     }
 
     fn shown(&self, ty: &Type) -> String {
-        display(&self.table.resolve(ty))
+        shown(&[&self.table.resolve(ty)]).remove(0)
     }
 
     fn is_local(&self, name: &str) -> bool {
@@ -502,7 +769,7 @@ impl<'a> Checker<'a> {
                 span.clone(),
             ),
             UnifyError::Infinite { var, ty } => {
-                let names = display_all(&[&Type::Var(var), &ty]);
+                let names = shown(&[&Type::Var(var), &ty]);
                 Diagnostic::error(
                     "E7107",
                     format!(
@@ -533,7 +800,7 @@ impl<'a> Checker<'a> {
             "E7301",
             format!(
                 "`{}` does not support {}.",
-                display(ty),
+                shown(&[ty]).remove(0),
                 constraint.describe()
             ),
             span.clone(),
@@ -585,9 +852,12 @@ impl<'a> Checker<'a> {
         self.level += 1;
         let mut ty = self.infer(value);
         if let Some(annotation) = annotation {
-            let declared = self
-                .env
-                .lower(annotation, &self.rigid, &mut self.diagnostics);
+            let declared = self.env.lower_with_effects(
+                annotation,
+                &self.rigid,
+                &self.effect_scope,
+                &mut self.diagnostics,
+            );
             self.unify_at(
                 &declared,
                 &ty,
@@ -757,10 +1027,12 @@ impl<'a> Checker<'a> {
             .find(|(local, _)| local == name)
             .map(|(_, scheme)| scheme.clone())
         {
-            return instantiate(&mut self.table, &scheme, self.level);
+            let ty = instantiate(&mut self.table, &scheme, self.level);
+            return self.open_top(ty);
         }
         if let Some(scheme) = self.globals.get(name).cloned() {
-            return instantiate(&mut self.table, &scheme, self.level);
+            let ty = instantiate(&mut self.table, &scheme, self.level);
+            return self.open_top(ty);
         }
         if self.env.ctors.contains_key(name) {
             return self.constructor_value(name);
@@ -816,7 +1088,7 @@ impl<'a> Checker<'a> {
         let shallow = self.table.shallow(&callee_ty);
         // Arguments are checked left to right against the parameters, so a lambda argument
         // sees the parameter types fixed by the arguments before it (as in `map(xs, { p -> p.x })`).
-        if let Type::Fun(params, result, _) = &shallow
+        if let Type::Fun(params, result, row) = &shallow
             && params.len() == args.len()
         {
             let reason = self.parameter_reason(callee);
@@ -824,6 +1096,7 @@ impl<'a> Checker<'a> {
                 let arg_ty = self.infer_argument(arg, param);
                 self.unify_at(param, &arg_ty, &arg.span, reason.clone());
             }
+            self.absorb(row, callee_name(callee), span);
             return (**result).clone();
         }
         let arg_types: Vec<Type> = args.iter().map(|arg| self.infer(arg)).collect();
@@ -843,8 +1116,10 @@ impl<'a> Checker<'a> {
             Type::Error => Type::Error,
             Type::Var(_) => {
                 let result = self.fresh();
-                let function = Type::Fun(arg_types, Box::new(result.clone()), Row::empty());
+                let row = self.table.fresh_row(self.level);
+                let function = Type::Fun(arg_types, Box::new(result.clone()), row.clone());
                 self.unify_at(&callee_ty, &function, &callee.span, None);
+                self.absorb(&row, None, span);
                 result
             }
             other => {
@@ -897,11 +1172,14 @@ impl<'a> Checker<'a> {
             param_types.push(ty.clone());
             self.locals.push((name.clone(), Scheme::mono(ty)));
         }
+        let fresh = self.table.fresh_row(self.level);
+        let saved = std::mem::replace(&mut self.context, fresh);
         self.lambda_depth += 1;
         let result = self.infer_block(body);
         self.lambda_depth -= 1;
+        let row = std::mem::replace(&mut self.context, saved);
         self.locals.truncate(mark);
-        Type::Fun(param_types, Box::new(result), Row::empty())
+        Type::Fun(param_types, Box::new(result), row)
     }
 
     fn parameter_reason(&self, callee: &Expr) -> Option<String> {
@@ -941,7 +1219,12 @@ impl<'a> Checker<'a> {
             if base == "server" {
                 let declared = self.function_spans.contains_key(name);
                 return match self.globals.get(name).cloned().filter(|_| declared) {
-                    Some(scheme) => instantiate(&mut self.table, &scheme, self.level),
+                    Some(scheme) => match instantiate(&mut self.table, &scheme, self.level) {
+                        Type::Fun(params, result, _) => {
+                            Type::Fun(params, result, Row::closed([Label::of(SERVER_CALL)]))
+                        }
+                        other => other,
+                    },
                     None => {
                         self.error(
                             "E7103",
@@ -1163,6 +1446,7 @@ impl<'a> Checker<'a> {
                 ),
             }
         }
+        self.perform(DB_WRITE, format!("db.{table}.insert"), span);
         model
     }
 
@@ -1202,6 +1486,7 @@ impl<'a> Checker<'a> {
             &args[0].span,
             Some(format!("the primary key of table `{table}`")),
         );
+        self.perform(DB_READ, format!("db.{table}.{method}"), span);
         if method == "find" {
             Type::option(model)
         } else {
@@ -1293,7 +1578,7 @@ impl<'a> Checker<'a> {
                             "E7105",
                             format!(
                                 "`Text` cannot display a value of type `{}`.",
-                                display(&resolved)
+                                shown(&[&resolved]).remove(0)
                             ),
                             arg.span.clone(),
                         )
@@ -1582,12 +1867,42 @@ fn db_method(expr: &Expr) -> Option<(&str, &str)> {
     }
 }
 
+/// Effect variables named in a function's signature: parameter and return types and the
+/// `effects [...]` clause.
+fn effect_variable_names(function: &Function) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = function
+        .effects
+        .iter()
+        .filter(|name| !name.contains('.'))
+        .cloned()
+        .collect();
+    let types = function
+        .parameters
+        .iter()
+        .filter_map(|parameter| parameter.type_ref.as_ref())
+        .chain(function.return_type.as_ref());
+    for type_ref in types {
+        if let Ok(te) = parse_type_text(&type_ref.display(), &function.span) {
+            te.effect_variables(&mut names);
+        }
+    }
+    names
+}
+
+/// Whether a function's effects are fixed by its declaration (and therefore checked exactly).
+fn effects_known(function: &Function) -> bool {
+    function.effects_declared
+        || function.domain == Domain::Pure
+        || (function.domain == Domain::Server && !function.component)
+}
+
 fn is_fully_annotated(function: &Function) -> bool {
     function
         .parameters
         .iter()
         .all(|parameter| parameter.type_ref.is_some())
         && (function.component || function.return_type.is_some())
+        && effects_known(function)
 }
 
 fn mismatch_error(
@@ -1596,7 +1911,7 @@ fn mismatch_error(
     span: &Span,
     reason: Option<String>,
 ) -> Diagnostic {
-    let names = display_all(&[expected, found]);
+    let names = shown(&[expected, found]);
     let diagnostic = Diagnostic::error(
         "E7101",
         format!(
@@ -1611,8 +1926,16 @@ fn mismatch_error(
     }
 }
 
-fn builtin(table: &mut TypeTable, arity: usize, build: impl Fn(&[Type]) -> Type) -> Scheme {
+fn builtin(
+    table: &mut TypeTable,
+    arity: usize,
+    rows: usize,
+    build: impl Fn(&[Type], &[RowVarId]) -> Type,
+) -> Scheme {
     let vars: Vec<Type> = (0..arity).map(|_| table.fresh(GENERIC_LEVEL)).collect();
+    let row_vars: Vec<RowVarId> = (0..rows)
+        .map(|_| table.fresh_row_var(GENERIC_LEVEL, None))
+        .collect();
     let ids = vars
         .iter()
         .filter_map(|var| {
@@ -1625,8 +1948,79 @@ fn builtin(table: &mut TypeTable, arity: usize, build: impl Fn(&[Type]) -> Type)
         .collect();
     Scheme {
         vars: ids,
-        row_vars: Vec::new(),
-        ty: build(&vars),
+        row_vars: row_vars.clone(),
+        ty: build(&vars, &row_vars),
+    }
+}
+
+/// Counts row-variable occurrences and whether all of them are in positive positions
+/// (function results flip nothing; parameters flip polarity; type arguments count as negative).
+fn row_occurrences(ty: &Type, positive: bool, output: &mut BTreeMap<RowVarId, (usize, bool)>) {
+    match ty {
+        Type::Fun(params, result, row) => {
+            params
+                .iter()
+                .for_each(|param| row_occurrences(param, !positive, output));
+            row_occurrences(result, positive, output);
+            if let Some(tail) = row.tail {
+                let entry = output.entry(tail).or_insert((0, true));
+                entry.0 += 1;
+                entry.1 &= positive;
+            }
+        }
+        Type::Con(_, args) => args
+            .iter()
+            .for_each(|arg| row_occurrences(arg, false, output)),
+        Type::Var(_) | Type::Error => {}
+    }
+}
+
+/// Resolved types as diagnostics show them. A row variable that occurs only once among them
+/// stands for "whatever further effects" (typically the tail added when a function is
+/// instantiated) and constrains nothing visible, so it is left out: `(Int) -> Int`, not
+/// `(Int) -> Int ! 'e`.
+fn shown(types: &[&Type]) -> Vec<String> {
+    let mut occurrences = BTreeMap::new();
+    for ty in types {
+        row_occurrences(ty, true, &mut occurrences);
+    }
+    let lone: BTreeSet<RowVarId> = occurrences
+        .into_iter()
+        .filter(|(_, (count, _))| *count == 1)
+        .map(|(tail, _)| tail)
+        .collect();
+    let stripped: Vec<Type> = types.iter().map(|ty| without_tails(ty, &lone)).collect();
+    display_all(&stripped.iter().collect::<Vec<_>>())
+}
+
+fn without_tails(ty: &Type, lone: &BTreeSet<RowVarId>) -> Type {
+    match ty {
+        Type::Fun(params, result, row) => {
+            let mut row = row.clone();
+            if row.tail.is_some_and(|tail| lone.contains(&tail)) {
+                row.tail = None;
+            }
+            Type::Fun(
+                params
+                    .iter()
+                    .map(|param| without_tails(param, lone))
+                    .collect(),
+                Box::new(without_tails(result, lone)),
+                row,
+            )
+        }
+        Type::Con(name, args) => Type::Con(
+            name.clone(),
+            args.iter().map(|arg| without_tails(arg, lone)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn callee_name(callee: &Expr) -> Option<&str> {
+    match &callee.kind {
+        ExprKind::Name(name) => Some(name.as_str()),
+        _ => None,
     }
 }
 
@@ -1833,11 +2227,11 @@ mod tests {
         );
         assert_eq!(
             scheme("fun compose(f, g, x) = f(g(x))", "compose"),
-            "(('a) -> 'b, ('c) -> 'a, 'c) -> 'b"
+            "(('a) -> 'b ! 'e, ('c) -> 'a ! 'e, 'c) -> 'b ! 'e"
         );
         assert_eq!(
             scheme("fun aplica(f, x) = f(x)", "aplica"),
-            "(('a) -> 'b, 'a) -> 'b"
+            "(('a) -> 'b ! 'e, 'a) -> 'b ! 'e"
         );
     }
 
@@ -2386,24 +2780,24 @@ mod tests {
     fn database_operations() {
         assert_eq!(
             db_scheme(
-                "server fun buscar(id: ClienteId): Cliente {\n    return db.clientes.require(id)\n}",
+                "server fun buscar(id: ClienteId): Cliente effects [db.read] {\n    return db.clientes.require(id)\n}",
                 "buscar"
             ),
-            "(ClienteId) -> Cliente"
+            "(ClienteId) -> Cliente ! {db.read}"
         );
         assert_eq!(
             db_scheme(
-                "server fun talvez(id: ClienteId): Cliente? = db.clientes.find(id)",
+                "server fun talvez(id: ClienteId): Cliente? effects [db.read] = db.clientes.find(id)",
                 "talvez"
             ),
-            "(ClienteId) -> Cliente?"
+            "(ClienteId) -> Cliente? ! {db.read}"
         );
         assert_eq!(
             db_scheme(
-                "server fun criar(nome: String): Cliente {\n    return db.clientes.insert {\n        nome = nome\n        apelido = null\n    }\n}",
+                "server fun criar(nome: String): Cliente effects [db.write] {\n    return db.clientes.insert {\n        nome = nome\n        apelido = null\n    }\n}",
                 "criar"
             ),
-            "(String) -> Cliente"
+            "(String) -> Cliente ! {db.write}"
         );
     }
 
@@ -2414,15 +2808,21 @@ mod tests {
             Err(vec!["E7104".into()])
         );
         assert_eq!(
-            with_db("server fun f(id: String): Cliente = db.clientes.require(id)"),
+            with_db(
+                "server fun f(id: String): Cliente effects [db.read] = db.clientes.require(id)"
+            ),
             Err(vec!["E7101".into()])
         );
         assert_eq!(
-            with_db("server fun f(n: Int): Cliente = db.clientes.insert { nome = n }"),
+            with_db(
+                "server fun f(n: Int): Cliente effects [db.write] = db.clientes.insert { nome = n }"
+            ),
             Err(vec!["E7101".into()])
         );
         assert_eq!(
-            with_db("server fun f(n: String): Cliente = db.clientes.insert { idade = n }"),
+            with_db(
+                "server fun f(n: String): Cliente effects [db.write] = db.clientes.insert { idade = n }"
+            ),
             Err(vec!["E7104".into()])
         );
         assert_eq!(
@@ -2438,8 +2838,9 @@ mod tests {
     #[test]
     fn missing_primary_key_column_is_reported() {
         let csv = "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Cliente,uid,id,ClienteId,false,true,true,postgresql\ncustomers,Cliente,uid,nome,String,false,true,false,postgresql\n";
-        let source =
-            format!("{ENTIDADE}server fun f(id: ClienteId): Cliente = db.customers.require(id)");
+        let source = format!(
+            "{ENTIDADE}server fun f(id: ClienteId): Cliente effects [db.read] = db.customers.require(id)"
+        );
         assert_eq!(
             infer_with_schema(&source, &schema(csv)),
             Err(vec!["E7104".into()])
@@ -2462,7 +2863,7 @@ mod tests {
     #[test]
     fn server_calls_and_environment_values() {
         let source = "environment development {\n    secret val token: String = env(\"T\", default = \"x\")\n    runtime val porta: Int = envOrNull(\"PORT\")\n}\nserver fun eco(x: Int): Int = x\nclient fun usa(): Int = server.eco(1)\nclient fun segredo(): String = token\nfun porta2() = porta ?: 80\n";
-        assert_eq!(scheme(source, "usa"), "() -> Int");
+        assert_eq!(scheme(source, "usa"), "() -> Int ! {server.call}");
         assert_eq!(scheme(source, "segredo"), "() -> String");
         assert_eq!(scheme(source, "porta2"), "() -> Int");
         assert_eq!(
@@ -2540,6 +2941,161 @@ mod tests {
                 "f"
             ),
             "(S) -> Int"
+        );
+    }
+
+    fn db_schemes(source: &str) -> Vec<(String, String)> {
+        with_db(source).unwrap_or_else(|codes| panic!("{codes:?}"))
+    }
+
+    fn scheme_in(schemes: &[(String, String)], name: &str) -> String {
+        schemes
+            .iter()
+            .find(|(other, _)| other == name)
+            .unwrap()
+            .1
+            .clone()
+    }
+
+    #[test]
+    fn effects_propagate_through_calls_and_recursion() {
+        let schemes = db_schemes(
+            "fun ler(id: ClienteId) = db.clientes.require(id)\nfun usa(id: ClienteId) = ler(id).nome\nfun a(n: Int, id: ClienteId): Cliente = if (n == 0) db.clientes.require(id) else b(n - 1, id)\nfun b(n: Int, id: ClienteId): Cliente = a(n, id)\nfun puro(x: Int) = x + 1\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "ler"),
+            "(ClienteId) -> Cliente ! {db.read}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "usa"),
+            "(ClienteId) -> String ! {db.read}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "a"),
+            "(Int, ClienteId) -> Cliente ! {db.read}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "b"),
+            "(Int, ClienteId) -> Cliente ! {db.read}"
+        );
+        assert_eq!(scheme_in(&schemes, "puro"), "(Int) -> Int");
+    }
+
+    #[test]
+    fn effects_are_polymorphic() {
+        assert_eq!(
+            scheme("fun aplica(f, x) = f(x)", "aplica"),
+            "(('a) -> 'b ! 'e, 'a) -> 'b ! 'e"
+        );
+        let schemes = db_schemes(
+            "fun nomes(ids: List<ClienteId>) = map(ids, { id -> db.clientes.require(id).nome })\nfun dobros(xs: List<Int>) = map(xs, { x -> x * 2 })\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "nomes"),
+            "(List<ClienteId>) -> List<String> ! {db.read}"
+        );
+        assert_eq!(scheme_in(&schemes, "dobros"), "(List<Int>) -> List<Int>");
+    }
+
+    #[test]
+    fn pure_functions_fit_where_effects_are_allowed() {
+        let schemes = db_schemes(
+            "fun g(f: (Int) -> Int ! [db.read]): Int = f(1)\nfun dobro(x: Int): Int = x * 2\nfun usa() = g(dobro)\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "g"),
+            "((Int) -> Int ! {db.read}) -> Int ! {db.read}"
+        );
+        assert_eq!(scheme_in(&schemes, "usa"), "() -> Int ! {db.read}");
+        let rejected = with_db(
+            "fun h(f: (Int) -> String): String = f(1)\nfun usa(id: ClienteId) = h({ x -> db.clientes.require(id).nome })\n",
+        );
+        assert_eq!(rejected, Err(vec!["E7101".to_string()]));
+    }
+
+    #[test]
+    fn lambdas_carry_their_own_effects() {
+        let schemes = db_schemes("fun criar(id: ClienteId) = { -> db.clientes.require(id) }\n");
+        assert_eq!(
+            scheme_in(&schemes, "criar"),
+            "(ClienteId) -> (() -> Cliente ! {db.read})"
+        );
+    }
+
+    #[test]
+    fn server_calls_produce_only_server_call() {
+        let schemes = db_schemes(
+            "server fun buscar(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)\nclient fun tela(id: ClienteId) = server.buscar(id).nome\nclient fun todos(ids: List<ClienteId>) = map(ids, server.buscar)\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "buscar"),
+            "(ClienteId) -> Cliente ! {db.read}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "tela"),
+            "(ClienteId) -> String ! {server.call}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "todos"),
+            "(List<ClienteId>) -> List<Cliente> ! {server.call}"
+        );
+    }
+
+    #[test]
+    fn declared_effects_must_match_exactly() {
+        assert_eq!(
+            with_db("server fun f(id: ClienteId): Cliente = db.clientes.require(id)\n"),
+            Err(vec!["E7402".to_string()])
+        );
+        assert_eq!(
+            with_db(
+                "server fun f(id: ClienteId): Cliente effects [db.read, db.write] = db.clientes.require(id)\n"
+            ),
+            Err(vec!["E7403".to_string()])
+        );
+        assert_eq!(
+            with_db("fun ler(id: ClienteId) = db.clientes.require(id)\nserver fun f(id: ClienteId): Cliente effects [db.read] = ler(id)\n")
+                .map(|schemes| scheme_in(&schemes, "f")),
+            Ok("(ClienteId) -> Cliente ! {db.read}".to_string())
+        );
+        assert_eq!(
+            with_db(
+                "fun ler(id: ClienteId) = db.clientes.require(id)\nserver fun f(id: ClienteId): Cliente = ler(id)\n"
+            ),
+            Err(vec!["E7402".to_string()])
+        );
+    }
+
+    #[test]
+    fn typed_program_lists_the_effects_of_each_function() {
+        let source = format!(
+            "{ENTIDADE}fun ler(id: ClienteId) = db.clientes.require(id)\nserver fun buscar(id: ClienteId): Cliente effects [db.read] = ler(id)\nclient fun tela(id: ClienteId) = server.buscar(id).nome\nfun puro(x: Int) = x + 1\n"
+        );
+        let (tokens, _) = crate::lexer::lex("test.bd", &source);
+        let (program, _) = crate::parser::parse(tokens);
+        let (typed, diagnostics) = crate::types::check(&program, &schema(CLIENTES));
+        assert!(
+            !crate::diagnostic::has_errors(&diagnostics),
+            "{diagnostics:?}"
+        );
+        assert_eq!(typed.effects["ler"], vec!["db.read".to_string()]);
+        assert_eq!(typed.effects["buscar"], vec!["db.read".to_string()]);
+        assert_eq!(typed.effects["tela"], vec!["server.call".to_string()]);
+        assert!(typed.effects["puro"].is_empty());
+    }
+
+    #[test]
+    fn mutual_recursion_with_effects() {
+        let schemes = db_schemes(
+            "fun a(n: Int, id: ClienteId): Int = if (n == 0) length(listOf(db.clientes.require(id))) else b(n, id)\nfun b(n: Int, id: ClienteId): Int = a(n - 1, id)\n",
+        );
+        assert_eq!(
+            scheme_in(&schemes, "a"),
+            "(Int, ClienteId) -> Int ! {db.read}"
+        );
+        assert_eq!(
+            scheme_in(&schemes, "b"),
+            "(Int, ClienteId) -> Int ! {db.read}"
         );
     }
 }

@@ -130,7 +130,6 @@ impl TypeTable {
     }
 
     /// An open row with no labels yet (consumed by effect inference, which builds on this).
-    #[allow(dead_code)]
     pub fn fresh_row(&mut self, level: u32) -> Row {
         let var = self.fresh_row_var(level, None);
         Row::with_tail([], var)

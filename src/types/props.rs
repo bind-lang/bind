@@ -192,6 +192,11 @@ fn row_source(row: &Row, names: &mut SourceNames) -> String {
     if row.is_pure() {
         return String::new();
     }
+    format!(" ! [{}]", row_items(row, names))
+}
+
+/// `db.read, e0`: the labels of a row, then its effect variable.
+fn row_items(row: &Row, names: &mut SourceNames) -> String {
     let mut items: Vec<String> = row.labels.iter().map(ToString::to_string).collect();
     if let Some(tail) = row.tail {
         let next = names.rows.len();
@@ -203,12 +208,13 @@ fn row_source(row: &Row, names: &mut SourceNames) -> String {
                 .clone(),
         );
     }
-    format!(" ! [{}]", items.join(", "))
+    items.join(", ")
 }
 
-/// The corpus entry annotated with the given function type.
+/// The corpus entry annotated with the given function type, including its own effects
+/// (`effects [...]`, so the body is checked against them exactly).
 fn annotate(entry: &Entry, ty: &Type) -> String {
-    let Type::Fun(params, result, _) = ty else {
+    let Type::Fun(params, result, row) = ty else {
         unreachable!("corpus entries are functions")
     };
     let mut names = SourceNames::default();
@@ -219,6 +225,7 @@ fn annotate(entry: &Entry, ty: &Type) -> String {
         .map(|(name, param)| format!("{name}: {}", to_source(param, &mut names)))
         .collect();
     let result = to_source(result, &mut names);
+    let effects = row_items(row, &mut names);
     let generics = if names.types.is_empty() {
         String::new()
     } else {
@@ -234,7 +241,7 @@ fn annotate(entry: &Entry, ty: &Type) -> String {
         )
     };
     format!(
-        "fun {generics}{}({}): {result} = {}\n",
+        "fun {generics}{}({}): {result} effects [{effects}] = {}\n",
         entry.name,
         params.join(", "),
         entry.body
@@ -272,11 +279,12 @@ fn is_instance(general: &Type, specific: &Type) -> bool {
         }
     }
 
-    /// A general row with a tail matches any row containing its labels, binding the tail to
-    /// the remaining labels consistently; a closed row only matches the same row.
+    /// Rows are sets: a general row `{L | v}` matches a specific row `{M | ...}` when
+    /// `L ⊆ M`, binding `v` consistently to the rest (`M \ L` plus the specific tail); a
+    /// closed general row only matches a closed row with the same labels.
     fn rows_match(general: &Row, specific: &Row, bound: &mut Bound) -> bool {
         let Some(tail) = general.tail else {
-            return general == specific;
+            return specific.tail.is_none() && general.labels == specific.labels;
         };
         if !general.labels.is_subset(&specific.labels) {
             return false;

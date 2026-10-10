@@ -1,4 +1,4 @@
-buscar : (ClienteId) -> Cliente
-talvez : (ClienteId) -> Cliente?
-criar : (String, Email) -> Cliente
-Pagina : (ClienteId) -> Ui
+buscar : (ClienteId) -> Cliente ! {db.read}
+talvez : (ClienteId) -> Cliente? ! {db.read}
+criar : (String, Email) -> Cliente ! {db.write}
+Pagina : (ClienteId) -> Ui ! {server.call}

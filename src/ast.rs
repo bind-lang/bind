@@ -120,7 +120,6 @@ pub struct Function {
     pub return_type: Option<TypeRef>,
     pub effects: Vec<String>,
     /// `true` when an `effects [...]` clause is present, even an empty one.
-    #[allow(dead_code)] // Read by effect checking (Task 5).
     pub effects_declared: bool,
     pub requires: Vec<String>,
     pub body_kind: BodyKind,

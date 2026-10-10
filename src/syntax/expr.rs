@@ -25,7 +25,6 @@ pub enum TypeExpr {
 
 impl TypeExpr {
     /// Effect variables (lowercase names without a dot) mentioned in function types.
-    #[allow(dead_code)] // Used by signature inference (Task 3).
     pub fn effect_variables(&self, output: &mut BTreeSet<String>) {
         match self {
             TypeExpr::Named { args, .. } => {

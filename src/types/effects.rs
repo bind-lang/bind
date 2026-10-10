@@ -29,14 +29,12 @@ impl Label {
         }
     }
 
-    #[allow(dead_code)] // Only tests use it until effect inference (Task 3).
     pub fn of(pair: (&str, &str)) -> Label {
         Label::new(pair.0, pair.1)
     }
 
     /// An effect variable inside the body of a function annotated with `effects [e]`: it only
     /// equals itself and is exempt from domain ceilings (the caller decides what it becomes).
-    #[allow(dead_code)] // Only tests use it until effect inference (Task 3).
     pub fn rigid(name: &str) -> Label {
         Label {
             resource: format!("'{name}"),

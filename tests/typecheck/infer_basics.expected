@@ -1,6 +1,6 @@
 ident : ('a) -> 'a
 constante : ('a, 'b) -> 'a
-compose : (('a) -> 'b, ('c) -> 'a, 'c) -> 'b
+compose : (('a) -> 'b ! 'e, ('c) -> 'a ! 'e, 'c) -> 'b ! 'e
 dobro : (Int) -> Int
-aplica : (('a) -> 'b, 'a) -> 'b
+aplica : (('a) -> 'b ! 'e, 'a) -> 'b ! 'e
 concat : (String, String) -> String
