@@ -71,15 +71,26 @@ struct Checker<'a> {
     effect_scope: BTreeMap<String, Row>,
     /// Domain of the body being checked (`Inferred` outside bodies).
     domain: Domain,
-    /// Declared domain of each function, to recognize server endpoints called from clients.
+    /// Declared domain of each function, to recognize server endpoints used by clients.
     function_domains: BTreeMap<String, Domain>,
+    /// Calls each function makes to program functions, in order, for effect paths.
+    calls: BTreeMap<String, Vec<(String, Span)>>,
 }
 
-/// How an effect reached the current body, for E7401's path and hint.
-#[derive(Clone, Copy)]
-enum Via<'a> {
-    Operation(&'a str),
-    Call(&'a str),
+/// One entry of the path from a function down to the operation that produces an effect.
+struct Step {
+    name: String,
+    span: Span,
+    operation: bool,
+}
+
+impl Step {
+    fn render(&self) -> String {
+        format!(
+            "{} ({}:{}:{})",
+            self.name, self.span.file, self.span.line, self.span.column
+        )
+    }
 }
 
 /// Where a function's effect first comes from, for diagnostics that show the path.
@@ -113,6 +124,7 @@ impl<'a> Checker<'a> {
             effect_scope: BTreeMap::new(),
             domain: Domain::Inferred,
             function_domains: BTreeMap::new(),
+            calls: BTreeMap::new(),
         }
     }
 
@@ -305,9 +317,16 @@ impl<'a> Checker<'a> {
             } else {
                 &mut sink
             };
-            let mut row =
-                self.env
-                    .lower_row(&function.effects, effects, &function.span, diagnostics);
+            // Without an `effects [...]` clause, the effect variables of the parameters are part
+            // of the row: effect variables are polymorphic in every domain, and the caller is
+            // charged for whatever it instantiates them with.
+            let mut names = function.effects.clone();
+            if !function.effects_declared {
+                names.extend(parameter_effect_variables(function));
+            }
+            let mut row = self
+                .env
+                .lower_row(&names, effects, &function.span, diagnostics);
             if let Some(ceiling) = ceiling(&function.domain) {
                 let outside: Vec<Label> = row
                     .labels
@@ -333,10 +352,7 @@ impl<'a> Checker<'a> {
             }
             row
         } else {
-            let var = self
-                .table
-                .fresh_row_var(self.level, ceiling(&function.domain));
-            Row::with_tail([], var)
+            self.table.fresh_row(self.level)
         };
         Type::Fun(params, Box::new(result), row)
     }
@@ -399,7 +415,7 @@ impl<'a> Checker<'a> {
         }
         for ((function, ty), context) in group.iter().zip(&types).zip(produced) {
             if let (Some(context), Type::Fun(_, _, declared)) = (context, ty) {
-                self.check_declared_effects(function, declared, &context);
+                self.check_effects(function, declared, &context);
             }
         }
         self.rigid.clear();
@@ -484,15 +500,15 @@ impl<'a> Checker<'a> {
         let ty = self.signature(function, &rigid, &effects, false);
         self.effect_scope = effects;
         if let (Some(context), Type::Fun(_, _, declared)) = (self.check_body(function, &ty), &ty) {
-            self.check_declared_effects(function, declared, &context);
+            self.check_effects(function, declared, &context);
         }
         self.report_ambiguous(&function.name);
         self.rigid.clear();
         self.level -= 1;
     }
 
-    /// Checks a body. For a function whose effects are declared, returns the row the body
-    /// produced, to be compared with the declaration by the caller.
+    /// Checks a body and returns the row it produced (the function's own row when its effects
+    /// are inferred), to be checked against the domain and the declaration by the caller.
     fn check_body(&mut self, function: &Function, ty: &Type) -> Option<Row> {
         let Type::Fun(params, result, row) = ty else {
             return None;
@@ -521,10 +537,7 @@ impl<'a> Checker<'a> {
         }
         let declared = effects_known(function);
         self.context = if declared {
-            let var = self
-                .table
-                .fresh_row_var(self.level, ceiling(&function.domain));
-            Row::with_tail([], var)
+            self.table.fresh_row(self.level)
         } else {
             row.clone()
         };
@@ -540,7 +553,7 @@ impl<'a> Checker<'a> {
         let context = std::mem::replace(&mut self.context, Row::empty());
         self.effect_scope.clear();
         self.domain = Domain::Inferred;
-        declared.then_some(context)
+        Some(context)
     }
 
     fn finish(&self, program: &Program) -> TypedProgram {
@@ -587,13 +600,15 @@ impl<'a> Checker<'a> {
                     span: span.clone(),
                 },
             ),
-            Err(error) => self.effect_error(error, Via::Operation(&text), span),
+            Err(_) => self.effect_mismatch(span),
         }
     }
 
     /// Calling a function brings its row into the current context. A closed row is opened
-    /// first, so a pure callee never closes the caller's row.
-    fn absorb(&mut self, row: &Row, callee: Option<&str>, description: &str, span: &Span) {
+    /// first, so a pure callee never closes the caller's row. `origin` (a call to a program
+    /// function, or a `server.f` call) is recorded for the labels the row already has, so
+    /// diagnostics can show the path to an effect.
+    fn absorb(&mut self, row: &Row, origin: Option<Origin>, span: &Span) {
         let resolved = self.table.resolve_row(row);
         let opened = match resolved.tail {
             Some(_) => resolved.clone(),
@@ -605,21 +620,30 @@ impl<'a> Checker<'a> {
         let context = self.context.clone();
         match unify_rows(&mut self.table, &context, &opened) {
             Ok(()) => {
-                if let Some(callee) = callee {
+                if let Some(origin) = &origin {
                     for label in &resolved.labels {
-                        let origin = Origin::Call {
-                            callee: callee.to_string(),
-                            span: span.clone(),
-                        };
-                        self.note_origin(label.clone(), origin);
+                        self.note_origin(label.clone(), origin.clone());
                     }
                 }
+                if let Some(Origin::Call { callee, span }) = origin {
+                    self.calls
+                        .entry(self.function.clone())
+                        .or_default()
+                        .push((callee, span));
+                }
             }
-            Err(error) => {
-                let via = callee.map_or(Via::Operation(description), Via::Call);
-                self.effect_error(error, via, span)
-            }
+            Err(_) => self.effect_mismatch(span),
         }
+    }
+
+    /// Context rows are always open and carry no ceiling, so joining effects cannot fail;
+    /// this only guards against a broken invariant.
+    fn effect_mismatch(&mut self, span: &Span) {
+        self.error(
+            "E7101",
+            format!("Effect mismatch in `{}`.", self.function),
+            span,
+        );
     }
 
     fn note_origin(&mut self, label: Label, origin: Origin) {
@@ -630,77 +654,152 @@ impl<'a> Checker<'a> {
             .or_insert(origin);
     }
 
-    /// A body exceeded its domain's ceiling: E7401 with the path down to the operation.
-    fn effect_error(&mut self, error: UnifyError, via: Via<'_>, span: &Span) {
-        let UnifyError::Ceiling { label, .. } = error else {
-            self.error(
-                "E7101",
-                format!("Effect mismatch in `{}`.", self.function),
-                span,
-            );
-            return;
-        };
-        let what = domain_description(&self.domain);
-        let place = format!("{}:{}:{}", span.file, span.line, span.column);
-        let mut path = vec![self.function.clone()];
-        let hint = match via {
-            Via::Operation(text) => {
-                path.push(format!("{text} ({place})"));
-                format!("Move `{text}` to a `server fun` and call it with `server.f(...)`.")
+    /// The origin to record for a call: program functions (non-local names) as calls,
+    /// `server.f` as an operation; builtins and locals are transparent.
+    fn call_origin(&self, callee: &Expr, span: &Span) -> Option<Origin> {
+        match &callee.kind {
+            ExprKind::Name(name)
+                if !self.is_local(name) && self.function_spans.contains_key(name) =>
+            {
+                Some(Origin::Call {
+                    callee: name.clone(),
+                    span: span.clone(),
+                })
             }
-            Via::Call(callee) => {
-                path.push(format!("{callee} ({place})"));
-                // A local (parameter or lambda) has no recorded origins of its own; a global
-                // of the same name must not lend it a path.
-                if !self.is_local(callee) {
-                    path.extend(self.effect_path(callee, &label));
+            ExprKind::Field { target, name }
+                if matches!(&target.kind, ExprKind::Name(base) if base == "server" && !self.is_shadowed(base))
+                    && self.function_spans.contains_key(name) =>
+            {
+                Some(Origin::Operation {
+                    text: format!("server.{name}"),
+                    span: span.clone(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// After a body: every concrete label it produced must fit its domain's ceiling (effect
+    /// variables are exempt; the caller is charged when it instantiates them). Then a
+    /// function whose effects are known is compared with its declaration.
+    fn check_effects(&mut self, function: &Function, declared: &Row, produced: &Row) {
+        if let Some(ceiling) = ceiling(&function.domain) {
+            let resolved = self.table.resolve_row(produced);
+            for label in &resolved.labels {
+                if !label.is_rigid() && !ceiling.contains(label) {
+                    self.ceiling_error(function, label);
                 }
-                format!("`{callee}` performs `{label}`; call it from a `server fun` instead.")
             }
-        };
-        self.diagnostics.push(
-            Diagnostic::error(
-                "E7401",
-                format!(
-                    "`{}` is {what} and cannot perform `{label}`.",
-                    self.function
-                ),
-                span.clone(),
-            )
-            .with_path(path)
-            .with_hint(hint),
-        );
+        }
+        if effects_known(function) {
+            self.check_declared_effects(function, declared, produced);
+        }
+    }
+
+    /// E7401: `function` produced `label`, outside its domain's ceiling.
+    fn ceiling_error(&mut self, function: &Function, label: &Label) {
+        let what = domain_description(&function.domain);
+        let steps = self.effect_trace(&function.name, label);
+        let mut path = vec![function.name.clone()];
+        path.extend(steps.iter().map(Step::render));
+        let hint = self.ceiling_hint(&function.domain, label, &steps);
+        let diagnostic = Diagnostic::error(
+            "E7401",
+            format!(
+                "`{}` is {what} and cannot perform `{label}`.",
+                function.name
+            ),
+            function.span.clone(),
+        )
+        .with_path(path);
+        self.diagnostics.push(match hint {
+            Some(hint) => diagnostic.with_hint(hint),
+            None => diagnostic,
+        });
+    }
+
+    fn ceiling_hint(&self, domain: &Domain, label: &Label, steps: &[Step]) -> Option<String> {
+        match domain {
+            Domain::Pure => Some("`pure` functions cannot perform effects.".into()),
+            Domain::Server if label == &Label::of(SERVER_CALL) => {
+                let called = steps
+                    .last()
+                    .filter(|step| step.operation)
+                    .and_then(|step| step.name.strip_prefix("server."));
+                Some(match called {
+                    Some(name) => {
+                        format!("Call `{name}(...)` directly; `server.` is only for client code.")
+                    }
+                    None => "Call the function directly; `server.` is only for client code.".into(),
+                })
+            }
+            Domain::Client if label.to_string().starts_with("db.") => {
+                let endpoint = steps.iter().find(|step| {
+                    !step.operation
+                        && self.function_domains.get(&step.name) == Some(&Domain::Server)
+                });
+                Some(match endpoint {
+                    Some(step) => format!("Call it through `server.{}(...)`.", step.name),
+                    None => "Database access runs on the server: move it into a `server fun` and call it with `server.f(...)`.".into(),
+                })
+            }
+            _ => None,
+        }
     }
 
     /// Follows recorded origins from `start` down to the operation that produces `label`.
-    fn effect_path(&self, start: &str, label: &Label) -> Vec<String> {
-        let mut path = Vec::new();
+    /// A call made before the callee's effects were known (recursion) is found by looking at
+    /// the callee's row now.
+    fn effect_trace(&self, start: &str, label: &Label) -> Vec<Step> {
+        let mut steps = Vec::new();
         let mut current = start.to_string();
         let mut seen = BTreeSet::new();
         while seen.insert(current.clone()) {
-            match self
+            let origin = self
                 .effect_origins
                 .get(&current)
                 .and_then(|origins| origins.get(label))
-            {
+                .cloned()
+                .or_else(|| self.later_call(&current, label));
+            match origin {
                 Some(Origin::Call { callee, span }) => {
-                    path.push(format!(
-                        "{callee} ({}:{}:{})",
-                        span.file, span.line, span.column
-                    ));
-                    current = callee.clone();
+                    steps.push(Step {
+                        name: callee.clone(),
+                        span,
+                        operation: false,
+                    });
+                    current = callee;
                 }
                 Some(Origin::Operation { text, span }) => {
-                    path.push(format!(
-                        "{text} ({}:{}:{})",
-                        span.file, span.line, span.column
-                    ));
+                    steps.push(Step {
+                        name: text,
+                        span,
+                        operation: true,
+                    });
                     break;
                 }
                 None => break,
             }
         }
-        path
+        steps
+    }
+
+    /// The first call made by `function` whose callee's row now contains `label`.
+    fn later_call(&self, function: &str, label: &Label) -> Option<Origin> {
+        self.calls.get(function)?.iter().find_map(|(callee, span)| {
+            let scheme = self.globals.get(callee)?;
+            let Type::Fun(_, _, row) = &scheme.ty else {
+                return None;
+            };
+            self.table
+                .resolve_row(row)
+                .labels
+                .contains(label)
+                .then(|| Origin::Call {
+                    callee: callee.clone(),
+                    span: span.clone(),
+                })
+        })
     }
 
     /// Opens the top row of an instantiated function type, so a function whose effects are
@@ -743,9 +842,24 @@ impl<'a> Checker<'a> {
         let produced = self.table.resolve_row(produced);
         let declared = self.table.resolve_row(declared);
         let listed: Vec<String> = declared.labels.iter().map(Label::to_string).collect();
-        for label in produced.labels.difference(&declared.labels) {
+        let ceiling = ceiling(&function.domain);
+        let outside = |label: &Label| {
+            ceiling
+                .as_ref()
+                .is_some_and(|ceiling| !label.is_rigid() && !ceiling.contains(label))
+        };
+        // Labels outside the ceiling were already reported as E7401.
+        for label in produced
+            .labels
+            .difference(&declared.labels)
+            .filter(|label| !outside(label))
+        {
             let mut path = vec![function.name.clone()];
-            path.extend(self.effect_path(&function.name, label));
+            path.extend(
+                self.effect_trace(&function.name, label)
+                    .iter()
+                    .map(Step::render),
+            );
             self.diagnostics.push(
                 Diagnostic::error(
                     "E7402",
@@ -761,6 +875,11 @@ impl<'a> Checker<'a> {
             );
         }
         for label in declared.labels.difference(&produced.labels) {
+            // Effect variables included implicitly (no `effects [...]` clause) are not a
+            // promise to perform them.
+            if label.is_rigid() && !function.effects_declared {
+                continue;
+            }
             self.diagnostics.push(
                 Diagnostic::error(
                     "E7403",
@@ -773,7 +892,9 @@ impl<'a> Checker<'a> {
                 .with_hint(format!("Remove `{label}` from `effects [...]`.")),
             );
         }
+        // The body's row ends here, unless it is the declaration's own effect variable.
         if let Some(tail) = produced.tail
+            && produced.tail != declared.tail
             && matches!(self.table.row_state(tail), RowState::Unbound { .. })
         {
             self.table.set_row(tail, RowState::Link(Row::empty()));
@@ -893,6 +1014,8 @@ impl<'a> Checker<'a> {
                 span,
                 reason,
             ),
+            // Unreachable: the checker never puts a ceiling on a row variable (domains are
+            // checked after each body, in `check_effects`); kept as a defensive fallback.
             UnifyError::Ceiling { label, .. } => Diagnostic::error(
                 "E7401",
                 format!("This code cannot perform `{label}`."),
@@ -1162,6 +1285,23 @@ impl<'a> Checker<'a> {
         }
         if let Some(scheme) = self.globals.get(name).cloned() {
             let ty = instantiate(&mut self.table, &scheme, self.level);
+            if self.domain == Domain::Client
+                && self.function_domains.get(name) == Some(&Domain::Server)
+            {
+                self.error(
+                    "E7404",
+                    format!("`{name}` is a server endpoint; call it through `server.{name}(...)`."),
+                    span,
+                );
+                // Its own effects are not charged: the error above already covers the use.
+                return match ty {
+                    Type::Fun(params, result, _) => {
+                        let row = self.table.fresh_row(self.level);
+                        Type::Fun(params, result, row)
+                    }
+                    other => other,
+                };
+            }
             return self.open_top(ty);
         }
         if self.env.ctors.contains_key(name) {
@@ -1214,17 +1354,6 @@ impl<'a> Checker<'a> {
         if let Some(block) = children {
             self.error("E7004", "Only UI nodes accept a child block.", &block.span);
         }
-        let endpoint_from_client = matches!(&callee.kind, ExprKind::Name(name)
-            if !self.is_local(name)
-                && self.domain == Domain::Client
-                && self.function_domains.get(name) == Some(&Domain::Server));
-        if endpoint_from_client && let ExprKind::Name(name) = &callee.kind {
-            self.error(
-                "E7404",
-                format!("`{name}` is a server endpoint; call it through `server.{name}(...)`."),
-                &callee.span,
-            );
-        }
         let callee_ty = self.infer(callee);
         let shallow = self.table.shallow(&callee_ty);
         // Arguments are checked left to right against the parameters, so a lambda argument
@@ -1237,11 +1366,8 @@ impl<'a> Checker<'a> {
                 let arg_ty = self.infer_argument(arg, param);
                 self.unify_at(param, &arg_ty, &arg.span, reason.clone());
             }
-            // The endpoint error was already given; do not repeat it as E7401.
-            if !endpoint_from_client {
-                let description = callee_description(callee);
-                self.absorb(row, callee_name(callee), &description, span);
-            }
+            let origin = self.call_origin(callee, span);
+            self.absorb(row, origin, span);
             return (**result).clone();
         }
         let arg_types: Vec<Type> = args.iter().map(|arg| self.infer(arg)).collect();
@@ -1264,8 +1390,7 @@ impl<'a> Checker<'a> {
                 let row = self.table.fresh_row(self.level);
                 let function = Type::Fun(arg_types, Box::new(result.clone()), row.clone());
                 self.unify_at(&callee_ty, &function, &callee.span, None);
-                let description = callee_description(callee);
-                self.absorb(&row, None, &description, span);
+                self.absorb(&row, None, span);
                 result
             }
             other => {
@@ -2029,17 +2154,28 @@ fn effect_variable_names(function: &Function) -> BTreeSet<String> {
         .filter(|name| !name.contains('.'))
         .cloned()
         .collect();
-    let types = function
-        .parameters
-        .iter()
-        .filter_map(|parameter| parameter.type_ref.as_ref())
-        .chain(function.return_type.as_ref());
-    for type_ref in types {
-        if let Ok(te) = parse_type_text(&type_ref.display(), &function.span) {
-            te.effect_variables(&mut names);
+    names.extend(parameter_effect_variables(function));
+    if let Some(type_ref) = &function.return_type {
+        type_effect_variables(type_ref, &function.span, &mut names);
+    }
+    names
+}
+
+/// Effect variables named in the parameter types of a function.
+fn parameter_effect_variables(function: &Function) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for parameter in &function.parameters {
+        if let Some(type_ref) = &parameter.type_ref {
+            type_effect_variables(type_ref, &function.span, &mut names);
         }
     }
     names
+}
+
+fn type_effect_variables(type_ref: &TypeRef, span: &Span, names: &mut BTreeSet<String>) {
+    if let Ok(te) = parse_type_text(&type_ref.display(), span) {
+        te.effect_variables(names);
+    }
 }
 
 /// Whether a function's effects are fixed by its declaration (and therefore checked exactly).
@@ -2123,24 +2259,6 @@ fn domain_description(domain: &Domain) -> &'static str {
         Domain::Client => "client code (it runs in the browser)",
         Domain::Server => "a server endpoint",
         _ => "this function",
-    }
-}
-
-/// Short text for a call whose callee is not a plain name (`server.f`, or "a call").
-fn callee_description(callee: &Expr) -> String {
-    match &callee.kind {
-        ExprKind::Field { target, name } if matches!(&target.kind, ExprKind::Name(base) if base == "server") =>
-        {
-            format!("server.{name}")
-        }
-        _ => "a call".to_string(),
-    }
-}
-
-fn callee_name(callee: &Expr) -> Option<&str> {
-    match &callee.kind {
-        ExprKind::Name(name) => Some(name.as_str()),
-        _ => None,
     }
 }
 
@@ -3385,5 +3503,130 @@ mod tests {
                 diagnostic.path
             );
         }
+    }
+
+    fn db_diagnostics(source: &str) -> Vec<crate::diagnostic::Diagnostic> {
+        let source = format!("{ENTIDADE}{source}");
+        let (tokens, _) = crate::lexer::lex("test.bd", &source);
+        let (program, _) = crate::parser::parse(tokens);
+        crate::types::check(&program, &schema(CLIENTES)).1
+    }
+
+    fn only_e7401(source: &str) -> crate::diagnostic::Diagnostic {
+        let diagnostics = db_diagnostics(source);
+        let codes: Vec<&str> = diagnostics.iter().map(|item| item.code).collect();
+        assert_eq!(codes, vec!["E7401"], "{diagnostics:?}");
+        diagnostics.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn ceilings_do_not_travel_with_rows() {
+        let client = "client fun t(f) = f()\n";
+        let plain = format!(
+            "{client}fun a(k: ClienteId): Cliente {{\n    val x = t({{ -> 1 }})\n    return db.clientes.require(k)\n}}\n"
+        );
+        assert!(with_db(&plain).is_ok(), "{:?}", with_db(&plain));
+        let server = format!(
+            "{client}server fun a(k: ClienteId): Cliente effects [db.read] {{\n    val x = t({{ -> 1 }})\n    return db.clientes.require(k)\n}}\n"
+        );
+        assert!(with_db(&server).is_ok(), "{:?}", with_db(&server));
+        let recursion = only_e7401(
+            "client fun b(n: Int, k: ClienteId) = a(n, k)\nfun a(n: Int, k: ClienteId) = if (n == 0) db.clientes.require(k).nome else b(n - 1, k)\n",
+        );
+        assert!(
+            recursion.message.starts_with("`b`"),
+            "{}",
+            recursion.message
+        );
+    }
+
+    #[test]
+    fn effect_variables_are_polymorphic_in_every_domain() {
+        for t in [
+            "pure fun t(f: () -> Cliente ! [e]): Cliente effects [e] = f()\n",
+            "pure fun t(f: () -> Cliente ! [e]) = f()\n",
+        ] {
+            let schemes = db_schemes(&format!(
+                "{t}fun u(k: ClienteId) = t({{ -> db.clientes.require(k) }})\n"
+            ));
+            assert_eq!(
+                scheme_in(&schemes, "u"),
+                "(ClienteId) -> Cliente ! {db.read}",
+                "{t}"
+            );
+            let component = only_e7401(&format!(
+                "{t}client component P(k: ClienteId) {{\n    val c = t({{ -> db.clientes.require(k) }})\n    UI {{ Text(c.nome) }}\n}}\n"
+            ));
+            assert!(
+                component.message.starts_with("`P`"),
+                "{}",
+                component.message
+            );
+        }
+    }
+
+    #[test]
+    fn endpoints_used_as_values_in_client_code_are_rejected() {
+        assert_eq!(
+            db_errors(
+                "server fun eco(x: Int): Int = x\nclient fun usa(): Int {\n    val g = eco\n    g(1)\n}\n"
+            ),
+            vec!["E7404"]
+        );
+        assert_eq!(
+            db_errors(
+                "server fun eco(x: Int): Int = x\nclient fun usa(xs: List<Int>) = map(xs, eco)\n"
+            ),
+            vec!["E7404"]
+        );
+    }
+
+    #[test]
+    fn ceiling_paths_and_hints() {
+        let through_map = only_e7401(
+            "fun ler(id: ClienteId) = db.clientes.require(id)\nclient component P(ids: List<ClienteId>) {\n    val xs = map(ids, { id -> ler(id) })\n    UI { Text(\"x\") }\n}\n",
+        );
+        assert_eq!(through_map.path.len(), 3, "{:?}", through_map.path);
+        assert_eq!(through_map.path[0], "P");
+        assert!(
+            through_map.path[1].starts_with("ler ("),
+            "{:?}",
+            through_map.path
+        );
+        assert!(
+            through_map.path[2].starts_with("db.clientes.require ("),
+            "{:?}",
+            through_map.path
+        );
+        assert_eq!(
+            through_map.hint.as_deref(),
+            Some(
+                "Database access runs on the server: move it into a `server fun` and call it with `server.f(...)`."
+            )
+        );
+        let server_call = only_e7401(
+            "server fun a(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)\nfun h(id: ClienteId) = server.a(id)\nserver fun b(id: ClienteId): Cliente = h(id)\n",
+        );
+        assert!(
+            server_call.path.last().unwrap().starts_with("server.a ("),
+            "{:?}",
+            server_call.path
+        );
+        assert_eq!(
+            server_call.hint.as_deref(),
+            Some("Call `a(...)` directly; `server.` is only for client code.")
+        );
+        let pure = only_e7401("pure fun p(id: ClienteId): String = db.clientes.require(id).nome\n");
+        assert_eq!(
+            pure.hint.as_deref(),
+            Some("`pure` functions cannot perform effects.")
+        );
+        let endpoint = only_e7401(
+            "server fun x(id: ClienteId): Cliente effects [db.read] = db.clientes.require(id)\nfun h(id: ClienteId) = x(id)\nclient fun c(id: ClienteId) = h(id).nome\n",
+        );
+        assert_eq!(
+            endpoint.hint.as_deref(),
+            Some("Call it through `server.x(...)`.")
+        );
     }
 }
