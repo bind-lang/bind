@@ -8,7 +8,7 @@ Repository: <https://github.com/bind-lang/bind>
 
 ## Certified profiles
 
-The current profile is `rust-web-v3` ([certified profile v0.3](docs/certified-profile-v0.3.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. The Elm client is gone. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), the wire contract is `bind-json-v3`, and overflow or deep recursion become typed errors instead of panics. Previous profiles are kept in docs: [v0.2](docs/certified-profile-v0.2.md) (`rust-elm-web-v2`) and [v0.1](docs/certified-profile-v0.1.md) (`rust-elm-web-v1`).
+The current profile is `rust-web-v3` ([certified profile v0.3](docs/certified-profile-v0.3.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. The Elm client is gone. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), the wire contract is `bind-json-v3`, and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input: the SSR's server calls go through the same wire codecs as the split mode's RPCs, `Date`/`DateTime`/`Instant` compare by value everywhere, UI trees of any depth render iteratively, and the compile-time pre-render of static pages is bounded (work and HTML size) with a run-time fallback. Previous profiles are kept in docs: [v0.2](docs/certified-profile-v0.2.md) (`rust-elm-web-v2`) and [v0.1](docs/certified-profile-v0.1.md) (`rust-elm-web-v1`).
 
 The overall shape is:
 
@@ -37,7 +37,7 @@ deployment = "vercel"
 certified = true
 capabilities = ["ui.dom"]
 # api_url = "/api"                            # default; must end in /api
-# frontend_origin = "https://app.example.com" # required when api_url is on another origin
+# frontend_origin = "https://app.example.com" # required when api_url is on another origin (and only then)
 ```
 
 Then regenerate the deploy directory (`bind generate --target <target>`); the Elm and npm files disappear. A program may have only one `client component` per web target (E8301).

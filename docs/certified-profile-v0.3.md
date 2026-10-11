@@ -29,15 +29,15 @@ deployment = "vercel"   # "vercel" | "aws-lambda"
 certified = true
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 # api_url = "/api"                           # padrão
-# frontend_origin = "https://app.exemplo.com" # exigido quando api_url é de outra origem
+# frontend_origin = "https://app.exemplo.com" # exigido quando api_url é de outra origem, proibido caso contrário
 ```
 
 - `client = "web"` e `server = "rust"`. `client = "elm"` não existe mais: é recusado com E8311 e uma sugestão de correção (`client = "web"` mais `mode`).
 - `mode` é obrigatório; a ausência dele é E8311.
 - `api_url`: o caminho deve ser exatamente `/api`, relativo (`/api`, o padrão) ou uma origem canônica seguida de `/api` (`https://host[:porta]/api`, sem barra final, consulta ou fragmento). O servidor gerado só responde em `/api/<endpoint>`; prefixos personalizados não são suportados.
-- `frontend_origin`: origem canônica (`http://` ou `https://`, host em minúsculas, porta não padrão opcional, sem caminho, credenciais ou barra final). É obrigatória quando `api_url` aponta para outra origem.
+- `frontend_origin`: origem canônica (`http://` ou `https://`, host em minúsculas, porta não padrão opcional, sem caminho, credenciais ou barra final). Um host cujo último rótulo é numérico só é canônico como IPv4 decimal de quatro octetos 0..255 sem zeros à esquerda (`http://1` e `http://999.1.1.1` são recusados: o navegador os reescreveria ou rejeitaria); o mesmo vale para a origem de `api_url`. É obrigatória quando `api_url` aponta para outra origem e só é aceita nesse caso: com `mode = "ssr"` ou `api_url = "/api"` é E8311 (remova-a ou dê a `api_url` a URL absoluta do API).
 - Dois componentes `client component` no mesmo programa dão E8301 em todo target web; a página é o único componente.
-- Metadados da página vêm de `[web]` (`title`, `description`, `language`, `stylesheet`); o shell inclui `lang`, `description`, `theme-color`, tags `og:*` e o favicon, e é idêntico (byte a byte, verificado por vetores compartilhados) nos dois modos e nas três implementações.
+- Metadados da página vêm de `[web]` (`title`, `description`, `language`, `stylesheet`); um `stylesheet` que não existe ou não pode ser lido é E8311 no `verify` (`generate` nunca falha num programa verificado). O shell inclui `lang`, `description`, `theme-color`, tags `og:*` e o favicon, e é idêntico (byte a byte, verificado por vetores compartilhados) nos dois modos e nas três implementações.
 
 ## Modos e deployments
 
@@ -48,15 +48,22 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 
 No Vercel o modo `ssr` usa uma função por endpoint mais `bind-page` (e não uma função única); o comportamento observável é o de um único servidor.
 
-**Componentes estáticos** (sem parâmetros e sem chamada de servidor) são pré-renderizados em tempo de compilação, pelo avaliador `core::eval`, em `web/index.html`, sem JavaScript, nos dois modos. A avaliação tem um orçamento (2.000.000 passos, 1024 limbs por `Int`, 4 MiB por `String`); se o componente excede o orçamento, falha ou usa algo que o avaliador não modela, a página é renderizada em tempo de execução (onde uma falha vira a tela de erro com seu status). Uma aplicação sem endpoints e com página estática não tem servidor: `web/` é tudo.
+**Componentes estáticos** (sem parâmetros e sem chamada de servidor) são pré-renderizados em tempo de compilação, pelo avaliador `core::eval`, em `web/index.html`, sem JavaScript, nos dois modos. A pré-renderização tem um orçamento:
+
+- trabalho da avaliação: 2.000.000 unidades, uma por expressão avaliada mais o tamanho do que cada operação percorre (limbs da aritmética de `Int`, bytes de concatenações, variáveis capturadas por lambdas, filhos de cada nó de UI, pares de valores visitados por `==`); valores (strings, listas, campos, filhos de UI) são compartilhados, de modo que copiar um valor não custa nada além disso;
+- tamanhos: 1024 limbs por `Int`, 4 MiB por `String`, aninhamento de expressões em avaliação limitado (a pilha do avaliador nunca estoura);
+- HTML do resultado: no máximo 1 MiB e 1.048.576 nós visitados. Subárvores compartilhadas (`val a = UI { Div { b; b } }` repetido) dobram o HTML a cada passo com memória linear: 22 ou 30 níveis estouram esse limite em milissegundos.
+
+Se o componente excede qualquer limite, falha ou usa algo que o avaliador não modela, a página é renderizada em tempo de execução (onde uma falha vira a tela de erro com seu status). Assim a pré-renderização termina em tempo e memória limitados. Uma aplicação sem endpoints e com página estática não tem servidor: `web/` é tudo.
 
 **SSR** (`mode = "ssr"`, componente dinâmico): o servidor responde a `GET` e `HEAD` em `/`.
 
 - Os parâmetros do componente vêm da query string e são estritos: decodificação percentual, `+` vale espaço; parâmetro ausente, repetido, com `%` malformado, UTF-8 inválido ou rejeitado pelo decodificador do tipo dá 400. Tipos aceitos: `String`, `Email`, `Url`, `Int`, `UUID`, `Date`, `DateTime`, `Instant` e `distinct type` sobre eles (formas canônicas estritas para `Int`, `UUID` e datas).
 - **Uma transação para todas as chamadas de servidor da página**: commit se a página renderiza, rollback em erro. Cada chamada `server.f` começa com profundidade 0, como um RPC separado. Uma página sem chamada de servidor não abre transação.
+- **Cada chamada `server.f` passa pelos codecs do fio**, em memória, exatamente como o RPC do split: os argumentos são escritos como o `JSON.stringify` do frontend os escreve (`NaN`/`±Infinity` viram `null`; um `Long` além de ±(2^53 − 1) é o erro interno do `TypeError` de `encodeLong`), decodificados na entrada do endpoint como pela rota RPC (400 com a mensagem do serde quando não cabem, por exemplo `null` para um `Double` ou um `Int` de mais de 1000 dígitos), e o resultado é serializado como pela rota e relido com o rigor dos decodificadores JS (um não finito, um `Int` de mais de 1000 dígitos ou um inteiro além de ±(2^53 − 1) dão a tela "Request failed"; um `Decimal` `-0` volta como `0`). Para todo programa e entrada, os dois modos mostram a mesma página.
 - Status: 200, 404 (`require` sem resultado), 400 (`BadRequest`, parâmetro inválido) e 500 (demais erros), com mensagem pública e página de erro no mesmo shell. Erros internos, de banco, estouro e limite de recursão têm mensagem genérica.
 
-**Split** (`mode = "split"`): `web/app.js` roda o componente no navegador e chama o API por `rpc`. **Cada RPC tem sua própria transação**, como no v0.2. A consequência observável: um endpoint que escreve e depois falha em outra chamada da mesma página faz commit da escrita em `split` e rollback em `ssr`. Falha de rede, resposta 500 sem JSON ou servidor indisponível viram a tela "Request failed" (ou a mensagem pública do erro), nunca exceção não tratada.
+**Split** (`mode = "split"`): `web/app.js` roda o componente no navegador e chama o API por `rpc`. **Cada RPC tem sua própria transação**, como no v0.2. A consequência observável: um endpoint que escreve e depois falha em outra chamada da mesma página faz commit da escrita em `split` e rollback em `ssr`. Falha de rede, resposta 500 sem JSON ou servidor indisponível viram a tela "Request failed" (ou a mensagem pública do erro), nunca exceção não tratada. Qualquer falha ao ler os parâmetros, rodar o componente ou renderizar a árvore mostra a tela de erro correspondente (a página nunca fica em "Loading…").
 
 ## Accepted application shape
 
@@ -91,7 +98,9 @@ E8306 (limites do cliente Elm) foi removido. **E8311** cobre:
 - `mode` ausente;
 - `api_url` que não é `/api` nem origem canônica mais `/api`;
 - `api_url` de outra origem sem `frontend_origin`;
-- `frontend_origin` que não é uma origem canônica;
+- `frontend_origin` que não é uma origem canônica (inclusive hosts numéricos que o navegador reescreveria, como `http://1`);
+- `frontend_origin` sem `api_url` de outra origem (`mode = "ssr"`, ou `api_url = "/api"`);
+- `[web].stylesheet` que não existe ou não pode ser lido;
 - programa sem `client component`;
 - parâmetro do componente de um tipo que a URL não carrega (fora de `String`, `Email`, `Url`, `Int`, `UUID`, `Date`, `DateTime`, `Instant` e `distinct` sobre eles);
 - componente, ou função alcançável a partir dele, que usa um valor de ambiente;
@@ -118,11 +127,13 @@ Os escalares e o fio são os do v0.2; o contrato é `bind-json-v3` (mesmo format
 
 `Decimal`/`Money` em componentes suportam `+`, `-`, negação, comparação e exibição; estouro de mantissa ou escala dá `Overflow`. Funções e tipos chamados `class`, `await`, `default`, `Object`, `enter` e campos como `__proto__`, `constructor` e `toString` geram JS válido e decodificam JSON sem poluir protótipos.
 
-`enter` (a contagem de profundidade, 10.000) sempre faz `await` no JS, de modo que `map`/`fold` sobre 100.000 itens não estouram a pilha. Cada implementação (avaliador, Rust, JS) segue as mesmas regras de exibição; os vetores compartilhados ficam em `runtime/vectors/` (`html-trees.json`, `numbers.json`, `pages.json`, `params.json`), e os de `Decimal` e `f32` do JS em `runtime/bind-runtime-js/tests/`.
+**Comparações de `Date`, `DateTime` e `Instant`** seguem a ordem dos valores, igual nas três implementações: o Rust compara os valores `chrono`; o JS (`rt.compareDate`, `rt.compareDateTime`, `rt.compareInstant`) e o avaliador (`compare_temporal`) leem o texto canônico como (ano com sinal, mês, dia, segundos do dia, nanossegundos com a fração completada a 9 dígitos) e comparam nessa ordem, nunca pelo texto (que erraria `…T10:00:00Z` contra `…T10:00:00.500Z`, `.500` contra `.500001`, segundos bissextos e anos estendidos ou negativos como `+10000` e `-0001`). A igualdade é a do texto, que é canônico.
+
+`enter` (a contagem de profundidade, 10.000) sempre faz `await` no JS, de modo que `map`/`fold` sobre 100.000 itens não estouram a pilha. **Renderização iterativa**: os três renderizadores de HTML/DOM (avaliador, Rust, JS), a liberação de árvores (`Node` no Rust, valores do avaliador) e `equals`/`compare` do JS usam pilha explícita, de modo que uma árvore de qualquer profundidade (200.000 elementos aninhados, de 10.000 chamadas com 20 nós cada) renderiza sem estouro de pilha no `generate`, no servidor SSR e no navegador; os filhos de UI são compartilhados (`Arc`) no Rust e no avaliador, nunca copiados. Cada implementação (avaliador, Rust, JS) segue as mesmas regras de exibição; os vetores compartilhados ficam em `runtime/vectors/` (`html-trees.json`, `numbers.json`, `pages.json`, `params.json`, `temporal-order.json`), e os de `Decimal` e `f32` do JS em `runtime/bind-runtime-js/tests/`.
 
 ## CORS
 
-Só existe com `api_url` de outra origem (`frontend_origin`). A Rust gerada decide por requisição:
+Só existe com `mode = "split"` e `api_url` de outra origem, cujo `frontend_origin` é obrigatório (e proibido em qualquer outro caso, E8311). A Rust gerada decide por requisição:
 
 - sem cabeçalho `Origin`: tratada normalmente (não há navegador);
 - `Origin` igual a `frontend_origin`: resposta com `access-control-allow-origin` e `vary: Origin`; o preflight `OPTIONS` é respondido com 204, `access-control-allow-methods: POST, OPTIONS`, `access-control-allow-headers: content-type, accept` e `access-control-max-age: 600`;
@@ -143,15 +154,14 @@ Não há etapa de Elm nem de npm: o Vercel serve `web/` como está. O `bind.lock
 
 ## Meaning of certification
 
-`certified-host` continua significando que todos os gates passaram na máquina que invocou o Bind. Os testes do `bindc` dão verificação adicional: um teste diferencial a três vias compara o avaliador da IR, o Rust gerado e o JS gerado (com `node`) em mais de 1.000 programas sem divergências e com recursão de 20.000 níveis; vetores compartilhados fixam HTML, números, parâmetros e páginas nas três implementações; testes com banco real (`BIND_TEST_DATABASE_URL`) confirmam commit e rollback do SSR e do split.
+`certified-host` continua significando que todos os gates passaram na máquina que invocou o Bind. Os testes do `bindc` dão verificação adicional: um teste diferencial a três vias compara o avaliador da IR, o Rust gerado e o JS gerado (com `node`) em mais de 1.000 programas sem divergências, com recursão de 20.000 níveis, uma árvore de UI de 199.800 níveis e comparações de `Date`/`DateTime`/`Instant` (os pares dos vetores e pares aleatórios, chamados com argumentos); vetores compartilhados fixam HTML, números, parâmetros, páginas e a ordem temporal nas três implementações; testes com banco real (`BIND_TEST_DATABASE_URL`) confirmam commit e rollback do SSR e do split e que `NaN` e `Int` de 1001 dígitos, como argumento e como resultado, dão a mesma página nos dois modos.
 
 A certificação **não** garante:
 
 - eventos, estado ou hidratação: a UI é uma função pura dos parâmetros e das respostas; a página SSR não envia JavaScript;
 - `*` e `/` de `Decimal`/`Money` no cliente: só existem no servidor (E8311 no componente);
-- `Long` acima de 2^53 no frontend JS (não suportado);
-- que um `Double` não finito devolvido por um endpoint se comporte igual nos dois modos: o SSR exibe `NaN`/`Infinity`, enquanto o split falha ao decodificar a resposta JSON;
-- orçamento de pré-renderização por custo: ele limita passos, não o custo de cada passo; um componente pesado pode deixar `generate` lento, e um que estoura o orçamento é renderizado em tempo de execução;
+- `Long` acima de 2^53 no frontend JS (não suportado; `Long` também não cruza o fio, E8309, e os dois modos recusam esses valores do mesmo jeito);
+- que uma página pesada seja pré-renderizada: uma que estoura o orçamento é renderizada em tempo de execução (o HTML é o mesmo);
 - terminação, arredondamento de escala de `Money` pelas colunas `numeric(p,s)`, erros de faixa inteira do banco (500);
 - reprodutibilidade do `Cargo.lock` transitivo ao longo do tempo: é re-resolvido no registry quando o perfil muda (o hash fica registrado);
 - autenticação: os endpoints gerados não têm nenhuma;
