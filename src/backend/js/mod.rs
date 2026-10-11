@@ -11,6 +11,8 @@
 pub mod codecs;
 #[cfg(test)]
 mod differential;
+#[cfg(test)]
+mod end_to_end;
 pub mod expr;
 pub mod names;
 pub mod page;

@@ -17,7 +17,7 @@ pub mod types;
 #[cfg(test)]
 pub(crate) mod differential;
 #[cfg(test)]
-mod transactions;
+pub(crate) mod transactions;
 
 use std::collections::{BTreeMap, BTreeSet};
 

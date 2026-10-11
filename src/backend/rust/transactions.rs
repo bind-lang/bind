@@ -23,7 +23,7 @@ server fun falha(nome: String, email: Email, saldo: Money, outro: CustomerId): C
 }
 
 /// `CREATE TABLE` for the CSV schema's `customers` table (the example only uses these types).
-fn create_table(csv: &str) -> String {
+pub(crate) fn create_table(csv: &str) -> String {
     let columns: Vec<String> = csv
         .lines()
         .skip(2)
