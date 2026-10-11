@@ -22,6 +22,8 @@ VerifiedApplication
 
 Generation receives `VerifiedApplication`, not raw source; o backend Rust lê somente a `CoreProgram` (IR tipada produzida por `types::check → core::lower → core::validate`), nunca tokens. Uma IR inconsistente é o erro interno E9001. If verification emits an error, no target generator is called.
 
+O cliente Elm ainda é gerado da `VerifiedApplication` (AST e tokens verificados) até o subprojeto 3c. Na biblioteca Rust gerada, os tipos e funções do programa ficam no módulo `app` e os itens do gerador (banco, requisições, roteador, testes) na raiz, para que nomes do usuário nunca colidam com eles.
+
 O runtime (`runtime/bind-runtime`) é copiado para o crate gerado como `src/bind_runtime.rs` e fornece `Int`, `Ctx`, `AppError`, transação por chamada e limite de profundidade. O avaliador de referência em `src/core/eval.rs` serve ao teste diferencial contra o Rust gerado.
 
 The compiler-owned Rust library is the semantic center of both deployment targets. It defines domain representations, strict request structures, SQL generated from database IR, row decoding, status mapping, and JSON responses. AWS and Vercel adapters are thin transport layers.
