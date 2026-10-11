@@ -51,3 +51,11 @@ specification of the page shell and the error screen:
 <= U+0020 and removing tab/LF/CR, a URL with a scheme is emitted only for `http`, `https`,
 `mailto`, `tel` (case-insensitive); otherwise the `href` is `""`. URLs without a scheme are
 emitted as is.
+
+## JS runtime only: `Decimal` and `f32`
+
+`runtime/bind-runtime-js/tests/decimal-vectors.json` and `f32-vectors.json` are generated from
+`rust_decimal` and Rust's `f32` by `runtime/bind-runtime/tests/js_vectors.rs`, which fails when
+the committed files differ from the generated content (regenerate with
+`BIND_BLESS=1 cargo test --manifest-path runtime/bind-runtime/Cargo.toml --test js_vectors`).
+They live next to the JS tests because only the JS runtime reimplements these operations.
