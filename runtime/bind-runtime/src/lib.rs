@@ -996,9 +996,7 @@ fn write_js_string(out: &mut String, text: &str) {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => {
-                out.push_str("\\u00");
-                out.push(char::from(b"0123456789abcdef"[(c as usize) >> 4]));
-                out.push(char::from(b"0123456789abcdef"[(c as usize) & 0xf]));
+                out.push_str(&format!("\\u{:04x}", c as u32));
             }
             c => out.push(c),
         }
