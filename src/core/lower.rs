@@ -452,12 +452,22 @@ fn expr(ty: Type, kind: ExprKind) -> Expr {
     Expr { ty, kind }
 }
 
-/// Whether evaluating `expr` always leaves the function: a `return`, or a sequence ending in
-/// one.
+/// Whether evaluating `expr` always leaves the function: a `return`, a sequence or `val`
+/// reaching one, or an `if`/`when` whose branches all do.
 fn diverges(expr: &Expr) -> bool {
     match &expr.kind {
         ExprKind::Return(_) => true,
-        ExprKind::Seq { body, .. } => diverges(body),
+        ExprKind::Seq { value, body } | ExprKind::Let { value, body, .. } => {
+            diverges(value) || diverges(body)
+        }
+        ExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => diverges(condition) || (diverges(then_branch) && diverges(else_branch)),
+        ExprKind::Match { scrutinee, arms } => {
+            diverges(scrutinee) || (!arms.is_empty() && arms.iter().all(|arm| diverges(&arm.body)))
+        }
         _ => false,
     }
 }
@@ -475,8 +485,8 @@ fn is_inert(expr: &Expr) -> bool {
     )
 }
 
-/// A node whose operand diverges (`(return 1) + 2`, `f(x, return y)`, `when (return z)`)
-/// never completes: it becomes the operands before that one, evaluated left to right for their
+/// A node whose operand diverges (`(return 1) + 2`, `f(x, return y)`, `when (return z)`,
+/// `(if (c) return 1 else return 2) + 3`) never completes: it becomes the operands before that one, evaluated left to right for their
 /// effects (inert ones dropped), followed by the diverging operand. Backends then never see a
 /// `return` used as a value, which Rust rejects in most operand positions.
 fn hoist_return(node: Expr) -> Expr {
@@ -510,9 +520,12 @@ fn hoist_return(node: Expr) -> Expr {
         _ => Vec::new(),
     };
     operands.truncate(position + 1);
-    let Some(diverging) = operands.pop() else {
+    let Some(mut diverging) = operands.pop() else {
         return expr(ty, ExprKind::Lit(Literal::Unit));
     };
+    // It stands for the node now: an `if` or `when` whose branches all return takes the
+    // node's type (a `Return`'s type carries no meaning anyway).
+    diverging.ty = ty.clone();
     operands
         .into_iter()
         .rev()

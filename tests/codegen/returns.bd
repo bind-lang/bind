@@ -29,3 +29,10 @@ fun condicao(x: Int): Boolean = if (return x > 0) false else true
 fun campo(x: Int): Int = Par(return x, "a").primeiro
 
 fun aninhado(n: Int): Int = (fundo(n) + (return n)) * 2
+
+fun ramos(x: Int): Int = (if (x > 0) return 1 else return 2) + 3
+
+fun arms(x: Int): Int = x * when (x) {
+    0 -> return 10
+    _ -> return 20
+}

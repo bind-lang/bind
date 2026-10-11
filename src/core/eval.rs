@@ -667,6 +667,10 @@ mod tests {
         assert_eq!(call("condicao", int("4")), Ok("true".into()));
         assert_eq!(call("campo", int("4")), Ok("4".into()));
         assert_eq!(call("aninhado", int("3")), Ok("3".into()));
+        assert_eq!(call("ramos", int("4")), Ok("1".into()));
+        assert_eq!(call("ramos", int("-4")), Ok("2".into()));
+        assert_eq!(call("arms", int("0")), Ok("10".into()));
+        assert_eq!(call("arms", int("4")), Ok("20".into()));
         assert_eq!(
             call("aninhado", int("20000")),
             Err(EvalError::RecursionLimit)

@@ -816,6 +816,10 @@ fn return_operands() {
     assert_eq!(int(returns::bind_ordem, 1), Int::from_i64(5));
     assert_eq!(int(returns::bind_campo, 4), Int::from_i64(4));
     assert_eq!(int(returns::bind_aninhado, 3), Int::from_i64(3));
+    assert_eq!(int(returns::bind_ramos, 4), Int::from_i64(1));
+    assert_eq!(int(returns::bind_ramos, -4), Int::from_i64(2));
+    assert_eq!(int(returns::bind_arms, 0), Int::from_i64(10));
+    assert_eq!(int(returns::bind_arms, 4), Int::from_i64(20));
     assert_eq!(rt.block_on(returns::bind_texto(Ctx::pure(), "a".to_string())).unwrap(), "a");
     assert!(rt.block_on(returns::bind_condicao(Ctx::pure(), Int::from_i64(4))).unwrap());
     let two = rust_decimal::Decimal::from(2);

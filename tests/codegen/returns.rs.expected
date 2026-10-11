@@ -110,3 +110,25 @@ pub fn bind_aninhado(ctx: crate::bind_runtime::Ctx, v0_n: crate::bind_runtime::I
         ::std::result::Result::Ok(v0_n.clone())
     })
 }
+
+pub fn bind_ramos(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        ::std::result::Result::Ok(if v0_x > crate::bind_runtime::Int::from_i64(0) {
+            return ::std::result::Result::Ok(crate::bind_runtime::Int::from_i64(1))
+        } else {
+            return ::std::result::Result::Ok(crate::bind_runtime::Int::from_i64(2))
+        })
+    })
+}
+
+pub fn bind_arms(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        ::std::result::Result::Ok(if v0_x == crate::bind_runtime::Int::from_i64(0) {
+            return ::std::result::Result::Ok(crate::bind_runtime::Int::from_i64(10))
+        } else {
+            return ::std::result::Result::Ok(crate::bind_runtime::Int::from_i64(20))
+        })
+    })
+}
