@@ -1,10 +1,21 @@
 package app.stock
 
+distinct type Count = Int
+distinct type Counts = List<Int>
+distinct type MaybeCount = Int?
+
 entity Item(
     val id: UUID,
     val name: String,
     val quantity: Int,
-    val reserved: Int?
+    val reserved: Int?,
+    val stock: Count
+)
+
+data class Summary(
+    val history: List<Int>,
+    val series: Counts,
+    val spare: MaybeCount
 )
 
 server fun reservar(id: UUID, quantidade: Int): Item
@@ -18,5 +29,6 @@ client component ItemPage(id: UUID, quantidade: Int) {
     UI {
         Text(item.name)
         Text(item.quantity)
+        Text(item.stock)
     }
 }

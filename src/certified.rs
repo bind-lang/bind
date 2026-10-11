@@ -821,13 +821,13 @@ fn elm_type_declaration(
             "type {}\n    = {} {}\n\n",
             declaration.name,
             declaration.name,
-            elm_type(
+            parenthesize_type(&elm_type(
                 declaration.underlying.as_ref().ok_or_else(|| format!(
                     "Distinct type `{}` has no underlying type",
                     declaration.name
                 ))?,
                 app
-            )?
+            )?)
         )),
         TypeKind::Data | TypeKind::Entity => {
             let mut output = format!("type alias {} =\n    {{ ", declaration.name);
@@ -873,7 +873,7 @@ fn elm_codec(declaration: &TypeDecl, app: &VerifiedApplication) -> Result<String
                 declaration.name,
                 declaration.name,
                 declaration.name,
-                elm_decoder(underlying, app)?,
+                parenthesize_expr(&elm_decoder(underlying, app)?),
                 declaration.name,
                 declaration.name,
                 declaration.name,
@@ -1769,12 +1769,24 @@ mod tests {
         assert!(generated.contains("features = [\"derive\", \"rc\"]"));
     }
 
-    /// The Elm client of `tests/codegen/client_int.bd` (`BIND_BLESS=1` regenerates the
-    /// snapshot): `Int` travels as a string, through `intDecoder` and `encodeInt`.
-    #[test]
-    fn client_int_snapshot() {
+    /// Removes its directory on drop, so a failing test leaves nothing behind.
+    struct TempDir(PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The `Main.elm` generated for `tests/codegen/client_int.bd`.
+    fn client_int_elm() -> String {
         let cases = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/codegen");
-        let root = std::env::temp_dir().join(format!("bindc-client-int-{}", std::process::id()));
+        let guard = TempDir(std::env::temp_dir().join(format!(
+            "bindc-client-int-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let root = &guard.0;
         fs::create_dir_all(root.join("app")).unwrap();
         fs::copy(cases.join("client_int.bd"), root.join("app/main.bd")).unwrap();
         fs::copy(cases.join("client_int.csv"), root.join("schema.csv")).unwrap();
@@ -1789,16 +1801,139 @@ mod tests {
             .application
             .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
         let plan = component_plan(&app).unwrap();
-        let elm = elm_main(&app, &plan).unwrap();
-        fs::remove_dir_all(&root).unwrap();
-        let path = cases.join("client_int.elm.expected");
+        elm_main(&app, &plan).unwrap()
+    }
+
+    /// The Elm client of `tests/codegen/client_int.bd` (`BIND_BLESS=1` regenerates the
+    /// snapshot): `Int` travels as a string, through `intDecoder` and `encodeInt`.
+    #[test]
+    fn client_int_snapshot() {
+        let elm = client_int_elm();
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/codegen/client_int.elm.expected");
         if std::env::var_os("BIND_BLESS").is_some() {
             fs::write(&path, &elm).unwrap();
         }
         assert_eq!(fs::read_to_string(&path).unwrap_or_default(), elm);
-        assert!(elm.contains("intDecoder : D.Decoder Int"));
-        assert!(elm.contains("encodeInt : Int -> E.Value"));
+        for expected in [
+            "intDecoder : D.Decoder Int",
+            "encodeInt : Int -> E.Value",
+            "|> andMap (D.field \"quantity\" intDecoder)",
+            "|> andMap (D.field \"reserved\" (D.nullable intDecoder))",
+            "|> andMap (D.field \"history\" (D.list intDecoder))",
+            "|> andMap (D.field \"stock\" decodeCount)",
+            "|> andMap (D.field \"series\" decodeCounts)",
+            "|> andMap (D.field \"spare\" decodeMaybeCount)",
+            "= Counts (List Int)",
+            "= MaybeCount (Maybe Int)",
+            "D.map Count intDecoder",
+            "D.map Counts (D.list intDecoder)",
+            "D.map MaybeCount (D.nullable intDecoder)",
+            "( \"stock\", encodeCount value_.stock )",
+            "( \"quantity\", encodeInt value_.quantity )",
+            "( \"history\", E.list (\\item_ -> encodeInt item_) value_.history )",
+            "( \"quantidade\", E.string (String.trim model.inputQuantidade) )",
+        ] {
+            assert!(elm.contains(expected), "missing `{expected}`");
+        }
+        // `Long` cannot cross the wire in this profile, so no plain number codec is generated.
         assert!(!elm.contains("D.int") && !elm.contains("E.int"));
+    }
+
+    /// Review Focus 1, run for real: the generated `intDecoder` and `encodeInt`, compiled by
+    /// `elm` and run by `node`, accept canonical safe integers exactly and reject anything else.
+    #[test]
+    #[ignore = "needs elm and node; run with `cargo test client_int_decoder -- --ignored`"]
+    fn client_int_decoder_runs_in_elm() {
+        let available = |tool: &str| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !available("elm") || !available("node") {
+            eprintln!("skipped: `elm` and `node` are required");
+            return;
+        }
+        let elm = client_int_elm();
+        let start = elm.find("intDecoder : D.Decoder Int").unwrap();
+        let end = elm.find("encodeInt value_ =").unwrap()
+            + "encodeInt value_ =\n    E.string (String.fromInt value_)\n\n".len();
+        let guard =
+            TempDir(std::env::temp_dir().join(format!("bindc-int-harness-{}", std::process::id())));
+        let dir = &guard.0;
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(
+            dir.join("elm.json"),
+            "{\"type\":\"application\",\"source-directories\":[\"src\"],\"elm-version\":\"0.19.2\",\"dependencies\":{\"direct\":{\"elm/browser\":\"1.0.2\",\"elm/core\":\"1.0.5\",\"elm/html\":\"1.0.0\",\"elm/http\":\"2.0.0\",\"elm/json\":\"1.1.3\"},\"indirect\":{\"elm/bytes\":\"1.0.8\",\"elm/file\":\"1.0.5\",\"elm/time\":\"1.0.0\",\"elm/url\":\"1.0.0\",\"elm/virtual-dom\":\"1.0.3\"}},\"test-dependencies\":{\"direct\":{},\"indirect\":{}}}",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("src/Harness.elm"),
+            format!(
+                "port module Harness exposing (main)\n\nimport Json.Decode as D\nimport Json.Encode as E\n\nport input : (E.Value -> msg) -> Sub msg\n\nport output : String -> Cmd msg\n\n{}run : E.Value -> String\nrun value =\n    case D.decodeValue intDecoder value of\n        Ok n ->\n            \"OK \" ++ String.fromInt n ++ \" \" ++ E.encode 0 (encodeInt n)\n\n        Err _ ->\n            \"FAIL\"\n\nmain : Program () () E.Value\nmain =\n    Platform.worker\n        {{ init = \\_ -> ( (), Cmd.none )\n        , update = \\value _ -> ( (), output (run value) )\n        , subscriptions = \\_ -> input identity\n        }}\n",
+                &elm[start..end]
+            ),
+        )
+        .unwrap();
+        let compiled = std::process::Command::new("elm")
+            .args(["make", "src/Harness.elm", "--output=harness.js"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        fs::write(
+            dir.join("run.js"),
+            r#"const { Elm } = require('./harness.js');
+const app = Elm.Harness.init();
+const inputs = [
+  "0", "-1", "9007199254740991", "-9007199254740991", "9007199254740990",
+  "1000000000000000", "8999999999999999",
+  "9007199254740992", "-9007199254740992", "10000000000000000",
+  "01", "-0", "+1", "1.5", "", " 1", 1, null,
+];
+const results = [];
+app.ports.output.subscribe((r) => {
+  results.push(r);
+  if (results.length === inputs.length) console.log(results.join("\n"));
+});
+for (const input of inputs) app.ports.input.send(input);
+"#,
+        )
+        .unwrap();
+        let run = std::process::Command::new("node")
+            .arg("run.js")
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        let results: Vec<&str> = stdout.lines().collect();
+        assert_eq!(results.len(), 18, "{stdout}");
+        let accepted = [
+            "0",
+            "-1",
+            "9007199254740991",
+            "-9007199254740991",
+            "9007199254740990",
+            "1000000000000000",
+            "8999999999999999",
+        ];
+        for (index, value) in accepted.iter().enumerate() {
+            // The decoded value and `encodeInt` of it (a JSON string) are exact.
+            assert_eq!(results[index], format!("OK {value} \"{value}\""));
+        }
+        for (offset, result) in results[accepted.len()..].iter().enumerate() {
+            assert_eq!(*result, "FAIL", "rejected input #{offset} was accepted");
+        }
     }
 
     /// A generation that fails leaves the previous output untouched.
