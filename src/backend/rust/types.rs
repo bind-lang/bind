@@ -98,11 +98,20 @@ const COPY_SCALARS: &[&str] = &[
 ];
 
 /// Program-wide facts the backend needs: constructors, boxed (recursive) fields and names.
+#[derive(Clone)]
 pub struct Layout<'p> {
     pub program: &'p CoreProgram,
     /// `(constructor, field index)` of every field stored as `Box<T>` to keep its type sized.
     boxed: BTreeSet<(String, usize)>,
     user_types: BTreeSet<&'p str>,
+    /// User type names and type parameters: a primitive of the same name is qualified.
+    shadowing: BTreeSet<&'p str>,
+    /// Rust identifiers of the type names, type parameters and variant names that cannot be
+    /// written verbatim (see [`Layout::ident`]).
+    idents: BTreeMap<String, String>,
+    /// The path of the program module from where the code is emitted: empty inside it,
+    /// `crate::app::` outside (database layer, router).
+    prefix: String,
 }
 
 impl<'p> Layout<'p> {
@@ -117,13 +126,100 @@ impl<'p> Layout<'p> {
                 | CoreType::Distinct { name, .. } => Some(name.as_str()),
             })
             .collect();
+        let mut names: BTreeSet<&str> = BTreeSet::new();
+        let mut shadowing: BTreeSet<&str> = BTreeSet::new();
+        for ty in &program.types {
+            match ty {
+                CoreType::Record { name, params, .. } => {
+                    names.insert(name);
+                    names.extend(params.iter().map(String::as_str));
+                    shadowing.insert(name);
+                    shadowing.extend(params.iter().map(String::as_str));
+                }
+                CoreType::Sum {
+                    name,
+                    params,
+                    variants,
+                } => {
+                    names.insert(name);
+                    names.extend(params.iter().map(String::as_str));
+                    names.extend(variants.iter().map(|(variant, _)| variant.as_str()));
+                    shadowing.insert(name);
+                    shadowing.extend(params.iter().map(String::as_str));
+                }
+                CoreType::Distinct { name, .. } => {
+                    names.insert(name);
+                    shadowing.insert(name);
+                }
+            }
+        }
+        let mut idents = BTreeMap::new();
+        let mut taken: BTreeSet<String> = names.iter().map(|name| name.to_string()).collect();
+        for name in &names {
+            if RAW_KEYWORDS.contains(name) {
+                idents.insert(name.to_string(), format!("r#{name}"));
+            } else if UNRAW_KEYWORDS.contains(name) {
+                let mut ident = format!("{name}_");
+                while taken.contains(&ident) {
+                    ident.push('_');
+                }
+                taken.insert(ident.clone());
+                idents.insert(name.to_string(), ident);
+            }
+        }
         let mut layout = Layout {
             program,
             boxed: BTreeSet::new(),
             user_types,
+            shadowing,
+            idents,
+            prefix: String::new(),
         };
         layout.boxed = layout.recursive_fields();
         layout
+    }
+
+    /// This layout for code emitted outside the program module, which is `module` (a child
+    /// of the crate root): user types are written `crate::<module>::Name`.
+    pub fn outside(&self, module: &str) -> Layout<'p> {
+        Layout {
+            prefix: format!("crate::{module}::"),
+            ..self.clone()
+        }
+    }
+
+    /// The Rust identifier of a user type name, type parameter or variant name: the Bind name
+    /// verbatim, a raw identifier for a keyword (`r#match`), or, for the names that cannot be
+    /// raw (`self`, `Self`, `super`, `crate`, `_`), the name followed by the fewest `_` that
+    /// make it unique among the program's type, parameter and variant names.
+    pub fn ident(&self, name: &str) -> String {
+        self.idents
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
+    }
+
+    /// A user type as written from where this layout emits code (see [`Layout::outside`]).
+    pub fn type_path(&self, name: &str) -> String {
+        format!("{}{}", self.prefix, self.ident(name))
+    }
+
+    /// The hidden field (or variant) of `type_name` that uses its unused type parameters:
+    /// `base` followed by the fewest `_` that make it differ from every field (or variant)
+    /// name of the type.
+    pub fn phantom_name(&self, type_name: &str, base: &str) -> String {
+        let taken: BTreeSet<&str> = self
+            .ctors_of(type_name)
+            .iter()
+            .flat_map(|ctor| {
+                std::iter::once(ctor.name).chain(ctor.fields.iter().map(|(field, _)| *field))
+            })
+            .collect();
+        let mut name = base.to_string();
+        while taken.contains(name.as_str()) {
+            name.push('_');
+        }
+        name
     }
 
     /// The constructor `ctor` of type `type_name`.
@@ -198,7 +294,7 @@ impl<'p> Layout<'p> {
 
     /// The Rust name of a primitive type, qualified when a user type shadows it.
     fn primitive(&self, name: &'static str) -> String {
-        if self.user_types.contains(name) {
+        if self.shadowing.contains(name) {
             format!("::std::primitive::{name}")
         } else {
             name.to_string()
@@ -232,13 +328,14 @@ impl<'p> Layout<'p> {
                 )
             }
             Type::Con(name, args) if args.is_empty() && name.starts_with('\'') => {
-                name.trim_start_matches('\'').to_string()
+                self.ident(name.trim_start_matches('\''))
             }
             Type::Con(name, args) if self.user_types.contains(name.as_str()) => {
+                let path = self.type_path(name);
                 if args.is_empty() {
-                    name.clone()
+                    path
                 } else {
-                    format!("{name}<{}>", all(args).join(", "))
+                    format!("{path}<{}>", all(args).join(", "))
                 }
             }
             Type::Con(name, args) => match (name.as_str(), all(args).as_slice()) {
@@ -386,23 +483,26 @@ impl<'p> Layout<'p> {
             let generics = if params.is_empty() {
                 String::new()
             } else {
+                let params: Vec<String> = params.iter().map(|param| self.ident(param)).collect();
                 format!("<{}>", params.join(", "))
             };
+            let ident = self.ident(name);
             match ty {
                 CoreType::Record { fields, .. } => {
-                    output.push_str(&format!("pub struct {name}{generics} {{\n"));
+                    output.push_str(&format!("pub struct {ident}{generics} {{\n"));
                     for (index, (field, field_ty)) in fields.iter().enumerate() {
                         let ty = self.stored_type(name, index, field_ty, &none);
                         output.push_str(&field_line("pub ", field, &ty, serde));
                     }
                     if let Some(phantom) = self.phantom(name) {
                         let skip = if serde { "#[serde(skip)]\n" } else { "" };
-                        output.push_str(&format!("{skip}pub {PHANTOM_FIELD}: {phantom},\n"));
+                        let field = self.phantom_name(name, PHANTOM_FIELD);
+                        output.push_str(&format!("{skip}pub {field}: {phantom},\n"));
                     }
                     output.push_str("}\n\n");
                 }
                 CoreType::Sum { variants, .. } => {
-                    output.push_str(&format!("pub enum {name}{generics} {{\n"));
+                    output.push_str(&format!("pub enum {ident}{generics} {{\n"));
                     for (variant, fields) in variants {
                         if serde {
                             // The `bind-json` name of a variant (as in the Elm codecs).
@@ -411,11 +511,12 @@ impl<'p> Layout<'p> {
                                 crate::certified::lower_camel(variant)
                             ));
                         }
+                        let variant_ident = self.ident(variant);
                         if fields.is_empty() {
-                            output.push_str(&format!("{variant},\n"));
+                            output.push_str(&format!("{variant_ident},\n"));
                             continue;
                         }
-                        output.push_str(&format!("{variant} {{\n"));
+                        output.push_str(&format!("{variant_ident} {{\n"));
                         for (index, (field, field_ty)) in fields.iter().enumerate() {
                             let ty = self.stored_type(variant, index, field_ty, &none);
                             output.push_str(&field_line("", field, &ty, serde));
@@ -425,8 +526,9 @@ impl<'p> Layout<'p> {
                     if let Some(phantom) = self.phantom(name) {
                         // Uninhabited: only gives the unused parameters a use.
                         let skip = if serde { "#[serde(skip)]\n" } else { "" };
+                        let variant = self.phantom_name(name, PHANTOM_VARIANT);
                         output.push_str(&format!(
-                            "{skip}{PHANTOM_VARIANT}({phantom}, ::std::convert::Infallible),\n"
+                            "{skip}{variant}({phantom}, ::std::convert::Infallible),\n"
                         ));
                     }
                     output.push_str("}\n\n");
@@ -435,8 +537,12 @@ impl<'p> Layout<'p> {
                     if serde {
                         output.push_str("#[serde(transparent)]\n");
                     }
+                    // Braced, not a tuple struct: a tuple struct's constructor would share
+                    // the value namespace with functions and locals.
                     let ty = self.stored_type(name, 0, underlying, &none);
-                    output.push_str(&format!("pub struct {name}(pub {ty});\n\n"));
+                    output.push_str(&format!(
+                        "pub struct {ident} {{\npub {DISTINCT_FIELD}: {ty},\n}}\n\n"
+                    ));
                 }
             }
         }
@@ -467,7 +573,10 @@ impl<'p> Layout<'p> {
         if unused.is_empty() {
             return None;
         }
-        let list: String = unused.iter().map(|param| format!("{param}, ")).collect();
+        let list: String = unused
+            .iter()
+            .map(|param| format!("{}, ", self.ident(param)))
+            .collect();
         Some(format!(
             "::std::marker::PhantomData<fn() -> ({})>",
             list.trim_end_matches(' ')
@@ -491,7 +600,10 @@ impl<'p> Layout<'p> {
     }
 }
 
-/// The hidden field of a record whose type parameters are not all used by its fields.
+/// The field of a distinct type's struct.
+pub const DISTINCT_FIELD: &str = "value";
+/// The hidden field of a record whose type parameters are not all used by its fields
+/// (made unique against the record's fields by [`Layout::phantom_name`]).
 pub const PHANTOM_FIELD: &str = "__phantom";
 /// The hidden, uninhabited variant of such a sum type.
 pub const PHANTOM_VARIANT: &str = "__Phantom";
@@ -512,7 +624,7 @@ fn markers(ty: &Type, output: &mut BTreeSet<String>) {
 
 pub(super) fn field_line(visibility: &str, field: &str, ty: &str, serde: bool) -> String {
     let ident = field_ident(field);
-    let rename = if serde && ident.ends_with('_') && !field.ends_with('_') {
+    let rename = if serde && !ident.starts_with("r#") && ident != field {
         format!("#[serde(rename = \"{field}\")]\n")
     } else {
         String::new()
@@ -530,6 +642,9 @@ fn mentions(ty: &Type, set: &BTreeSet<String>, functions: bool) -> bool {
     }
 }
 
+/// Rust keywords that cannot be raw identifiers (`_` is not an identifier at all).
+const UNRAW_KEYWORDS: &[&str] = &["self", "Self", "super", "crate", "_"];
+
 /// Rust keywords that can be written as raw identifiers (`r#type`).
 const RAW_KEYWORDS: &[&str] = &[
     "as", "break", "const", "continue", "else", "enum", "extern", "false", "fn", "for", "if",
@@ -545,7 +660,7 @@ const RAW_KEYWORDS: &[&str] = &[
 pub fn field_ident(name: &str) -> String {
     if RAW_KEYWORDS.contains(&name) {
         format!("r#{name}")
-    } else if matches!(name, "self" | "Self" | "super" | "crate") {
+    } else if UNRAW_KEYWORDS.contains(&name) {
         format!("{name}_")
     } else {
         name.to_string()

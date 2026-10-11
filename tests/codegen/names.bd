@@ -1,0 +1,62 @@
+// User names that are also names of generated items, Rust keywords or locals.
+data class HttpResult(val status: Int)
+data class tests(val y: Int)
+data class bind_runtime(val z: Int)
+data class app(val w: Int)
+distinct type finish = Int
+distinct type begin = Int
+distinct type error_result = Int
+distinct type handle_rpc = Int
+distinct type serve_rpc = Int
+distinct type db_find_things = Int
+distinct type decode_things = Int
+distinct type ctx = Int
+distinct type bind_dobro = Int
+distinct type v0_a = Int
+distinct type c0 = Int
+distinct type m0 = Int
+distinct type p0 = Int
+data class match(val _: Int, val self: Int)
+data class Self(val a: Int)
+data class self_(val a: Int)
+data class _(val a: Int)
+data class Caixa<type, Self>(val x: type, val __phantom: Int)
+sealed class S {
+    data object type
+    data class fn(val crate: Int)
+    data object crate
+}
+
+distinct type ThingId = UUID
+
+entity Thing(
+    val id: ThingId,
+    val label: String
+)
+
+fun dobro(a: Int): Int = a * 2
+
+fun classifica(s: S): Int = when (s) {
+    S.type -> 1
+    S.fn(c) -> c
+    S.crate -> 3
+}
+
+fun usa(m: match, k: Self, j: self_, u: _, c: Caixa<Int, String>): Int =
+    m._ + m.self + k.a + j.a + u.a + c.x + c.__phantom
+
+server fun calcula(a: Int): HttpResult {
+    val x = finish(dobro(a))
+    val y = ctx(a)
+    val z = when (y) {
+        ctx(n) -> n
+    }
+    val q = classifica(S.fn(z)) + classifica(S.crate) + classifica(S.type)
+    val u = usa(match(1, 2), Self(3), self_(4), _(5), Caixa(6, 7))
+    val w = when (x) {
+        finish(n) -> n
+    }
+    return HttpResult(q + u + w)
+}
+
+server fun procura(id: ThingId): Thing? effects [db.read] = db.things.find(id)

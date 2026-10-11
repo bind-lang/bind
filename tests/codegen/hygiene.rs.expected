@@ -52,11 +52,15 @@ pub struct T0 {
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(transparent)]
-pub struct None(pub ::std::string::String);
+pub struct None {
+    pub value: ::std::string::String,
+}
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(transparent)]
-pub struct Some(pub crate::bind_runtime::Int);
+pub struct Some {
+    pub value: crate::bind_runtime::Int,
+}
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum Arc {

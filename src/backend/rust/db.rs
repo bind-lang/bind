@@ -17,7 +17,7 @@ use crate::core::ir::{CoreFunction, CoreProgram, CoreType, DbOp, Expr, ExprKind}
 use crate::schema::DatabaseSchema;
 use crate::types::ty::Type;
 
-use super::types::{Layout, RUNTIME, STRING};
+use super::types::{DISTINCT_FIELD, Layout, RUNTIME, STRING};
 
 /// One database operation used by the generated code.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -294,9 +294,10 @@ impl DbPlan {
                 params.push(format!("{name}: {}", layout.ty(ty, &none)));
                 binds.push_str(&format!(".bind({})", bind_value(&name, ty, layout)?));
             }
+            let model_type = layout.type_path(model.name);
             let result = match key {
-                DbKey::Find(_) => format!("::std::option::Option<{}>", model.name),
-                _ => model.name.to_string(),
+                DbKey::Find(_) => format!("::std::option::Option<{model_type}>"),
+                _ => model_type,
             };
             let decode = format!("decode_{}", identifier(table));
             let finish = match key {
@@ -323,11 +324,10 @@ impl DbPlan {
                     decode_value(field, ty, layout)?
                 ));
             }
+            let model_type = layout.type_path(model.name);
             output.push_str(&format!(
-                "fn decode_{}(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<{}, {RUNTIME}::AppError> {{\n::std::result::Result::Ok({} {{\n{}\n}})\n}}\n\n",
+                "fn decode_{}(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<{model_type}, {RUNTIME}::AppError> {{\n::std::result::Result::Ok({model_type} {{\n{}\n}})\n}}\n\n",
                 identifier(table),
-                model.name,
-                model.name,
                 fields.join("\n")
             ));
         }
@@ -415,7 +415,7 @@ fn cast(ty: &Type, layout: &Layout) -> Result<&'static str, String> {
 /// The value bound for parameter `name` of type `ty`: distinct wrappers removed.
 fn bind_value(name: &str, ty: &Type, layout: &Layout) -> Result<String, String> {
     let column = column(ty, layout)?;
-    let unwrap = ".0".repeat(column.wrappers.len());
+    let unwrap = format!(".{DISTINCT_FIELD}").repeat(column.wrappers.len());
     Ok(match (column.nullable, unwrap.is_empty()) {
         (_, true) => name.to_string(),
         (false, false) => format!("{name}{unwrap}"),
@@ -444,7 +444,12 @@ fn decode_value(field: &str, ty: &Type, layout: &Layout) -> Result<String, Strin
             .iter()
             .rev()
             .fold(inner.to_string(), |value, wrapper| {
-                format!("{wrapper}({value})")
+                let field = if value == DISTINCT_FIELD {
+                    value
+                } else {
+                    format!("{DISTINCT_FIELD}: {value}")
+                };
+                format!("{} {{ {field} }}", layout.type_path(wrapper))
             })
     };
     Ok(if column.nullable {

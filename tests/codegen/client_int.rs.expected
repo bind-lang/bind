@@ -40,42 +40,52 @@
 /// The Bind runtime, copied verbatim from bindc's `runtime/bind-runtime`.
 pub mod bind_runtime;
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-#[serde(transparent)]
-pub struct Count(pub crate::bind_runtime::Int);
+/// The program's types and functions. User names live only here, so they never meet the
+/// items below (database layer, request types, router, tests) or the runtime.
+pub mod app {
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct Count {
+        pub value: crate::bind_runtime::Int,
+    }
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-#[serde(transparent)]
-pub struct Counts(pub ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>);
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct Counts {
+        pub value: ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>,
+    }
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-#[serde(transparent)]
-pub struct MaybeCount(pub ::std::option::Option<crate::bind_runtime::Int>);
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct MaybeCount {
+        pub value: ::std::option::Option<crate::bind_runtime::Int>,
+    }
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-pub struct Item {
-    pub id: ::uuid::Uuid,
-    pub name: ::std::string::String,
-    pub quantity: crate::bind_runtime::Int,
-    pub reserved: ::std::option::Option<crate::bind_runtime::Int>,
-    pub stock: Count,
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    pub struct Item {
+        pub id: ::uuid::Uuid,
+        pub name: ::std::string::String,
+        pub quantity: crate::bind_runtime::Int,
+        pub reserved: ::std::option::Option<crate::bind_runtime::Int>,
+        pub stock: Count,
+    }
+
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    pub struct Summary {
+        pub history: ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>,
+        pub series: Counts,
+        pub spare: MaybeCount,
+    }
+
+    pub fn bind_reservar(ctx: crate::bind_runtime::Ctx, v0_id: ::uuid::Uuid, v1_quantidade: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<Item> {
+        ::std::boxed::Box::pin(async move {
+            let ctx = ctx.enter()?;
+            crate::db_require_items(ctx.clone(), v0_id).await
+        })
+    }
 }
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-pub struct Summary {
-    pub history: ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>,
-    pub series: Counts,
-    pub spare: MaybeCount,
-}
-
-pub fn bind_reservar(ctx: crate::bind_runtime::Ctx, v0_id: ::uuid::Uuid, v1_quantidade: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<Item> {
-    ::std::boxed::Box::pin(async move {
-        let ctx = ctx.enter()?;
-        db_require_items(ctx.clone(), v0_id).await
-    })
-}
-
-fn db_require_items(ctx: crate::bind_runtime::Ctx, p0_id: ::uuid::Uuid) -> crate::bind_runtime::BoxFuture<Item> {
+fn db_require_items(ctx: crate::bind_runtime::Ctx, p0_id: ::uuid::Uuid) -> crate::bind_runtime::BoxFuture<crate::app::Item> {
     ::std::boxed::Box::pin(async move {
         let query = ::sqlx::query("SELECT \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"quantity\"::numeric AS \"quantity\", \"reserved\"::numeric AS \"reserved\", \"stock\"::numeric AS \"stock\" FROM \"items\" WHERE \"id\" = $1::uuid LIMIT 1").bind(p0_id);
         let row = {
@@ -89,13 +99,13 @@ fn db_require_items(ctx: crate::bind_runtime::Ctx, p0_id: ::uuid::Uuid) -> crate
     })
 }
 
-fn decode_items(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<Item, crate::bind_runtime::AppError> {
-    ::std::result::Result::Ok(Item {
+fn decode_items(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<crate::app::Item, crate::bind_runtime::AppError> {
+    ::std::result::Result::Ok(crate::app::Item {
         id: ::sqlx::Row::try_get::<::uuid::Uuid, _>(row, "id")?,
         name: ::sqlx::Row::try_get::<::std::string::String, _>(row, "name")?,
         quantity: ::sqlx::Row::try_get::<crate::bind_runtime::Int, _>(row, "quantity")?,
         reserved: ::sqlx::Row::try_get::<::std::option::Option<crate::bind_runtime::Int>, _>(row, "reserved")?,
-        stock: Count(::sqlx::Row::try_get::<crate::bind_runtime::Int, _>(row, "stock")?),
+        stock: crate::app::Count { value: ::sqlx::Row::try_get::<crate::bind_runtime::Int, _>(row, "stock")? },
     })
 }
 
@@ -167,7 +177,7 @@ pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpR
                 ::std::result::Result::Ok(started) => started,
                 ::std::result::Result::Err(response) => return response,
             };
-            let result = bind_reservar(ctx.clone(), input.id, input.quantidade).await;
+            let result = app::bind_reservar(ctx.clone(), input.id, input.quantidade).await;
             finish(ctx, result).await
         }
         _ => error_result(&crate::bind_runtime::AppError::NotFound(::std::string::String::from("RPC procedure not found"))),

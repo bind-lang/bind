@@ -7,19 +7,10 @@ use crate::core::ir::CoreFunction;
 
 use super::types::{Layout, RUNTIME, field_ident, field_line};
 
-/// The request type of each endpoint: `<Name>Input`, made unique against user types.
-pub fn input_names(endpoints: &[&CoreFunction], layout: &Layout) -> BTreeMap<String, String> {
-    let mut taken: BTreeSet<String> = layout
-        .program
-        .types
-        .iter()
-        .map(|ty| match ty {
-            crate::core::ir::CoreType::Record { name, .. }
-            | crate::core::ir::CoreType::Sum { name, .. }
-            | crate::core::ir::CoreType::Distinct { name, .. } => name.clone(),
-        })
-        .collect();
-    taken.extend(["HttpResult".to_string()]);
+/// The request type of each endpoint: `<Name>Input`, unique among them and distinct from the
+/// other items at the crate root (user types live in the program module).
+pub fn input_names(endpoints: &[&CoreFunction]) -> BTreeMap<String, String> {
+    let mut taken: BTreeSet<String> = BTreeSet::from(["HttpResult".to_string()]);
     let mut names = BTreeMap::new();
     for endpoint in endpoints {
         let mut name = format!("{}Input", crate::certified::pascal_case(&endpoint.name));
@@ -121,8 +112,9 @@ match path.trim_end_matches('/') {{
             arguments.push(format!("input.{}", field_ident(name)));
         }
         output.push_str(&format!(
-            "{:?} => {{\nlet (input, ctx) = match begin::<{input}>(body, pool).await {{\n::std::result::Result::Ok(started) => started,\n::std::result::Result::Err(response) => return response,\n}};\nlet result = bind_{}({}).await;\nfinish(ctx, result).await\n}}\n",
+            "{:?} => {{\nlet (input, ctx) = match begin::<{input}>(body, pool).await {{\n::std::result::Result::Ok(started) => started,\n::std::result::Result::Err(response) => return response,\n}};\nlet result = {}::bind_{}({}).await;\nfinish(ctx, result).await\n}}\n",
             format!("/api/{}", endpoint.name),
+            super::PROGRAM_MODULE,
             endpoint.name,
             arguments.join(", ")
         ));

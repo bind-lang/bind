@@ -40,58 +40,64 @@
 /// The Bind runtime, copied verbatim from bindc's `runtime/bind-runtime`.
 pub mod bind_runtime;
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-#[serde(transparent)]
-pub struct CustomerId(pub ::uuid::Uuid);
+/// The program's types and functions. User names live only here, so they never meet the
+/// items below (database layer, request types, router, tests) or the runtime.
+pub mod app {
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(transparent)]
+    pub struct CustomerId {
+        pub value: ::uuid::Uuid,
+    }
 
-#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
-pub struct Customer {
-    pub id: CustomerId,
-    pub name: ::std::string::String,
-    pub email: ::std::string::String,
-    pub balance: ::rust_decimal::Decimal,
-    pub visits: crate::bind_runtime::Int,
-    pub nickname: ::std::option::Option<::std::string::String>,
-}
+    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    pub struct Customer {
+        pub id: CustomerId,
+        pub name: ::std::string::String,
+        pub email: ::std::string::String,
+        pub balance: ::rust_decimal::Decimal,
+        pub visits: crate::bind_runtime::Int,
+        pub nickname: ::std::option::Option<::std::string::String>,
+    }
 
-pub fn bind_cadastrar(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String, v1_email: ::std::string::String, v2_saldo: ::rust_decimal::Decimal) -> crate::bind_runtime::BoxFuture<Customer> {
-    ::std::boxed::Box::pin(async move {
-        let ctx = ctx.enter()?;
-        let v3_novo: Customer = db_insert_customers(ctx.clone(), bind_normalizar(ctx.clone(), v0_nome.clone()).await?, v1_email.clone(), v2_saldo, crate::bind_runtime::Int::from_i64(0)).await?;
-        db_require_customers(ctx.clone(), v3_novo.id.clone()).await
-    })
-}
-
-pub fn bind_falha(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String, v1_email: ::std::string::String, v2_saldo: ::rust_decimal::Decimal, v3_outro: CustomerId) -> crate::bind_runtime::BoxFuture<Customer> {
-    ::std::boxed::Box::pin(async move {
-        let ctx = ctx.enter()?;
-        let v4_ignorado: Customer = db_insert_customers(ctx.clone(), v0_nome.clone(), v1_email.clone(), v2_saldo, crate::bind_runtime::Int::from_i64(1)).await?;
-        db_require_customers(ctx.clone(), v3_outro.clone()).await
-    })
-}
-
-pub fn bind_normalizar(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String) -> crate::bind_runtime::BoxFuture<::std::string::String> {
-    ::std::boxed::Box::pin(async move {
-        let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(if v0_nome == "" {
-            ::std::string::String::from("sem nome")
-        } else {
-            let v1_outro = v0_nome.clone();
-            v1_outro.clone()
+    pub fn bind_cadastrar(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String, v1_email: ::std::string::String, v2_saldo: ::rust_decimal::Decimal) -> crate::bind_runtime::BoxFuture<Customer> {
+        ::std::boxed::Box::pin(async move {
+            let ctx = ctx.enter()?;
+            let v3_novo: Customer = crate::db_insert_customers(ctx.clone(), bind_normalizar(ctx.clone(), v0_nome.clone()).await?, v1_email.clone(), v2_saldo, crate::bind_runtime::Int::from_i64(0)).await?;
+            crate::db_require_customers(ctx.clone(), v3_novo.id.clone()).await
         })
-    })
+    }
+
+    pub fn bind_falha(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String, v1_email: ::std::string::String, v2_saldo: ::rust_decimal::Decimal, v3_outro: CustomerId) -> crate::bind_runtime::BoxFuture<Customer> {
+        ::std::boxed::Box::pin(async move {
+            let ctx = ctx.enter()?;
+            let v4_ignorado: Customer = crate::db_insert_customers(ctx.clone(), v0_nome.clone(), v1_email.clone(), v2_saldo, crate::bind_runtime::Int::from_i64(1)).await?;
+            crate::db_require_customers(ctx.clone(), v3_outro.clone()).await
+        })
+    }
+
+    pub fn bind_normalizar(ctx: crate::bind_runtime::Ctx, v0_nome: ::std::string::String) -> crate::bind_runtime::BoxFuture<::std::string::String> {
+        ::std::boxed::Box::pin(async move {
+            let ctx = ctx.enter()?;
+            ::std::result::Result::Ok(if v0_nome == "" {
+                ::std::string::String::from("sem nome")
+            } else {
+                let v1_outro = v0_nome.clone();
+                v1_outro.clone()
+            })
+        })
+    }
+
+    pub fn bind_procurar(ctx: crate::bind_runtime::Ctx, v0_id: CustomerId) -> crate::bind_runtime::BoxFuture<::std::option::Option<Customer>> {
+        ::std::boxed::Box::pin(async move {
+            let ctx = ctx.enter()?;
+            crate::db_find_customers(ctx.clone(), v0_id.clone()).await
+        })
+    }
 }
 
-pub fn bind_procurar(ctx: crate::bind_runtime::Ctx, v0_id: CustomerId) -> crate::bind_runtime::BoxFuture<::std::option::Option<Customer>> {
+fn db_require_customers(ctx: crate::bind_runtime::Ctx, p0_id: crate::app::CustomerId) -> crate::bind_runtime::BoxFuture<crate::app::Customer> {
     ::std::boxed::Box::pin(async move {
-        let ctx = ctx.enter()?;
-        db_find_customers(ctx.clone(), v0_id.clone()).await
-    })
-}
-
-fn db_require_customers(ctx: crate::bind_runtime::Ctx, p0_id: CustomerId) -> crate::bind_runtime::BoxFuture<Customer> {
-    ::std::boxed::Box::pin(async move {
-        let query = ::sqlx::query("SELECT \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"email\"::text AS \"email\", \"balance\"::numeric AS \"balance\", \"visits\"::numeric AS \"visits\", \"nickname\"::text AS \"nickname\" FROM \"customers\" WHERE \"id\" = $1::uuid LIMIT 1").bind(p0_id.0);
+        let query = ::sqlx::query("SELECT \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"email\"::text AS \"email\", \"balance\"::numeric AS \"balance\", \"visits\"::numeric AS \"visits\", \"nickname\"::text AS \"nickname\" FROM \"customers\" WHERE \"id\" = $1::uuid LIMIT 1").bind(p0_id.value);
         let row = {
             let mut transaction = ctx.transaction().await?;
             query.fetch_optional(&mut **transaction).await?
@@ -103,9 +109,9 @@ fn db_require_customers(ctx: crate::bind_runtime::Ctx, p0_id: CustomerId) -> cra
     })
 }
 
-fn db_find_customers(ctx: crate::bind_runtime::Ctx, p0_id: CustomerId) -> crate::bind_runtime::BoxFuture<::std::option::Option<Customer>> {
+fn db_find_customers(ctx: crate::bind_runtime::Ctx, p0_id: crate::app::CustomerId) -> crate::bind_runtime::BoxFuture<::std::option::Option<crate::app::Customer>> {
     ::std::boxed::Box::pin(async move {
-        let query = ::sqlx::query("SELECT \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"email\"::text AS \"email\", \"balance\"::numeric AS \"balance\", \"visits\"::numeric AS \"visits\", \"nickname\"::text AS \"nickname\" FROM \"customers\" WHERE \"id\" = $1::uuid LIMIT 1").bind(p0_id.0);
+        let query = ::sqlx::query("SELECT \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"email\"::text AS \"email\", \"balance\"::numeric AS \"balance\", \"visits\"::numeric AS \"visits\", \"nickname\"::text AS \"nickname\" FROM \"customers\" WHERE \"id\" = $1::uuid LIMIT 1").bind(p0_id.value);
         let row = {
             let mut transaction = ctx.transaction().await?;
             query.fetch_optional(&mut **transaction).await?
@@ -114,7 +120,7 @@ fn db_find_customers(ctx: crate::bind_runtime::Ctx, p0_id: CustomerId) -> crate:
     })
 }
 
-fn db_insert_customers(ctx: crate::bind_runtime::Ctx, p0_name: ::std::string::String, p1_email: ::std::string::String, p2_balance: ::rust_decimal::Decimal, p3_visits: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<Customer> {
+fn db_insert_customers(ctx: crate::bind_runtime::Ctx, p0_name: ::std::string::String, p1_email: ::std::string::String, p2_balance: ::rust_decimal::Decimal, p3_visits: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::app::Customer> {
     ::std::boxed::Box::pin(async move {
         let query = ::sqlx::query("INSERT INTO \"customers\" (\"name\", \"email\", \"balance\", \"visits\") VALUES ($1::text, $2::text, $3::numeric, $4::numeric) RETURNING \"id\"::uuid AS \"id\", \"name\"::text AS \"name\", \"email\"::text AS \"email\", \"balance\"::numeric AS \"balance\", \"visits\"::numeric AS \"visits\", \"nickname\"::text AS \"nickname\"").bind(p0_name).bind(p1_email).bind(p2_balance).bind(p3_visits);
         let row = {
@@ -125,9 +131,9 @@ fn db_insert_customers(ctx: crate::bind_runtime::Ctx, p0_name: ::std::string::St
     })
 }
 
-fn decode_customers(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<Customer, crate::bind_runtime::AppError> {
-    ::std::result::Result::Ok(Customer {
-        id: CustomerId(::sqlx::Row::try_get::<::uuid::Uuid, _>(row, "id")?),
+fn decode_customers(row: &::sqlx::postgres::PgRow) -> ::std::result::Result<crate::app::Customer, crate::bind_runtime::AppError> {
+    ::std::result::Result::Ok(crate::app::Customer {
+        id: crate::app::CustomerId { value: ::sqlx::Row::try_get::<::uuid::Uuid, _>(row, "id")? },
         name: ::sqlx::Row::try_get::<::std::string::String, _>(row, "name")?,
         email: ::sqlx::Row::try_get::<::std::string::String, _>(row, "email")?,
         balance: ::sqlx::Row::try_get::<::rust_decimal::Decimal, _>(row, "balance")?,
@@ -150,13 +156,13 @@ struct FalhaInput {
     nome: ::std::string::String,
     email: ::std::string::String,
     saldo: ::rust_decimal::Decimal,
-    outro: CustomerId,
+    outro: crate::app::CustomerId,
 }
 
 #[derive(::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ProcurarInput {
-    id: CustomerId,
+    id: crate::app::CustomerId,
 }
 
 /// Response of one RPC call: HTTP status and JSON body.
@@ -220,7 +226,7 @@ pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpR
                 ::std::result::Result::Ok(started) => started,
                 ::std::result::Result::Err(response) => return response,
             };
-            let result = bind_cadastrar(ctx.clone(), input.nome, input.email, input.saldo).await;
+            let result = app::bind_cadastrar(ctx.clone(), input.nome, input.email, input.saldo).await;
             finish(ctx, result).await
         }
         "/api/falha" => {
@@ -228,7 +234,7 @@ pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpR
                 ::std::result::Result::Ok(started) => started,
                 ::std::result::Result::Err(response) => return response,
             };
-            let result = bind_falha(ctx.clone(), input.nome, input.email, input.saldo, input.outro).await;
+            let result = app::bind_falha(ctx.clone(), input.nome, input.email, input.saldo, input.outro).await;
             finish(ctx, result).await
         }
         "/api/procurar" => {
@@ -236,7 +242,7 @@ pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpR
                 ::std::result::Result::Ok(started) => started,
                 ::std::result::Result::Err(response) => return response,
             };
-            let result = bind_procurar(ctx.clone(), input.id).await;
+            let result = app::bind_procurar(ctx.clone(), input.id).await;
             finish(ctx, result).await
         }
         _ => error_result(&crate::bind_runtime::AppError::NotFound(::std::string::String::from("RPC procedure not found"))),

@@ -1,9 +1,13 @@
 //! The Rust server backend: core IR → Rust source.
 //!
-//! The generated module refers to the runtime as `crate::bind_runtime` (the runtime source
-//! copied into the generated crate) and to every other item by a full path, so it can be
-//! placed as its own file (`src/<module>.rs`) of any crate that provides that module and the
-//! pinned dependencies.
+//! The generated code refers to the runtime as `crate::bind_runtime` (the runtime source
+//! copied into the generated crate) and to every other item by a full path. A server crate
+//! puts the program's types and functions in their own module ([`PROGRAM_MODULE`]) and the
+//! database layer, request types, router and tests at the crate root, so no user name can
+//! collide with a generated one. User type names, type parameters and variant names that are
+//! Rust keywords become raw identifiers (or get a `_` suffix, see `types::Layout::ident`);
+//! distinct types are braced structs (`T { value }`), so user types occupy only the type
+//! namespace and never meet functions or locals.
 
 pub mod db;
 pub mod endpoints;
@@ -119,23 +123,35 @@ pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<Strin
                 .collect::<Vec<_>>()
                 .join(" ")
         })?;
-    let names = endpoints::input_names(&endpoints, &layout);
+    let names = endpoints::input_names(&endpoints);
+    let outside = layout.outside(PROGRAM_MODULE);
 
     let mut output = String::from(CRATE_HEADER);
     // The module header's lint allowances apply to the whole crate.
     output.push_str(MODULE_HEADER.split_once('\n').map_or("", |(_, rest)| rest));
     output.push_str("\n/// The Bind runtime, copied verbatim from bindc's `runtime/bind-runtime`.\npub mod bind_runtime;\n\n");
+    output.push_str(&format!(
+        "/// The program's types and functions. User names live only here, so they never meet the\n/// items below (database layer, request types, router, tests) or the runtime.\npub mod {PROGRAM_MODULE} {{\n"
+    ));
     output.push_str(&layout.declarations());
     for function in &functions {
         output.push_str(&expr::function_with_db(function, &layout, &plan.functions));
         output.push('\n');
     }
-    output.push_str(&plan.render(&layout, database)?);
-    output.push_str(&endpoints::inputs(&endpoints, &names, &layout));
+    while output.ends_with('\n') {
+        output.pop();
+    }
+    output.push_str("\n}\n\n");
+    output.push_str(&plan.render(&outside, database)?);
+    output.push_str(&endpoints::inputs(&endpoints, &names, &outside));
     output.push_str(&endpoints::router(&endpoints, &names));
     output.push_str(&endpoints::tests(&endpoints, &names));
     Ok(indent(&output))
 }
+
+/// The module of the generated crate holding the program's types and functions. Its name is
+/// fixed: user names are declared inside it, never next to it, so none can collide with it.
+pub const PROGRAM_MODULE: &str = "app";
 
 /// The endpoints and the program functions reachable from them through `Global` references,
 /// ordered by name.
@@ -727,7 +743,7 @@ fn wire_shapes() {
     assert_eq!(json(&node), r#"{"no":{"esq":"folha","valor":"2","dir":"folha"}}"#);
     let back: adt::Arvore = serde_json::from_str(&json(&node)).unwrap();
     assert_eq!(back, node);
-    assert_eq!(json(&records::Codigo("c".to_string())), r#""c""#);
+    assert_eq!(json(&records::Codigo { value: "c".to_string() }), r#""c""#);
     let config = records::Config {
         r#type: "t".to_string(),
         r#match: Int::from_i64(3),

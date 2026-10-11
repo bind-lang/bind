@@ -31,7 +31,9 @@
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(transparent)]
-pub struct Codigo(pub ::std::string::String);
+pub struct Codigo {
+    pub value: ::std::string::String,
+}
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 pub enum Lista<T> {
@@ -94,7 +96,7 @@ pub enum Rotulo {
 pub fn bind_codigo(ctx: crate::bind_runtime::Ctx, v0_s: ::std::string::String) -> crate::bind_runtime::BoxFuture<Codigo> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(Codigo(v0_s.clone()))
+        ::std::result::Result::Ok(Codigo { value: v0_s.clone() })
     })
 }
 

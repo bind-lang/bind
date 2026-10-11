@@ -20,8 +20,8 @@ use crate::types::ty::Type;
 
 use super::db::{DbFunction, DbKey};
 use super::types::{
-    ARC, BOX, CtorDef, CtorKind, Layout, OPTION, PHANTOM_FIELD, PHANTOM_VARIANT, RESULT, RUNTIME,
-    STRING, field_ident,
+    ARC, BOX, CtorDef, CtorKind, DISTINCT_FIELD, Layout, OPTION, PHANTOM_FIELD, PHANTOM_VARIANT,
+    RESULT, RUNTIME, STRING, field_ident,
 };
 
 /// One function in the uniform calling convention.
@@ -698,6 +698,8 @@ impl Generator<'_, '_> {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
+        let path = self.layout.type_path(type_name);
+        let variant = self.layout.ident(ctor);
         atom(match def.kind {
             CtorKind::Record => {
                 let mut fields = fields();
@@ -705,13 +707,14 @@ impl Generator<'_, '_> {
                     if !fields.is_empty() {
                         fields.push_str(", ");
                     }
-                    fields.push_str(&format!("{PHANTOM_FIELD}: ::std::marker::PhantomData"));
+                    let phantom = self.layout.phantom_name(type_name, PHANTOM_FIELD);
+                    fields.push_str(&format!("{phantom}: ::std::marker::PhantomData"));
                 }
-                format!("{type_name}{type_args} {{ {fields} }}")
+                format!("{path}{type_args} {{ {fields} }}")
             }
-            CtorKind::Variant if def.fields.is_empty() => format!("{type_name}{type_args}::{ctor}"),
-            CtorKind::Variant => format!("{type_name}{type_args}::{ctor} {{ {} }}", fields()),
-            CtorKind::Distinct => format!("{type_name}({})", values.join(", ")),
+            CtorKind::Variant if def.fields.is_empty() => format!("{path}{type_args}::{variant}"),
+            CtorKind::Variant => format!("{path}{type_args}::{variant} {{ {} }}", fields()),
+            CtorKind::Distinct => format!("{path} {{ {DISTINCT_FIELD}: {} }}", values.join(", ")),
             CtorKind::BindResult => {
                 format!(
                     "{RUNTIME}::BindResult{type_args}::{ctor}({})",
@@ -763,7 +766,12 @@ impl Generator<'_, '_> {
                 value
             });
         }
-        atom(format!("{}({}).await?", function.name, values.join(", ")))
+        // The database layer is at the crate root, outside the program module.
+        atom(format!(
+            "crate::{}({}).await?",
+            function.name,
+            values.join(", ")
+        ))
     }
 
     fn builtin_call(&mut self, name: &str, instance: &[Type], args: &[Expr]) -> Code {
@@ -1057,7 +1065,9 @@ impl Generator<'_, '_> {
         {
             // The hidden variant is uninhabited: the empty `match` needs no arm and no panic.
             output.push_str(&format!(
-                "{type_name}::{PHANTOM_VARIANT}(_, never) => match *never {{}},\n"
+                "{}::{}(_, never) => match *never {{}},\n",
+                self.layout.type_path(type_name),
+                self.layout.phantom_name(type_name, PHANTOM_VARIANT)
             ));
         }
         output.push('}');
@@ -1088,13 +1098,25 @@ impl Generator<'_, '_> {
             _ => match self.layout.ctor(type_name, name) {
                 Some(def) => match def.kind {
                     CtorKind::BindResult => format!("{RUNTIME}::BindResult::{name}({})", single()),
-                    CtorKind::Distinct => format!("{type_name}({})", single()),
-                    CtorKind::Variant if def.fields.is_empty() => format!("{type_name}::{name}"),
+                    CtorKind::Distinct => format!(
+                        "{} {{ {DISTINCT_FIELD}: {} }}",
+                        self.layout.type_path(type_name),
+                        single()
+                    ),
+                    CtorKind::Variant if def.fields.is_empty() => format!(
+                        "{}::{}",
+                        self.layout.type_path(type_name),
+                        self.layout.ident(name)
+                    ),
                     CtorKind::Variant | CtorKind::Record => {
                         let prefix = if def.kind == CtorKind::Variant {
-                            format!("{type_name}::{name}")
+                            format!(
+                                "{}::{}",
+                                self.layout.type_path(type_name),
+                                self.layout.ident(name)
+                            )
                         } else {
-                            type_name.to_string()
+                            self.layout.type_path(type_name)
                         };
                         let mut fields: Vec<String> = binders
                             .iter()
@@ -1259,7 +1281,7 @@ impl Generator<'_, '_> {
                             }
                             let field_ty = field_types.get(index).cloned().unwrap_or(Type::Error);
                             let field = match def.kind {
-                                CtorKind::Distinct => "0".to_string(),
+                                CtorKind::Distinct => DISTINCT_FIELD.to_string(),
                                 _ => def
                                     .fields
                                     .get(index)
@@ -1291,7 +1313,11 @@ impl Generator<'_, '_> {
                         } else if binders.is_empty() {
                             let pattern = if def.kind == CtorKind::Variant && !def.fields.is_empty()
                             {
-                                format!("{type_name}::{name} {{ .. }}")
+                                format!(
+                                    "{}::{} {{ .. }}",
+                                    self.layout.type_path(type_name),
+                                    self.layout.ident(name)
+                                )
                             } else {
                                 pattern
                             };
