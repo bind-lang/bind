@@ -462,8 +462,6 @@ pub const TITLE_BAD_REQUEST: &str = "Bad request";
 pub const TITLE_NOT_FOUND: &str = "Page not found";
 /// Title and heading of the error screen for any other error.
 pub const TITLE_ERROR: &str = "Something went wrong";
-/// Stylesheet linked by the error screens rendered with `error_page`.
-pub const ERROR_STYLESHEET: &str = "/styles.css";
 
 /// The element kinds of a UI value. `Text` and `Empty` are separate `Node` variants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -592,7 +590,7 @@ pub fn escape_html(text: &str) -> String {
 
 /// The HTML of a UI value, byte for byte that of `render_html_value` in `bindc`: the `UI`
 /// root is a fragment, `Text` an escaped text node, `Empty` nothing; arguments are used
-/// leniently (heading level clamped to 1..=6, `javascript:` hrefs emptied, extra arguments
+/// leniently (heading level clamped to 1..=6, hrefs with a scheme other than http/https/mailto/tel emptied, extra arguments
 /// ignored). The page shell (`page_html`) adds the `bind-site` wrapper.
 pub fn render_html(node: &Node) -> String {
     let mut out = String::new();
@@ -644,7 +642,7 @@ fn render_into(out: &mut String, node: &Node) {
         }
         NodeTag::Link => {
             let href = arg(0).map(|url| {
-                if is_javascript_uri(&url) {
+                if !is_allowed_href(&url) {
                     String::new()
                 } else {
                     url
@@ -705,32 +703,35 @@ fn heading_level(value: &Int) -> u8 {
     }
 }
 
-/// Elm's `href` sanitizer `/^\s*j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/i`.
-fn is_javascript_uri(url: &str) -> bool {
-    let mut chars = url.chars().filter(|c| !is_js_whitespace(*c));
-    "javascript:".chars().all(|expected| {
-        chars
-            .next()
-            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
-    })
-}
-
-/// JavaScript's `\s`: WhiteSpace and LineTerminator.
-fn is_js_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{9}'..='\u{d}'
-            | ' '
-            | '\u{a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
-    )
+/// Whether a link's `href` may be emitted as is: the URL is normalized like a browser URL
+/// parser does (leading and trailing characters <= U+0020 stripped, ASCII tab, LF and CR
+/// removed anywhere); when the result has a scheme (`^[A-Za-z][A-Za-z0-9+.-]*:` before any
+/// `/`, `?` or `#`) only `http`, `https`, `mailto` and `tel` (ASCII case-insensitive) are
+/// allowed; a URL without a scheme (relative path, `/...`, `#...`, `?...`, `//host`) is allowed.
+fn is_allowed_href(url: &str) -> bool {
+    let normalized: String = url
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let mut chars = normalized.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    let mut scheme = normalized[..1].to_string();
+    for c in chars {
+        if c == ':' {
+            return ["http", "https", "mailto", "tel"]
+                .iter()
+                .any(|allowed| scheme.eq_ignore_ascii_case(allowed));
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') {
+            scheme.push(c);
+        } else {
+            return true;
+        }
+    }
+    true
 }
 
 /// The single page shell of both modes: a full HTML document with the title, the stylesheet
@@ -746,9 +747,9 @@ pub fn page_html(title: &str, stylesheet: &str, body: &str) -> String {
     )
 }
 
-/// The status and HTML of the error screen: the title for the status class and the public
-/// message (never internal details).
-pub fn error_page(error: &AppError) -> (u16, String) {
+/// The status and the markup of the error screen body: the title for the status class and the
+/// public message (never internal details), inside `<main class="bind-error">`.
+pub fn error_body(error: &AppError) -> (u16, String) {
     let status = error.status();
     let title = match status {
         400 => TITLE_BAD_REQUEST,
@@ -760,7 +761,13 @@ pub fn error_page(error: &AppError) -> (u16, String) {
         escape_html(title),
         escape_html(&error.public_message())
     );
-    (status, page_html(title, ERROR_STYLESHEET, &body))
+    (status, body)
+}
+
+/// The status and HTML of a whole error page: `page_html(title, stylesheet, error_body)`.
+pub fn error_page(error: &AppError, title: &str, stylesheet: &str) -> (u16, String) {
+    let (status, body) = error_body(error);
+    (status, page_html(title, stylesheet, &body))
 }
 
 /// ECMAScript `Number::toString(10)` of `value` (what `String(x)` gives in JavaScript).
@@ -783,13 +790,13 @@ pub fn js_number_to_string(value: f64) -> String {
     if k <= n && n <= 21 {
         format!("{digits}{}", "0".repeat((n - k) as usize))
     } else if 0 < n && n <= 21 {
-        let (whole, fraction) = digits.split_at(n as usize);
+        let (whole, fraction) = digits.split_at_checked(n as usize).unwrap_or((&digits, ""));
         format!("{whole}.{fraction}")
     } else if -6 < n && n <= 0 {
         format!("0.{}{digits}", "0".repeat((-n) as usize))
     } else {
         let sign = if n - 1 < 0 { '-' } else { '+' };
-        let (first, rest) = digits.split_at(1);
+        let (first, rest) = digits.split_at_checked(1).unwrap_or((&digits, ""));
         let rest = if rest.is_empty() {
             String::new()
         } else {
@@ -902,16 +909,17 @@ mod tests {
         assert!(page.contains("<link rel=\"stylesheet\" href=\"/s.css?x=&quot;1&quot;\">"));
         assert!(page.contains("<div class=\"bind-site\"><p>hi</p></div>"));
 
-        let (status, html) = error_page(&AppError::NotFound("user 42 secret".into()));
+        let (status, html) =
+            error_page(&AppError::NotFound("user 42 secret".into()), "T", "/s.css");
         assert_eq!(status, 404);
         assert!(html.contains(TITLE_NOT_FOUND));
         assert!(html.contains("not found"));
         assert!(!html.contains("secret"));
-        let (status, html) = error_page(&AppError::BadRequest("bad <id>".into()));
+        let (status, html) = error_page(&AppError::BadRequest("bad <id>".into()), "T", "/s.css");
         assert_eq!(status, 400);
         assert!(html.contains(TITLE_BAD_REQUEST));
         assert!(html.contains("bad &lt;id&gt;"));
-        let (status, html) = error_page(&AppError::Internal("db password".into()));
+        let (status, html) = error_page(&AppError::Internal("db password".into()), "T", "/s.css");
         assert_eq!(status, 500);
         assert!(html.contains(TITLE_ERROR));
         assert!(html.contains("internal error"));

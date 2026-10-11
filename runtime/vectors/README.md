@@ -28,3 +28,26 @@ A `<tree>` is `{ "node": <name>, "args": [<arg>...], "children": [<tree>...] }`.
 An array of `{ "bits": <16 hex digits>, "text": <string> }`: the IEEE-754 bits of an `f64`
 and its ECMAScript `Number.prototype.toString` text (`js_number_to_string`). Bits are used so
 `NaN`, `-0` and infinities are unambiguous.
+
+The values were cross-checked against node (`String(x)` of the `f64` with those bits) and
+agree on every case. The bindc test also fails when the committed file differs from the
+generated case list (run with `BIND_BLESS=1` after changing the list).
+
+## `pages.json`
+
+An array of cases checked by the runtime test (and the JS runtime), hand-written from the
+specification of the page shell and the error screen:
+
+- `{ "kind": "page", "title", "stylesheet", "body", "html" }`: `page_html(title, stylesheet,
+  body)` must give `html` (title and stylesheet are HTML-escaped, `body` is inserted as is).
+- `{ "kind": "error_body", "error", "message", "status", "html" }`: `error` is one of
+  `BadRequest`, `NotFound`, `Internal`, `Overflow`, `RecursionLimit` with its `message`;
+  `error_body(error)` must give `status` and `html` (`<main class="bind-error">` with the
+  title of the status class and the public message, both escaped).
+
+## Links
+
+`html-trees.json` includes the `Link` href allowlist cases: after trimming characters
+<= U+0020 and removing tab/LF/CR, a URL with a scheme is emitted only for `http`, `https`,
+`mailto`, `tel` (case-insensitive); otherwise the `href` is `""`. URLs without a scheme are
+emitted as is.

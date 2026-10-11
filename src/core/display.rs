@@ -38,13 +38,13 @@ pub fn js_number_to_string(value: f64) -> String {
     if k <= n && n <= 21 {
         format!("{digits}{}", "0".repeat((n - k) as usize))
     } else if 0 < n && n <= 21 {
-        let (whole, fraction) = digits.split_at(n as usize);
+        let (whole, fraction) = digits.split_at_checked(n as usize).unwrap_or((&digits, ""));
         format!("{whole}.{fraction}")
     } else if -6 < n && n <= 0 {
         format!("0.{}{digits}", "0".repeat((-n) as usize))
     } else {
         let sign = if n - 1 < 0 { '-' } else { '+' };
-        let (first, rest) = digits.split_at(1);
+        let (first, rest) = digits.split_at_checked(1).unwrap_or((&digits, ""));
         let rest = if rest.is_empty() {
             String::new()
         } else {
@@ -172,9 +172,9 @@ pub struct UiTree {
 ///
 /// - Containers: the first argument is `class`, the second `id`.
 /// - `Heading`: `N` is the `Int` level clamped to 1..=6; a missing or `String` level gives 1.
-/// - `Link`: `href` is the first argument, but the empty string when it matches the Elm
-///   sanitizer `^\s*j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:` (ASCII case-insensitive, `\s`
-///   as in JavaScript: see `is_js_whitespace`); `class` the second, `target` the third;
+/// - `Link`: `href` is the first argument, but the empty string unless it passes the allowlist
+///   of `is_allowed_href` (no scheme, or `http`, `https`, `mailto`, `tel`); `class` the
+///   second, `target` the third;
 ///   `rel="noopener noreferrer"` follows `target` exactly when the target is `_blank`;
 ///   `aria-label` is the fourth.
 ///
@@ -217,7 +217,7 @@ fn render_into(out: &mut String, tree: &UiTree) {
             format!("h{level}")
         }
         UiNode::Link => {
-            let href = arg(0).map(|url| if is_javascript_uri(url) { "" } else { url });
+            let href = arg(0).map(|url| if is_allowed_href(url) { url } else { "" });
             push("href", href);
             push("class", arg(1));
             push("target", arg(2));
@@ -319,33 +319,35 @@ pub fn escape_html(text: &str) -> String {
     out
 }
 
-/// Elm's `href` sanitizer `/^\s*j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/i`.
-fn is_javascript_uri(url: &str) -> bool {
-    let mut chars = url.chars().filter(|c| !is_js_whitespace(*c));
-    "javascript:".chars().all(|expected| {
-        chars
-            .next()
-            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
-    })
-}
-
-/// JavaScript's `\s`: WhiteSpace and LineTerminator — U+0009..U+000D, U+0020, U+00A0,
-/// U+1680, U+2000..U+200A, U+2028, U+2029, U+202F, U+205F, U+3000 and U+FEFF.
-fn is_js_whitespace(c: char) -> bool {
-    matches!(
-        c,
-        '\u{9}'..='\u{d}'
-            | ' '
-            | '\u{a0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200a}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202f}'
-            | '\u{205f}'
-            | '\u{3000}'
-            | '\u{feff}'
-    )
+/// Whether a link's `href` may be emitted as is: the URL is normalized like a browser URL
+/// parser does (leading and trailing characters <= U+0020 stripped, ASCII tab, LF and CR
+/// removed anywhere); when the result has a scheme (`^[A-Za-z][A-Za-z0-9+.-]*:` before any
+/// `/`, `?` or `#`) only `http`, `https`, `mailto` and `tel` (ASCII case-insensitive) are
+/// allowed; a URL without a scheme (relative path, `/...`, `#...`, `?...`, `//host`) is allowed.
+fn is_allowed_href(url: &str) -> bool {
+    let normalized: String = url
+        .trim_matches(|c: char| c <= ' ')
+        .chars()
+        .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+        .collect();
+    let mut chars = normalized.chars();
+    if !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return true;
+    }
+    let mut scheme = normalized[..1].to_string();
+    for c in chars {
+        if c == ':' {
+            return ["http", "https", "mailto", "tel"]
+                .iter()
+                .any(|allowed| scheme.eq_ignore_ascii_case(allowed));
+        }
+        if c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-') {
+            scheme.push(c);
+        } else {
+            return true;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -554,14 +556,35 @@ mod tests {
             link(vec![s(" Java\tScript:alert(1)")]),
             "<a href=\"\">go</a>"
         );
-        assert_eq!(
-            link(vec![s("\u{feff}javascript\u{3000}:x")]),
-            "<a href=\"\">go</a>"
-        );
-        assert_eq!(
-            link(vec![s("javascripts:x")]),
-            "<a href=\"javascripts:x\">go</a>"
-        );
+        for blocked in [
+            "\u{1}javascript:x",
+            " JaVaScRiPt:x",
+            "java\tscript:x",
+            "vbscript:x",
+            "data:text/html,x",
+            "ftp://x",
+            "javascripts:x",
+        ] {
+            assert_eq!(link(vec![s(blocked)]), "<a href=\"\">go</a>", "{blocked:?}");
+        }
+        for allowed in [
+            "https://ok",
+            "HTTP://ok",
+            "mailto:a@b",
+            "tel:+1",
+            "#top",
+            "/path?q=1",
+            "//cdn.example/x",
+            "?q=a:b",
+            "a/b:c",
+            "page.html",
+        ] {
+            assert_eq!(
+                link(vec![s(allowed)]),
+                format!("<a href=\"{allowed}\">go</a>"),
+                "{allowed:?}"
+            );
+        }
         assert_eq!(link(vec![]), "<a>go</a>");
 
         assert_eq!(render_html_value(&n(UiNode::Rule, vec![], vec![])), "<hr>");
@@ -833,8 +856,19 @@ mod tests {
             ]),
             link(vec![s("/a"), s("c"), s("_self")]),
             link(vec![s(" Java\tScript:alert(1)")]),
-            link(vec![s("\u{feff}javascript\u{3000}:x")]),
-            link(vec![s("javascripts:x")]),
+            link(vec![s("\u{1}javascript:x")]),
+            link(vec![s(" JaVaScRiPt:x")]),
+            link(vec![s("java\tscript:x")]),
+            link(vec![s("vbscript:x")]),
+            link(vec![s("data:text/html,x")]),
+            link(vec![s("https://ok")]),
+            link(vec![s("mailto:a@b")]),
+            link(vec![s("#top")]),
+            link(vec![s("/path?q=1")]),
+            link(vec![s("//cdn.example/x")]),
+            link(vec![s("ftp://x")]),
+            link(vec![s("\u{feff}javascript:x")]),
+            link(vec![s("tel:+15551234")]),
             link(vec![]),
             n(UiNode::Rule, vec![], vec![]),
             n(UiNode::Rule, vec![s("sep")], vec![text("ignored")]),
@@ -901,43 +935,47 @@ mod tests {
         }
     }
 
+    fn number_vector_values() -> Vec<f64> {
+        vec![
+            0.1 + 0.2,
+            1e21,
+            1e-7,
+            123456789012345680000.0,
+            -0.0,
+            0.0,
+            5e-324,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1.5e300,
+            0.000001,
+            0.0000012,
+            1.2e-7,
+            1.0,
+            -1.5,
+            100.0,
+            123.456,
+            1e20,
+            1.5e21,
+            -1e-7,
+            f64::MAX,
+            f64::MIN_POSITIVE,
+            0.1f32 as f64,
+            1010.0 + 14362.0 / 32768.0,
+            -87.76602172851562,
+            9007199254740993.0,
+            4.35,
+            1e100,
+            123456789.125,
+            0.5,
+        ]
+    }
+
     #[test]
     fn number_vectors_file() {
         let path = vector_path("numbers.json");
         if bless() {
-            let values: Vec<f64> = vec![
-                0.1 + 0.2,
-                1e21,
-                1e-7,
-                123456789012345680000.0,
-                -0.0,
-                0.0,
-                5e-324,
-                f64::NAN,
-                f64::INFINITY,
-                f64::NEG_INFINITY,
-                1.5e300,
-                0.000001,
-                0.0000012,
-                1.2e-7,
-                1.0,
-                -1.5,
-                100.0,
-                123.456,
-                1e20,
-                1.5e21,
-                -1e-7,
-                f64::MAX,
-                f64::MIN_POSITIVE,
-                0.1f32 as f64,
-                1010.0 + 14362.0 / 32768.0,
-                -87.76602172851562,
-                9007199254740993.0,
-                4.35,
-                1e100,
-                123456789.125,
-                0.5,
-            ];
+            let values = number_vector_values();
             let entries: Vec<String> = values
                 .iter()
                 .map(|v| {
@@ -952,6 +990,21 @@ mod tests {
         }
         let file = parse_json(&std::fs::read_to_string(&path).expect("vectors file"));
         assert!(file.array().len() >= 20);
+        let expected: Vec<(String, String)> = number_vector_values()
+            .iter()
+            .map(|v| (format!("{:016x}", v.to_bits()), js_number_to_string(*v)))
+            .collect();
+        let actual: Vec<(String, String)> = file
+            .array()
+            .iter()
+            .map(|c| {
+                (
+                    c.get("bits").str().to_string(),
+                    c.get("text").str().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected, "stale file: BIND_BLESS=1");
         for case in file.array() {
             let bits = u64::from_str_radix(case.get("bits").str(), 16).expect("hex bits");
             assert_eq!(

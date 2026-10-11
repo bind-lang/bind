@@ -2,7 +2,9 @@
 //! `bindc` (`core::display`) and by the JS runtime.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use bind_runtime::{Int, Node, NodeArg, NodeTag, js_number_to_string, render_html};
+use bind_runtime::{
+    AppError, Int, Node, NodeArg, NodeTag, error_body, js_number_to_string, page_html, render_html,
+};
 use serde_json::Value;
 
 fn vectors(name: &str) -> Vec<Value> {
@@ -68,5 +70,36 @@ fn number_vectors() {
             "{}",
             case["bits"]
         );
+    }
+}
+
+#[test]
+fn page_vectors() {
+    let cases = vectors("pages.json");
+    assert!(cases.len() >= 6);
+    for case in &cases {
+        let text = |key: &str| case[key].as_str().unwrap();
+        let expected = text("html");
+        match text("kind") {
+            "page" => assert_eq!(
+                page_html(text("title"), text("stylesheet"), text("body")),
+                expected
+            ),
+            "error_body" => {
+                let message = text("message").to_string();
+                let error = match text("error") {
+                    "BadRequest" => AppError::BadRequest(message),
+                    "NotFound" => AppError::NotFound(message),
+                    "Internal" => AppError::Internal(message),
+                    "Overflow" => AppError::Overflow(message),
+                    "RecursionLimit" => AppError::RecursionLimit,
+                    other => panic!("unknown error {other}"),
+                };
+                let (status, html) = error_body(&error);
+                assert_eq!(status, case["status"].as_u64().unwrap() as u16);
+                assert_eq!(html, expected);
+            }
+            other => panic!("unknown kind {other}"),
+        }
     }
 }

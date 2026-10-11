@@ -1,0 +1,10 @@
+[
+  {"kind":"page","title":"Home","stylesheet":"/styles.css","body":"<p>hi</p>","html":"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Home</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><div class=\"bind-site\"><p>hi</p></div></body></html>"},
+  {"kind":"page","title":"A & B <i>","stylesheet":"/s.css?x=\"1\"&y='2'","body":"<main>x</main>","html":"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>A &amp; B &lt;i&gt;</title><link rel=\"stylesheet\" href=\"/s.css?x=&quot;1&quot;&amp;y=&#39;2&#39;\"></head><body><div class=\"bind-site\"><main>x</main></div></body></html>"},
+  {"kind":"page","title":"","stylesheet":"","body":"","html":"<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title></title><link rel=\"stylesheet\" href=\"\"></head><body><div class=\"bind-site\"></div></body></html>"},
+  {"kind":"error_body","error":"BadRequest","message":"bad <id> & \"x\"","status":400,"html":"<main class=\"bind-error\"><h1>Bad request</h1><p>bad &lt;id&gt; &amp; &quot;x&quot;</p></main>"},
+  {"kind":"error_body","error":"NotFound","message":"user 42 secret","status":404,"html":"<main class=\"bind-error\"><h1>Page not found</h1><p>not found</p></main>"},
+  {"kind":"error_body","error":"Internal","message":"db password","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>internal error</p></main>"},
+  {"kind":"error_body","error":"Overflow","message":"x","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>numeric overflow</p></main>"},
+  {"kind":"error_body","error":"RecursionLimit","message":"","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>recursion limit exceeded</p></main>"}
+]
