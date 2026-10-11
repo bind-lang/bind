@@ -366,6 +366,52 @@ HttpResponse {{ status: result.status, content_type: RPC_CONTENT_TYPE, body: res
     ))
 }
 
+/// The server calls of the `ssr` page: `ssr_call_<name>` for every endpoint, which the
+/// page's `server.<name>(…)` calls (`expr`). Each goes through the wire codecs of the `split`
+/// mode in memory (the runtime's `WireRequest`, `wire_decode_request`, `wire_response`): the
+/// arguments written exactly as the JS frontend's `JSON.stringify` writes them and decoded
+/// into `<Name>Input` as the RPC route does, the result serialized as the route does and read
+/// back as strictly as the JS decoders read it. So for every program and input both modes show
+/// the same page (NaN, an `Int` of more than 1000 digits, a `Long` beyond ±(2^53 − 1)).
+pub fn server_calls(
+    endpoints: &[&CoreFunction],
+    names: &BTreeMap<String, String>,
+    layout: &Layout,
+) -> String {
+    let none = BTreeMap::new();
+    let mut output = String::new();
+    for endpoint in endpoints {
+        let mut params = vec![format!("ctx: {RUNTIME}::Ctx")];
+        let mut fields = String::new();
+        let mut arguments = vec!["ctx".to_string()];
+        for (index, (_, name, ty)) in endpoint.params.iter().enumerate() {
+            params.push(format!("a{index}: {}", layout.ty(ty, &none)));
+            fields.push_str(&format!("request.field({name:?}, &a{index})?;\n"));
+            arguments.push(format!("input.{}", field_ident(name)));
+        }
+        output.push_str(&format!(
+            "/// `server.{name}(…)` in the page: the RPC of the split mode, in memory (see the runtime's
+/// wire functions), so both modes show the same page.
+async fn ssr_call_{name}({params}) -> ::std::result::Result<{result}, {RUNTIME}::AppError> {{
+#[allow(unused_mut)]
+let mut request = {RUNTIME}::WireRequest::new();
+{fields}let input: {input} = {RUNTIME}::wire_decode_request(&request.finish())?;
+let value = {module}::bind_{name}({arguments}).await?;
+{RUNTIME}::wire_response(value)
+}}
+
+",
+            name = endpoint.name,
+            params = params.join(", "),
+            result = layout.ty(&endpoint.result, &none),
+            input = names[&endpoint.name],
+            module = super::PROGRAM_MODULE,
+            arguments = arguments.join(", "),
+        ));
+    }
+    output
+}
+
 /// The page tests of the generated crate: a missing parameter is a 400 page naming it.
 pub fn page_tests(component: &CoreFunction) -> String {
     let Some((_, name, _)) = component.params.first() else {

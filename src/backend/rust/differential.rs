@@ -1999,6 +1999,7 @@ fn variant(error: &AppError) -> &'static str {
         AppError::Overflow(_) => "Overflow",
         AppError::RecursionLimit => "RecursionLimit",
         AppError::Internal(_) => "Internal",
+        AppError::RequestFailed => "RequestFailed",
     }
 }
 

@@ -35,6 +35,11 @@ pub enum AppError {
     Overflow(String),
     RecursionLimit,
     Internal(String),
+    /// A server call's response the JS frontend could not decode (a non-finite number, an
+    /// `Int` of more than `MAX_INT_DIGITS` digits, a `Long` beyond ±(2^53 − 1)): in the `ssr`
+    /// mode, the error of the same call in the `split` mode, whose screen says
+    /// `TEXT_REQUEST_FAILED` (see [`wire_response`]).
+    RequestFailed,
 }
 
 impl AppError {
@@ -47,7 +52,8 @@ impl AppError {
             | AppError::Serialization(_)
             | AppError::Overflow(_)
             | AppError::RecursionLimit
-            | AppError::Internal(_) => 500,
+            | AppError::Internal(_)
+            | AppError::RequestFailed => 500,
         }
     }
 
@@ -64,6 +70,7 @@ impl AppError {
             AppError::Overflow(_) => "numeric overflow".to_string(),
             AppError::RecursionLimit => "recursion limit exceeded".to_string(),
             AppError::Internal(_) => "internal error".to_string(),
+            AppError::RequestFailed => TEXT_REQUEST_FAILED.to_string(),
         }
     }
 }
@@ -78,6 +85,7 @@ impl fmt::Display for AppError {
             AppError::Overflow(m) => write!(f, "overflow: {m}"),
             AppError::RecursionLimit => write!(f, "recursion limit exceeded"),
             AppError::Internal(m) => write!(f, "internal error: {m}"),
+            AppError::RequestFailed => write!(f, "the response cannot be decoded by the frontend"),
         }
     }
 }
@@ -943,6 +951,551 @@ pub fn display_text<T: serde::Serialize>(value: &T) -> Result<String, AppError> 
 }
 
 // ---------------------------------------------------------------------------------------------
+// Server calls of the SSR page through the wire codecs of the split mode. In the `split` mode a
+// `server.f(…)` call is an RPC: the JS frontend encodes the arguments with `JSON.stringify`, the
+// server decodes them (`serde_json`, a 400 with serde's message when it cannot), runs `f` and
+// writes the result with `serde_json`, which the JS decoders read (a "Request failed" screen
+// when they cannot). The SSR page makes the same round trip in memory, so for every program and
+// input both modes show the same page: NaN and ±Infinity become `null` (rejected by the decoder
+// of the other side), an `Int` of more than `MAX_INT_DIGITS` digits is rejected, a `Long` beyond
+// ±(2^53 − 1) cannot be sent (the JS `encodeLong` throws: an internal error) nor received.
+// ---------------------------------------------------------------------------------------------
+
+/// Largest integer a JS number holds exactly (`Number.MAX_SAFE_INTEGER`).
+const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// Why a value cannot be written as the JS frontend would write it.
+#[derive(Debug)]
+pub struct WireError(String);
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for WireError {}
+
+impl serde::ser::Error for WireError {
+    fn custom<T: fmt::Display>(message: T) -> Self {
+        WireError(message.to_string())
+    }
+}
+
+/// A JSON string exactly as `JSON.stringify` writes it: `"` and `\` escaped, `\b`, `\f`, `\n`,
+/// `\r`, `\t`, other controls below U+0020 as `\u00xx` (lowercase), everything else as is.
+fn write_js_string(out: &mut String, text: &str) {
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str("\\u00");
+                out.push(char::from(b"0123456789abcdef"[(c as usize) >> 4]));
+                out.push(char::from(b"0123456789abcdef"[(c as usize) & 0xf]));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+}
+
+/// A serde `Serializer` writing the JSON text `JSON.stringify` gives for the JS frontend's
+/// encoding of the same value: compact, fields in declaration order, numbers as JavaScript
+/// writes them (`js_number_to_string`; NaN and ±Infinity as `null`), integers only within
+/// ±(2^53 − 1) (the JS `encodeLong` throws beyond).
+struct JsJson<'a> {
+    out: &'a mut String,
+}
+
+/// The state of a JSON array or object being written.
+struct JsCompound<'a, 'b> {
+    json: &'b mut JsJson<'a>,
+    first: bool,
+    /// Closing text: `]`, `}`, `]}` or `}}` (a variant's payload inside its `{"name": …}`).
+    close: &'static str,
+}
+
+impl JsJson<'_> {
+    fn integer(&mut self, negative: bool, magnitude: u128) -> Result<(), WireError> {
+        if magnitude > u128::from(MAX_SAFE_INTEGER) {
+            return Err(WireError(
+                "Long beyond the exact range of JSON numbers".to_string(),
+            ));
+        }
+        if negative && magnitude != 0 {
+            self.out.push('-');
+        }
+        self.out.push_str(&magnitude.to_string());
+        Ok(())
+    }
+
+    fn open_variant(&mut self, variant: &str) {
+        self.out.push('{');
+        write_js_string(self.out, variant);
+        self.out.push(':');
+    }
+}
+
+impl JsCompound<'_, '_> {
+    fn separator(&mut self) {
+        if !self.first {
+            self.json.out.push(',');
+        }
+        self.first = false;
+    }
+
+    fn key(&mut self, key: &str) {
+        self.separator();
+        write_js_string(self.json.out, key);
+        self.json.out.push(':');
+    }
+}
+
+impl<'a, 'b> serde::Serializer for &'b mut JsJson<'a> {
+    type Ok = ();
+    type Error = WireError;
+    type SerializeSeq = JsCompound<'a, 'b>;
+    type SerializeTuple = JsCompound<'a, 'b>;
+    type SerializeTupleStruct = JsCompound<'a, 'b>;
+    type SerializeTupleVariant = JsCompound<'a, 'b>;
+    type SerializeMap = JsCompound<'a, 'b>;
+    type SerializeStruct = JsCompound<'a, 'b>;
+    type SerializeStructVariant = JsCompound<'a, 'b>;
+
+    fn serialize_bool(self, value: bool) -> Result<(), WireError> {
+        self.out.push_str(if value { "true" } else { "false" });
+        Ok(())
+    }
+
+    fn serialize_i8(self, value: i8) -> Result<(), WireError> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    fn serialize_i16(self, value: i16) -> Result<(), WireError> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    fn serialize_i32(self, value: i32) -> Result<(), WireError> {
+        self.serialize_i64(i64::from(value))
+    }
+
+    fn serialize_i64(self, value: i64) -> Result<(), WireError> {
+        self.integer(value < 0, u128::from(value.unsigned_abs()))
+    }
+
+    fn serialize_i128(self, value: i128) -> Result<(), WireError> {
+        self.integer(value < 0, value.unsigned_abs())
+    }
+
+    fn serialize_u8(self, value: u8) -> Result<(), WireError> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    fn serialize_u16(self, value: u16) -> Result<(), WireError> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    fn serialize_u32(self, value: u32) -> Result<(), WireError> {
+        self.serialize_u64(u64::from(value))
+    }
+
+    fn serialize_u64(self, value: u64) -> Result<(), WireError> {
+        self.integer(false, u128::from(value))
+    }
+
+    fn serialize_u128(self, value: u128) -> Result<(), WireError> {
+        self.integer(false, value)
+    }
+
+    fn serialize_f32(self, value: f32) -> Result<(), WireError> {
+        self.serialize_f64(f64::from(value))
+    }
+
+    fn serialize_f64(self, value: f64) -> Result<(), WireError> {
+        if value.is_finite() {
+            self.out.push_str(&js_number_to_string(value));
+        } else {
+            self.out.push_str("null");
+        }
+        Ok(())
+    }
+
+    fn serialize_char(self, value: char) -> Result<(), WireError> {
+        write_js_string(self.out, value.encode_utf8(&mut [0; 4]));
+        Ok(())
+    }
+
+    fn serialize_str(self, value: &str) -> Result<(), WireError> {
+        write_js_string(self.out, value);
+        Ok(())
+    }
+
+    fn serialize_bytes(self, value: &[u8]) -> Result<(), WireError> {
+        use serde::ser::SerializeSeq;
+        let mut seq = self.serialize_seq(Some(value.len()))?;
+        for byte in value {
+            seq.serialize_element(byte)?;
+        }
+        seq.end()
+    }
+
+    fn serialize_none(self) -> Result<(), WireError> {
+        self.serialize_unit()
+    }
+
+    fn serialize_some<T: serde::Serialize + ?Sized>(self, value: &T) -> Result<(), WireError> {
+        value.serialize(self)
+    }
+
+    fn serialize_unit(self) -> Result<(), WireError> {
+        self.out.push_str("null");
+        Ok(())
+    }
+
+    fn serialize_unit_struct(self, _name: &'static str) -> Result<(), WireError> {
+        self.serialize_unit()
+    }
+
+    fn serialize_unit_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+    ) -> Result<(), WireError> {
+        self.serialize_str(variant)
+    }
+
+    fn serialize_newtype_struct<T: serde::Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<(), WireError> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_variant<T: serde::Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        value: &T,
+    ) -> Result<(), WireError> {
+        self.open_variant(variant);
+        value.serialize(&mut *self)?;
+        self.out.push('}');
+        Ok(())
+    }
+
+    fn serialize_seq(self, _len: Option<usize>) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.out.push('[');
+        Ok(JsCompound {
+            json: self,
+            first: true,
+            close: "]",
+        })
+    }
+
+    fn serialize_tuple(self, len: usize) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.serialize_seq(Some(len))
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.open_variant(variant);
+        self.out.push('[');
+        Ok(JsCompound {
+            json: self,
+            first: true,
+            close: "]}",
+        })
+    }
+
+    fn serialize_map(self, _len: Option<usize>) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.out.push('{');
+        Ok(JsCompound {
+            json: self,
+            first: true,
+            close: "}",
+        })
+    }
+
+    fn serialize_struct(
+        self,
+        _name: &'static str,
+        len: usize,
+    ) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.serialize_map(Some(len))
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _name: &'static str,
+        _index: u32,
+        variant: &'static str,
+        _len: usize,
+    ) -> Result<JsCompound<'a, 'b>, WireError> {
+        self.open_variant(variant);
+        self.out.push('{');
+        Ok(JsCompound {
+            json: self,
+            first: true,
+            close: "}}",
+        })
+    }
+}
+
+impl serde::ser::SerializeSeq for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_element<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), WireError> {
+        self.separator();
+        value.serialize(&mut *self.json)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        self.json.out.push_str(self.close);
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeTuple for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_element<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl serde::ser::SerializeTupleStruct for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl serde::ser::SerializeTupleVariant for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::serialize_element(self, value)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        serde::ser::SerializeSeq::end(self)
+    }
+}
+
+impl serde::ser::SerializeMap for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_key<T: serde::Serialize + ?Sized>(&mut self, key: &T) -> Result<(), WireError> {
+        // As serde_json (and a JS object): string keys, other scalars as their text.
+        let key = match serde_json::to_value(key) {
+            Ok(serde_json::Value::String(text)) => text,
+            Ok(serde_json::Value::Number(number)) => number.to_string(),
+            Ok(serde_json::Value::Bool(value)) => value.to_string(),
+            _ => return Err(WireError("key must be a string".to_string())),
+        };
+        self.key(&key);
+        Ok(())
+    }
+
+    fn serialize_value<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), WireError> {
+        value.serialize(&mut *self.json)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        self.json.out.push_str(self.close);
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStruct for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), WireError> {
+        self.key(key);
+        value.serialize(&mut *self.json)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        self.json.out.push_str(self.close);
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeStructVariant for JsCompound<'_, '_> {
+    type Ok = ();
+    type Error = WireError;
+
+    fn serialize_field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        key: &'static str,
+        value: &T,
+    ) -> Result<(), WireError> {
+        serde::ser::SerializeStruct::serialize_field(self, key, value)
+    }
+
+    fn end(self) -> Result<(), WireError> {
+        serde::ser::SerializeStruct::end(self)
+    }
+}
+
+/// The JSON text of a server call's arguments as the JS frontend sends it
+/// (`JSON.stringify(rt.record([[name, encoded value], …]))`): one field per parameter, in order.
+#[derive(Debug)]
+pub struct WireRequest {
+    text: String,
+}
+
+impl Default for WireRequest {
+    fn default() -> Self {
+        WireRequest::new()
+    }
+}
+
+impl WireRequest {
+    pub fn new() -> WireRequest {
+        WireRequest {
+            text: String::from("{"),
+        }
+    }
+
+    /// Adds the parameter `name` with `value`. A value the JS frontend cannot encode (a `Long`
+    /// beyond ±(2^53 − 1): its `encodeLong` throws a `TypeError`) is an internal error, whose
+    /// screen is the one the JS frontend shows for that exception.
+    pub fn field<T: serde::Serialize + ?Sized>(
+        &mut self,
+        name: &str,
+        value: &T,
+    ) -> Result<(), AppError> {
+        if self.text.len() > 1 {
+            self.text.push(',');
+        }
+        write_js_string(&mut self.text, name);
+        self.text.push(':');
+        value
+            .serialize(&mut JsJson {
+                out: &mut self.text,
+            })
+            .map_err(|error| AppError::Internal(error.to_string()))
+    }
+
+    /// The request body.
+    pub fn finish(mut self) -> String {
+        self.text.push('}');
+        self.text
+    }
+}
+
+/// The JSON text `JSON.stringify` gives for a value (`WireRequest`'s writer), or why the JS
+/// frontend could not encode it.
+pub fn js_json<T: serde::Serialize + ?Sized>(value: &T) -> Result<String, WireError> {
+    let mut out = String::new();
+    value.serialize(&mut JsJson { out: &mut out })?;
+    Ok(out)
+}
+
+/// Decodes a request body as the server's RPC route does: `BadRequest` with serde's message
+/// (status 400, the message shown) when it does not fit the endpoint's input.
+pub fn wire_decode_request<I: serde::de::DeserializeOwned>(body: &str) -> Result<I, AppError> {
+    serde_json::from_str(body).map_err(|error| AppError::BadRequest(error.to_string()))
+}
+
+/// The result of a server call as the JS frontend receives it: serialized as the RPC route
+/// does (`Serialization` when serde cannot, the route's 500), then read back as strictly as
+/// the JS decoders read it: `RequestFailed` for a non-finite number (serde writes `null`), an
+/// `Int` of more than `MAX_INT_DIGITS` digits or an integer beyond ±(2^53 − 1). The value read
+/// back is what the page then uses (a `Decimal` `-0` reads as `0`, as in JS).
+pub fn wire_response<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: T,
+) -> Result<T, AppError> {
+    let json = serde_json::to_value(&value)?;
+    drop(value);
+    if !js_decodable_numbers(&json) {
+        return Err(AppError::RequestFailed);
+    }
+    serde_json::from_value(json).map_err(|_| AppError::RequestFailed)
+}
+
+/// Whether every integer in `json` is one a JS number holds exactly (the JS `decodeLong`).
+fn js_decodable_numbers(json: &serde_json::Value) -> bool {
+    let mut pending = vec![json];
+    while let Some(value) = pending.pop() {
+        match value {
+            serde_json::Value::Number(number) => {
+                let safe = match (number.as_i64(), number.as_u64()) {
+                    (Some(value), _) => value.unsigned_abs() <= MAX_SAFE_INTEGER,
+                    (None, Some(value)) => value <= MAX_SAFE_INTEGER,
+                    (None, None) => true,
+                };
+                if !safe {
+                    return false;
+                }
+            }
+            serde_json::Value::Array(items) => pending.extend(items),
+            serde_json::Value::Object(fields) => pending.extend(fields.values()),
+            _ => {}
+        }
+    }
+    true
+}
+
+// ---------------------------------------------------------------------------------------------
 // Page parameters (SSR): the query string of `GET /`, decoded like the JS runtime's `readParams`.
 // ---------------------------------------------------------------------------------------------
 
@@ -1142,6 +1695,189 @@ mod tests {
             "<h1></h1>"
         );
         assert_eq!(render_html(&heading(None)), "<h1></h1>");
+    }
+
+    #[test]
+    fn deep_trees_render_and_drop_without_growing_the_stack() {
+        // 200,000 nested `Div`s, on a test thread's small stack.
+        let depth = 200_000;
+        let mut tree = Node::Text("x".into());
+        for _ in 0..depth {
+            tree = Node::Element {
+                tag: NodeTag::Div,
+                args: Vec::new(),
+                children: Arc::new(vec![tree]),
+            };
+        }
+        let html = render_html(&tree);
+        assert_eq!(html.len(), depth * "<div></div>".len() + 1);
+        assert!(html.starts_with("<div><div>") && html.ends_with("</div></div>"));
+        // A copy shares the children; dropping both frees the tree once, iteratively.
+        let copy = tree.clone();
+        drop(tree);
+        assert_eq!(render_html(&copy).len(), html.len());
+        drop(copy);
+    }
+
+    #[test]
+    fn requests_are_written_as_json_stringify_writes_them() {
+        #[derive(serde::Serialize)]
+        struct Record {
+            #[serde(rename = "__proto__")]
+            proto: String,
+            maybe: Option<Option<i64>>,
+            amount: rust_decimal::Decimal,
+            number: Int,
+            ratio: f32,
+            list: Vec<f64>,
+        }
+        #[derive(serde::Serialize)]
+        enum Shape {
+            #[serde(rename = "circle")]
+            Circle { radius: Int },
+            #[serde(rename = "none")]
+            Nothing,
+        }
+        let mut request = WireRequest::new();
+        request
+            .field("text", "a\"b\\c\n\u{8}\u{c}\u{1}\u{1f}é😀</script>")
+            .unwrap();
+        request.field("x", &f64::NAN).unwrap();
+        request
+            .field("y", &[1e21, 1e-7, -0.0, 0.1, 100.0, f64::INFINITY, 123.456])
+            .unwrap();
+        request
+            .field(
+                "r",
+                &Record {
+                    proto: "p".into(),
+                    maybe: Some(None),
+                    amount: rust_decimal::Decimal::new(-150, 2),
+                    number: int("-12345678901234567890"),
+                    ratio: 0.1,
+                    list: vec![],
+                },
+            )
+            .unwrap();
+        request
+            .field("s", &[Shape::Circle { radius: int("2") }, Shape::Nothing])
+            .unwrap();
+        request
+            .field("ok", &BindResult::<i64, String>::Ok(9_007_199_254_740_991))
+            .unwrap();
+        request.field("unit", &()).unwrap();
+        assert_eq!(
+            request.finish(),
+            concat!(
+                r#"{"text":"a\"b\\c\n\b\f\u0001\u001fé😀</script>","x":null,"#,
+                r#""y":[1e+21,1e-7,0,0.1,100,null,123.456],"#,
+                r#""r":{"__proto__":"p","maybe":null,"amount":"-1.50","number":"-12345678901234567890","ratio":0.10000000149011612,"list":[]},"#,
+                r#""s":[{"circle":{"radius":"2"}},"none"],"ok":{"Ok":9007199254740991},"unit":null}"#
+            )
+        );
+        // A `Long` the JS frontend cannot encode: its `encodeLong` throws (an internal error).
+        let mut request = WireRequest::new();
+        assert!(matches!(
+            request.field("n", &9_007_199_254_740_992_i64),
+            Err(AppError::Internal(_))
+        ));
+        assert!(matches!(
+            WireRequest::new().field("n", &i64::MIN),
+            Err(AppError::Internal(_))
+        ));
+        assert_eq!(
+            js_json(&-9_007_199_254_740_991_i64).unwrap(),
+            "-9007199254740991"
+        );
+        assert_eq!(WireRequest::new().finish(), "{}");
+    }
+
+    #[test]
+    fn requests_are_decoded_as_the_rpc_route_decodes_them() {
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Input {
+            x: f64,
+            n: Int,
+        }
+        let mut request = WireRequest::new();
+        request.field("x", &f64::NAN).unwrap();
+        request.field("n", &int("1")).unwrap();
+        match wire_decode_request::<Input>(&request.finish()) {
+            Err(AppError::BadRequest(message)) => {
+                assert_eq!(
+                    message,
+                    "invalid type: null, expected f64 at line 1 column 9"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        let digits = format!("1{}", "0".repeat(MAX_INT_DIGITS));
+        let mut request = WireRequest::new();
+        request.field("x", &1.5).unwrap();
+        request.field("n", &int(&digits[..MAX_INT_DIGITS])).unwrap();
+        assert!(wire_decode_request::<Input>(&request.finish()).is_ok());
+        let body = format!("{{\"x\":1.5,\"n\":\"{digits}\"}}");
+        assert!(matches!(
+            wire_decode_request::<Input>(&body),
+            Err(AppError::BadRequest(message)) if message.starts_with("invalid Int")
+        ));
+    }
+
+    #[test]
+    fn responses_are_read_back_as_the_js_decoders_read_them() {
+        assert!(matches!(
+            wire_response(f64::NAN),
+            Err(AppError::RequestFailed)
+        ));
+        assert!(matches!(
+            wire_response(f64::NEG_INFINITY),
+            Err(AppError::RequestFailed)
+        ));
+        assert!(matches!(
+            wire_response(vec![1.0_f32, f32::INFINITY]),
+            Err(AppError::RequestFailed)
+        ));
+        assert_eq!(wire_response(0.1_f32).unwrap(), 0.1_f32);
+        assert_eq!(
+            wire_response(-0.0_f64).unwrap().to_bits(),
+            (-0.0_f64).to_bits()
+        );
+        let big = Int(num_bigint::BigInt::from(10).pow(MAX_INT_DIGITS as u32));
+        assert!(matches!(wire_response(big), Err(AppError::RequestFailed)));
+        let fits = Int(num_bigint::BigInt::from(10).pow(MAX_INT_DIGITS as u32 - 1));
+        assert_eq!(wire_response(fits.clone()).unwrap(), fits);
+        assert!(matches!(
+            wire_response(9_007_199_254_740_992_i64),
+            Err(AppError::RequestFailed)
+        ));
+        assert!(matches!(
+            wire_response(Some(-9_007_199_254_740_992_i64)),
+            Err(AppError::RequestFailed)
+        ));
+        assert_eq!(
+            wire_response(-9_007_199_254_740_991_i64).unwrap(),
+            -9_007_199_254_740_991
+        );
+        assert_eq!(wire_response(Some(None::<i64>)).unwrap(), None);
+        let zero = wire_response(-rust_decimal::Decimal::new(0, 2)).unwrap();
+        assert_eq!(
+            display_decimal(&zero),
+            "0.00",
+            "a negative zero reads back as zero"
+        );
+        let error = AppError::RequestFailed;
+        assert_eq!(
+            (error.status(), error.public_message().as_str()),
+            (500, TEXT_REQUEST_FAILED)
+        );
+        let (status, body) = error_body(&error);
+        assert_eq!(status, 500);
+        assert_eq!(
+            body,
+            "<main class=\"bind-error\"><h1>Something went wrong</h1><p>Request failed</p></main>"
+        );
     }
 
     #[test]

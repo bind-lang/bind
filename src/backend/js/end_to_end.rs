@@ -23,7 +23,13 @@
 //!   response must allow the page's origin. Happy path, 404 and invalid parameter render exactly
 //!   the SSR's HTML; Review Focus 2: a test double answering `500` with the body `oops`, a page on
 //!   the refused origin and the server shut down all show the "Request failed" screen, with no
-//!   unhandled exception (node exits non-zero on one).
+//!   unhandled exception (node exits non-zero on one);
+//! - the wire boundary (`WIRE_PAGE`, both modes of a fourth project): a NaN argument, a NaN
+//!   result, a 1001-digit `Int` argument and a 1001-digit `Int` result give the same page in
+//!   the `ssr` mode (server calls through the wire codecs in memory) as in the `split` mode
+//!   (real RPCs from node): "Bad request" with serde's message for the arguments, "Request
+//!   failed" for the results. (A `Long` cannot cross the wire in rust-web-v3, E8309: the
+//!   runtime's unit tests cover its ±(2^53 − 1) rule.)
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,6 +64,26 @@ const FAILING_PAGE: &str = r#"client component Falha(id: CustomerId, outro: Cust
     UI {
         Text(novo.name)
         Text(falta.name)
+    }
+}
+"#;
+
+/// Server calls at the wire's limits, selected by the page parameter `k` (replaces the
+/// commerce page in the wire variant).
+const WIRE_PAGE: &str = r#"server fun eco(x: Double): Double = x
+server fun naoNumero(): Double = 0.0 / 0.0
+server fun ecoInt(n: Int): Int = n
+server fun grande(): Int = 10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+
+client component Fio(k: Int) {
+    UI {
+        when (k) {
+            1 -> Text(server.eco(0.0 / 0.0))
+            2 -> Text(server.naoNumero())
+            3 -> Text(server.ecoInt(10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000))
+            4 -> Text(server.grande())
+            _ -> Text(server.eco(1.5))
+        }
     }
 }
 "#;
@@ -177,6 +203,10 @@ fn ssr_and_split_against_postgres() {
     );
     let failing = Project::new("failing", &failing_source);
     let fail = failing.generate("ssr");
+    let wire_source = format!("{}{WIRE_PAGE}", source.split(CUSTOMER_PAGE).next().unwrap());
+    let wire = Project::new("wire", &wire_source);
+    let wire_ssr = wire.generate("ssr");
+    let wire_split = wire.generate("split");
 
     let harness =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bind-codegen-tests/bind-e2e");
@@ -188,7 +218,7 @@ fn ssr_and_split_against_postgres() {
     fs::write(
         harness.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-fail = {{ path = \"fail\" }}\n",
+            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-fail = {{ path = \"fail\" }}\nbind-e2e-wire-ssr = {{ path = \"wire-ssr\" }}\nbind-e2e-wire-split = {{ path = \"wire-split\" }}\n",
             crate::certified::server_dependencies()
         ),
     )
@@ -203,11 +233,21 @@ fn ssr_and_split_against_postgres() {
     member(&harness, "ssr", "bind-e2e-ssr", &ssr);
     member(&harness, "split", "bind-e2e-split", &split);
     member(&harness, "fail", "bind-e2e-fail", &fail);
+    member(&harness, "wire-ssr", "bind-e2e-wire-ssr", &wire_ssr);
+    member(&harness, "wire-split", "bind-e2e-wire-split", &wire_split);
     // The split page as generated: index.html, app.js (API_URL = "http://api.test/api") and the
     // runtime.
     fs::create_dir_all(harness.join("web")).unwrap();
     for file in ["index.html", "app.js", "bind-runtime.js"] {
         fs::copy(split.join("web").join(file), harness.join("web").join(file)).unwrap();
+    }
+    fs::create_dir_all(harness.join("web-wire")).unwrap();
+    for file in ["index.html", "app.js", "bind-runtime.js"] {
+        fs::copy(
+            wire_split.join("web").join(file),
+            harness.join("web-wire").join(file),
+        )
+        .unwrap();
     }
     let index = fs::read_to_string(harness.join("web/index.html")).unwrap();
     assert!(index.contains("from \"/app.js\"; page.boot("), "{index}");
@@ -248,15 +288,15 @@ fn ssr_and_split_against_postgres() {
     assert!(output.contains("end-to-end: ok"), "{output}");
 }
 
-/// Boots the generated split page (`web/app.js`) in node: `node page.mjs <server> <origin>
-/// <search>` prints `{"html": <the page's div.bind-site>, "requests": [...]}`. `fetch` behaves as
+/// Boots the generated split page (`web/app.js`, or the module given as a fourth argument) in
+/// node: `node page.mjs <server> <origin> <search> [app]` prints `{"html": <the page's div.bind-site>, "requests": [...]}`. `fetch` behaves as
 /// in a browser showing the page on `<origin>`: calls to `http://api.test` go to `<server>`, each
 /// after its CORS preflight, and a response that does not allow `<origin>` is a network error
 /// (`TypeError`). An unhandled exception or rejection exits non-zero.
 const PAGE_SCRIPT: &str = r#"import { createDocument, serialize } from "./dom.mjs";
-import { "bind:page" as page } from "./web/app.js";
 
-const [server, pageOrigin, search] = process.argv.slice(2);
+const [server, pageOrigin, search, app = "./web/app.js"] = process.argv.slice(2);
+const { "bind:page": page } = await import(app);
 const API_ORIGIN = "http://api.test";
 process.on("unhandledRejection", (error) => {
   console.error("unhandled rejection:", error);
@@ -483,17 +523,22 @@ macro_rules! page_handler {
 }
 
 /// The `split` routing of the generated Lambda with `frontend_origin`: `cors`, then `serve_rpc`.
-fn split_handler(handle: tokio::runtime::Handle, pool: sqlx::PgPool) -> Handler {
-    Arc::new(move |request: Request| {
-        let cors = bind_e2e_split::cors(&request.method, request.origin.as_deref());
-        let headers: Vec<(String, String)> =
-            cors.headers.iter().map(|(name, value)| (name.to_string(), value.clone())).collect();
-        if let Some(result) = cors.response {
-            return Response { status: result.status, content_type: RPC_CONTENT_TYPE.to_string(), headers, body: result.body };
-        }
-        let result = handle.block_on(bind_e2e_split::serve_rpc(request.path, request.body, pool.clone()));
-        Response { status: result.status, content_type: RPC_CONTENT_TYPE.to_string(), headers, body: result.body }
-    })
+macro_rules! split_handler {
+    ($krate:ident, $handle:expr, $pool:expr) => {{
+        let handle = $handle.clone();
+        let pool = $pool.clone();
+        let handler: Handler = Arc::new(move |request: Request| {
+            let cors = $krate::cors(&request.method, request.origin.as_deref());
+            let headers: Vec<(String, String)> =
+                cors.headers.iter().map(|(name, value)| (name.to_string(), value.clone())).collect();
+            if let Some(result) = cors.response {
+                return Response { status: result.status, content_type: RPC_CONTENT_TYPE.to_string(), headers, body: result.body };
+            }
+            let result = handle.block_on($krate::serve_rpc(request.path, request.body, pool.clone()));
+            Response { status: result.status, content_type: RPC_CONTENT_TYPE.to_string(), headers, body: result.body }
+        });
+        handler
+    }};
 }
 
 /// Test double of a failing API: CORS allows `http://a.test` (so the browser exposes the
@@ -568,8 +613,13 @@ fn site(page: &str) -> String {
 /// The generated split page booted in node on `origin`, its API at `server`: the content of
 /// its `div.bind-site` and the requests it made.
 fn split_page(server: &str, origin: &str, search: &str) -> (String, Vec<String>) {
+    split_page_of("./web/app.js", server, origin, search)
+}
+
+/// `split_page` of the split page whose module is `app`.
+fn split_page_of(app: &str, server: &str, origin: &str, search: &str) -> (String, Vec<String>) {
     let output = Command::new("node")
-        .args(["page.mjs", server, origin, search])
+        .args(["page.mjs", server, origin, search, app])
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output()
         .unwrap();
@@ -667,7 +717,7 @@ fn scenarios(runtime: &tokio::runtime::Runtime, url: &str, schema: &str) {
     println!("ssr: write then fail -> 404 and 0 rows; without the failure the row is committed");
 
     // CORS of the split server (frontend_origin = "http://a.test").
-    let mut split = Server::start(split_handler(handle.clone(), pool.clone()));
+    let mut split = Server::start(split_handler!(bind_e2e_split, handle, pool));
     let body = format!(r#"{{"id":"{ana}"}}"#);
     let preflight = |origin: &str| {
         http(
@@ -724,6 +774,34 @@ fn scenarios(runtime: &tokio::runtime::Runtime, url: &str, schema: &str) {
     let (html, requests) = split_page(&server, "http://a.test", &format!("?id={ana}"));
     assert_eq!((html.as_str(), requests), (REQUEST_FAILED, preflight_only));
     println!("split: 500 `oops`, refused origin and server down -> \"Request failed\"");
+
+    // The wire boundary: the same page in both modes.
+    let wire_ssr = Server::start(page_handler!(bind_e2e_wire_ssr, handle, pool));
+    let wire_split = Server::start(split_handler!(bind_e2e_wire_split, handle, pool));
+    let bad_request_prefix = "<main class=\"bind-error\"><h1>Bad request</h1><p>";
+    for (k, status, expected) in [
+        ("0", 200, "1.5".to_string()),
+        (
+            "1",
+            400,
+            format!("{bad_request_prefix}invalid type: null, expected f64 at line 1 column 9</p></main>"),
+        ),
+        ("2", 500, REQUEST_FAILED.to_string()),
+        ("3", 400, String::new()),
+        ("4", 500, REQUEST_FAILED.to_string()),
+    ] {
+        let page = http(&wire_ssr, "GET", &format!("/?k={k}"), &[], "");
+        assert_eq!(page.status, status, "k={k}: {}", page.body);
+        let from_ssr = site(&page.body);
+        let (from_split, _) = split_page_of("./web-wire/app.js", &wire_split.origin(), "http://a.test", &format!("?k={k}"));
+        assert_eq!(from_ssr, from_split, "k={k}: ssr and split differ");
+        if expected.is_empty() {
+            assert!(from_ssr.starts_with(&format!("{bad_request_prefix}invalid Int")), "k={k}: {from_ssr}");
+        } else {
+            assert_eq!(from_ssr, expected, "k={k}");
+        }
+    }
+    println!("wire: NaN and 1001-digit Int, as arguments and as results, give the same page in ssr and split");
 
     runtime.block_on(pool.close());
 }

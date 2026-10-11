@@ -48,7 +48,7 @@ pub mod app {
     pub fn bind_CustomerPage(ctx: crate::bind_runtime::Ctx, v0_id: CustomerId) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Node> {
         ::std::boxed::Box::pin(async move {
             let ctx = ctx.enter()?;
-            let v1_customer: Customer = bind_getCustomer(ctx.server_call(), v0_id.clone()).await?;
+            let v1_customer: Customer = super::ssr_call_getCustomer(ctx.server_call(), v0_id.clone()).await?;
             ::std::result::Result::Ok(crate::bind_runtime::Node::Element {
                 tag: crate::bind_runtime::NodeTag::Ui,
                 args: ::std::vec![],
@@ -299,6 +299,17 @@ pub async fn serve(
         let result = serve_rpc(path, body, pool).await;
         HttpResponse { status: result.status, content_type: RPC_CONTENT_TYPE, body: result.body }
     }
+}
+
+/// `server.getCustomer(…)` in the page: the RPC of the split mode, in memory (see the runtime's
+/// wire functions), so both modes show the same page.
+async fn ssr_call_getCustomer(ctx: crate::bind_runtime::Ctx, a0: crate::app::CustomerId) -> ::std::result::Result<crate::app::Customer, crate::bind_runtime::AppError> {
+    #[allow(unused_mut)]
+    let mut request = crate::bind_runtime::WireRequest::new();
+    request.field("id", &a0)?;
+    let input: GetCustomerInput = crate::bind_runtime::wire_decode_request(&request.finish())?;
+    let value = app::bind_getCustomer(ctx, input.id).await?;
+    crate::bind_runtime::wire_response(value)
 }
 
 #[cfg(test)]

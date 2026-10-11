@@ -197,6 +197,16 @@ pub fn library_with(
             program,
             &outside,
         )?);
+        let mut called = std::collections::BTreeSet::new();
+        for function in client {
+            server_calls_in(&function.body, &mut called);
+        }
+        let called: Vec<&CoreFunction> = endpoints
+            .iter()
+            .copied()
+            .filter(|endpoint| called.contains(endpoint.name.as_str()))
+            .collect();
+        output.push_str(&endpoints::server_calls(&called, &names, &outside));
         page_tests = endpoints::page_tests(component);
     }
     output.push_str(&endpoints::tests(&endpoints, &names, &page_tests));
@@ -248,6 +258,16 @@ fn page_plan<'p>(
 }
 
 /// Whether `expr` or one of its subexpressions satisfies `test`.
+/// The functions `expr` calls with `server.` (into `names`).
+fn server_calls_in<'e>(expr: &'e Expr, names: &mut std::collections::BTreeSet<&'e str>) {
+    if let ExprKind::ServerCall { function, .. } = &expr.kind {
+        names.insert(function);
+    }
+    for child in children(expr) {
+        server_calls_in(child, names);
+    }
+}
+
 fn contains(expr: &Expr, test: &dyn Fn(&Expr) -> bool) -> bool {
     test(expr)
         || children(expr)

@@ -547,11 +547,15 @@ impl Generator<'_, '_> {
                 atom("::std::compile_error!(\"bindc: environment values are not server code\")")
             }
             // Only in the component's code (SSR; `server_problems` rejects them in endpoint
-            // code, E8310): a direct call, as the separate RPC of the JS frontend (depth 0).
+            // code, E8310): the crate's `ssr_call_<name>`, the separate RPC of the JS frontend
+            // (depth 0) through the same wire codecs, in memory (`endpoints::server_calls`).
             ExprKind::ServerCall { function, args } => {
                 let mut values = vec!["ctx.server_call()".to_string()];
                 values.extend(self.owned_args(args));
-                atom(format!("bind_{function}({}).await?", values.join(", ")))
+                atom(format!(
+                    "super::ssr_call_{function}({}).await?",
+                    values.join(", ")
+                ))
             }
             ExprKind::Ui {
                 node,
