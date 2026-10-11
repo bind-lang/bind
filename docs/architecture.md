@@ -13,13 +13,16 @@ whole-application verification
     └── RPC graph and target capabilities
     ↓
 VerifiedApplication
+    │   (types::check → core::lower → core::validate: CoreProgram, IR tipada)
     ├── Rust core ──→ AWS Lambda adapter
     │            └─→ Vercel Rust adapters
-    ├── bind-json-v1 schema and vectors
+    ├── bind-json-v2 schema and vectors
     └── Elm client and codecs
 ```
 
-Generation receives `VerifiedApplication`, not raw source. If verification emits an error, no target generator is called.
+Generation receives `VerifiedApplication`, not raw source; o backend Rust lê somente a `CoreProgram` (IR tipada produzida por `types::check → core::lower → core::validate`), nunca tokens. Uma IR inconsistente é o erro interno E9001. If verification emits an error, no target generator is called.
+
+O runtime (`runtime/bind-runtime`) é copiado para o crate gerado como `src/bind_runtime.rs` e fornece `Int`, `Ctx`, `AppError`, transação por chamada e limite de profundidade. O avaliador de referência em `src/core/eval.rs` serve ao teste diferencial contra o Rust gerado.
 
 The compiler-owned Rust library is the semantic center of both deployment targets. It defines domain representations, strict request structures, SQL generated from database IR, row decoding, status mapping, and JSON responses. AWS and Vercel adapters are thin transport layers.
 

@@ -2,6 +2,8 @@
 
 Profile identifier: `rust-elm-web-v1`.
 
+> Nota: este perfil foi substituído pelo [v0.2](certified-profile-v0.2.md) (`rust-elm-web-v2`, contrato `bind-json-v2`, servidor gerado da IR tipada). Mantido como referência histórica.
+
 This document defines the finite surface for which `bind certify` may issue an attestation. It is intentionally smaller than the long-term RFC. Unsupported semantics are compilation errors; the compiler never substitutes weaker behavior.
 
 ## Execution model

@@ -6,14 +6,16 @@ Bind is a new whole-application language and compiler, not a wrapper around a ha
 
 Repository: <https://github.com/bind-lang/bind>
 
-## Certified v0.1 profile
+## Certified profiles
 
-The first deliberately narrow profile is:
+The current profile is `rust-elm-web-v2` ([certified profile v0.2](docs/certified-profile-v0.2.md)): the type checker lowers the program to a typed core IR, and the Rust server is generated from that IR alone. Endpoints accept the whole language (not one database operation), every RPC runs in one transaction, `Int` has arbitrary precision (JSON strings, `bind-json-v2`), and overflow or deep recursion become typed errors instead of panics. The v0.1 profile (`rust-elm-web-v1`) is kept in [docs](docs/certified-profile-v0.1.md).
+
+The overall shape (shared by both profiles) is:
 
 ```text
 Bind source (.bind or .bd)
         │
-        ├── Rust server + PostgreSQL + bind-json-v1 RPC
+        ├── Rust server + PostgreSQL + bind-json-v2 RPC
         │       ├── AWS Lambda / provided.al2023
         │       └── Vercel Rust Functions
         │
@@ -104,7 +106,7 @@ vercel deploy
 
 Neither command is run automatically because both require the user's cloud account and may create remote resources.
 
-## What v0.1 proves
+## What the certified profile proves
 
 - Hindley-Milner type inference in the OCaml model, with algebraic data types, exhaustive `when`, no exceptions and no mutation (see [type system](docs/type-system.md));
 - nominal and nullable types across Bind, Rust, JSON, Elm, and PostgreSQL;
@@ -113,10 +115,10 @@ Neither command is run automatically because both require the user's cloud accou
 - effects (`db.read`, `db.write`, `server.call`) and deployment domains in the type system, with exact `effects [...]` contracts (see [type system](docs/type-system.md));
 - typed environment declarations and secret-to-client rejection;
 - database table, field, type, nullability, and required-insert checks against a deterministic schema snapshot;
-- compiler-owned RPC paths, strict request decoding, response codecs, and generated malformed-contract tests;
+- compiler-owned RPC paths (`bind-json-v2`), strict request decoding, response codecs, and generated malformed-contract tests;
 - target capability negotiation before generation;
 - deterministic SHA-256 source, schema, lockfile, and artifact attestations.
 
 No compiler can prove database availability, future uniqueness conflicts, network availability, or a cloud provider's uptime. `certified-host` in the manifest means the generated project passed the local certified toolchain; the cloud-native builders still produce the final Linux deployment artifact.
 
-The exact supported subset and rejection policy are specified in the [certified profile](docs/certified-profile-v0.1.md). The implementation architecture is described in [architecture](docs/architecture.md).
+The exact supported subset and rejection policy are specified in the [certified profile v0.2](docs/certified-profile-v0.2.md) (previous: [v0.1](docs/certified-profile-v0.1.md)). The implementation architecture is described in [architecture](docs/architecture.md).
