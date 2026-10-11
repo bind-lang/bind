@@ -15,7 +15,7 @@ pub mod expr;
 pub mod types;
 
 #[cfg(test)]
-mod differential;
+pub(crate) mod differential;
 #[cfg(test)]
 mod transactions;
 

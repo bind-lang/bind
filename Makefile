@@ -10,7 +10,8 @@ test:
 	cargo test
 	cargo test --manifest-path runtime/bind-runtime/Cargo.toml
 
-# Builds and runs generated Rust crates (snapshots, servers, the differential test). Tests that
+# Builds and runs generated Rust crates and JS modules (snapshots, servers, the server
+# differential test and the three-way evaluator x Rust x JS one, which needs node). Tests that
 # need PostgreSQL run against BIND_TEST_DATABASE_URL and skip without it.
 test-generated:
 	cargo test -- --ignored

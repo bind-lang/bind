@@ -8,6 +8,11 @@
 //! `main` runs each `bind_p<i>(Ctx::pure())` on a tokio runtime with 64 MiB worker stacks and
 //! prints `p<i>=<render>` in the canonical form of `Value::render`. The crate must pass
 //! `cargo clippy -- -D warnings`, and the two outputs must agree line by line.
+//!
+//! The generator also has a web mode (`Gen::web`, its own seed and prelude additions) for the
+//! three-way test in `backend::js::differential`: `Double`, `Float`, `Forma` and `Ui` results.
+//! Every draw it adds happens only in that mode, so the server's programs are unchanged
+//! (`server_programs_are_unchanged_by_the_web_generator`).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,7 +25,7 @@ use crate::diagnostic::Diagnostic;
 use crate::schema::DatabaseSchema;
 
 /// Number of random programs.
-const PROGRAMS: usize = 1000;
+pub(crate) const PROGRAMS: usize = 1000;
 /// Seed of the generator.
 const SEED: u64 = 0x00B1_4D00_D1FF_2026;
 /// Expression depth budget of a program body.
@@ -85,17 +90,21 @@ impl Rng {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ty {
+pub(crate) enum Ty {
     Int,
     Bool,
     Str,
     List,
     OptInt,
     Forma,
+    // Only in the three-way test's programs (`Gen::web`).
+    Double,
+    Float,
+    Ui,
 }
 
 impl Ty {
-    fn bind(self) -> &'static str {
+    pub(crate) fn bind(self) -> &'static str {
         match self {
             Ty::Int => "Int",
             Ty::Bool => "Boolean",
@@ -103,12 +112,40 @@ impl Ty {
             Ty::List => "List<Int>",
             Ty::OptInt => "Int?",
             Ty::Forma => "Forma",
+            Ty::Double => "Double",
+            Ty::Float => "Float",
+            Ty::Ui => "Ui",
         }
     }
 }
 
 const RESULT_TYPES: [Ty; 5] = [Ty::Int, Ty::Bool, Ty::Str, Ty::List, Ty::OptInt];
 const VALUE_TYPES: [Ty; 6] = [Ty::Int, Ty::Bool, Ty::Str, Ty::List, Ty::OptInt, Ty::Forma];
+/// Result types of the three-way test's programs: the server's, the sum type, `Double`,
+/// `Float` and `Ui` (twice, so UI trees are the most frequent result).
+const WEB_RESULT_TYPES: [Ty; 10] = [
+    Ty::Int,
+    Ty::Bool,
+    Ty::Str,
+    Ty::List,
+    Ty::OptInt,
+    Ty::Forma,
+    Ty::Double,
+    Ty::Float,
+    Ty::Ui,
+    Ty::Ui,
+];
+const WEB_VALUE_TYPES: [Ty; 9] = [
+    Ty::Int,
+    Ty::Bool,
+    Ty::Str,
+    Ty::List,
+    Ty::OptInt,
+    Ty::Forma,
+    Ty::Double,
+    Ty::Float,
+    Ty::Ui,
+];
 
 /// Pieces of string literals: (Bind source, value).
 const STRING_PIECES: &[(&str, &str)] = &[
@@ -140,14 +177,135 @@ const STRING_PIECES: &[(&str, &str)] = &[
     ("}", "}"),
 ];
 
+/// String pieces of the three-way test: the server's plus HTML-significant text, so `Text`,
+/// class names and hrefs need escaping.
+const WEB_STRING_PIECES: &[(&str, &str)] = &[
+    ("a", "a"),
+    ("bind", "bind"),
+    (" ", " "),
+    ("0", "0"),
+    ("\\n", "\n"),
+    ("\\t", "\t"),
+    ("\\r", "\r"),
+    ("\\\"", "\""),
+    ("\\\\", "\\"),
+    ("\\'", "'"),
+    ("\\$", "$"),
+    ("\\u0001", "\u{1}"),
+    ("\\u001F", "\u{1f}"),
+    ("\\u007f", "\u{7f}"),
+    ("ção", "ção"),
+    ("😀", "😀"),
+    ("\\u2028", "\u{2028}"),
+    ("\\uD800", "\\uD800"),
+    ("{", "{"),
+    ("<", "<"),
+    (">", ">"),
+    ("&", "&"),
+    ("&amp;", "&amp;"),
+    ("<script>", "<script>"),
+    ("</p>", "</p>"),
+    ("&#39;", "&#39;"),
+    ("javascript:", "javascript:"),
+];
+
+/// Double literals of the three-way test (finite; results reach `Infinity` and `NaN` through
+/// arithmetic): ECMAScript's number-to-string boundaries, rounding cases and the extremes.
+const DOUBLE_LITERALS: &[&str] = &[
+    "0.0",
+    "1.0",
+    "1.5",
+    "0.1",
+    "0.2",
+    "3.0",
+    "100.0",
+    "2.5e-3",
+    "1e21",
+    "1e20",
+    "123456789012345680000.0",
+    "1e-7",
+    "1.5e-6",
+    "1e308",
+    "1.7976931348623157e308",
+    "5e-324",
+    "2.2250738585072014e-308",
+    "9007199254740993.0",
+    "0.30000000000000004",
+    "123.456",
+    "6.02214076e23",
+];
+
+/// Float literals of the three-way test (finite, within the `Float` range).
+const FLOAT_LITERALS: &[&str] = &[
+    "0.0f",
+    "1.0f",
+    "0.1f",
+    "0.3f",
+    "2.5f",
+    "100.0f",
+    "1e10f",
+    "16777217.0f",
+    "3.4e38f",
+    "1e-45f",
+    "1.17549435e-38f",
+    "123.456f",
+    "1e21f",
+];
+
+/// Container UI nodes (class and id arguments).
+const CONTAINERS: &[&str] = &[
+    "Page",
+    "Container",
+    "Div",
+    "Grid",
+    "Stack",
+    "Header",
+    "Nav",
+    "Main",
+    "Section",
+    "Article",
+    "Aside",
+    "Footer",
+    "Paragraph",
+    "Span",
+    "Strong",
+    "Emphasis",
+    "Small",
+    "List",
+    "Item",
+    "Pre",
+    "Code",
+];
+
+/// Link targets: allowed and disallowed schemes, relative URLs, browser normalization.
+const HREFS: &[&str] = &[
+    "https://x.y/?a=1&b=2",
+    "http://x",
+    "mailto:a@b.c",
+    "tel:+55",
+    "/caminho",
+    "#topo",
+    "?q=1",
+    "//host",
+    "javascript:alert(1)",
+    " JaVaScRiPt:alert(1)",
+    "java\\tscript:x",
+    "data:text/html,<b>",
+    "ftp://x",
+    "",
+];
+
 /// Variables in scope, innermost last.
 type Scope = Vec<(String, Ty)>;
 
-struct Gen {
+pub(crate) struct Gen {
     rng: Rng,
     next_name: usize,
+    /// The three-way test's generator: `Double`, `Float` and `Ui` too. Every choice it adds
+    /// is drawn only when set, so the server's programs are the same with or without it.
+    web: bool,
     /// How many times each construct was generated.
-    counts: BTreeMap<&'static str, usize>,
+    pub(crate) counts: BTreeMap<&'static str, usize>,
 }
 
 impl Gen {
@@ -155,7 +313,31 @@ impl Gen {
         Gen {
             rng: Rng(seed),
             next_name: 0,
+            web: false,
             counts: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn web(seed: u64) -> Gen {
+        Gen {
+            web: true,
+            ..Gen::new(seed)
+        }
+    }
+
+    fn result_types(&self) -> &'static [Ty] {
+        if self.web {
+            &WEB_RESULT_TYPES
+        } else {
+            &RESULT_TYPES
+        }
+    }
+
+    fn value_types(&self) -> &'static [Ty] {
+        if self.web {
+            &WEB_VALUE_TYPES
+        } else {
+            &VALUE_TYPES
         }
     }
 
@@ -169,16 +351,16 @@ impl Gen {
     }
 
     /// `fun p<i>(): T …`: an expression body or a block with `val`s and an early `return`.
-    fn program(&mut self, index: usize) -> (Ty, String) {
+    pub(crate) fn program(&mut self, index: usize) -> (Ty, String) {
         self.next_name = 0;
-        let ty = *self.rng.pick(&RESULT_TYPES);
+        let ty = *self.rng.pick(self.result_types());
         let name = format!("p{index}");
         let source = if self.rng.chance(30) {
             self.count("block body");
             let mut scope = Scope::new();
             let mut lines = Vec::new();
             for _ in 0..self.rng.range(1, 3) {
-                let local_ty = *self.rng.pick(&VALUE_TYPES);
+                let local_ty = *self.rng.pick(self.value_types());
                 let local = self.fresh();
                 let value = if self.rng.chance(25) {
                     self.count("early return");
@@ -243,6 +425,9 @@ impl Gen {
             Ty::List => self.list(d, scope),
             Ty::OptInt => self.opt_int(d, scope),
             Ty::Forma => self.forma(d, scope),
+            Ty::Double => self.double(d, scope),
+            Ty::Float => self.float(d, scope),
+            Ty::Ui => self.ui(d, scope),
         }
     }
 
@@ -276,6 +461,16 @@ impl Gen {
                     "Vazia".into()
                 } else {
                     format!("Circulo({})", self.leaf(Ty::Int))
+                }
+            }
+            Ty::Double => self.double_literal(),
+            Ty::Float => self.float_literal(),
+            Ty::Ui => {
+                self.count("UI leaf");
+                match self.rng.below(3) {
+                    0 => format!("Text({})", self.leaf(Ty::Int)),
+                    1 => format!("Text({})", self.string_literal().0),
+                    _ => format!("Rule({})", self.string_literal().0),
                 }
             }
         }
@@ -348,8 +543,13 @@ impl Gen {
         self.count("string literal");
         let mut source = String::from("\"");
         let mut value = String::new();
+        let pieces = if self.web {
+            WEB_STRING_PIECES
+        } else {
+            STRING_PIECES
+        };
         for _ in 0..self.rng.range(0, 4) {
-            let (piece, piece_value) = *self.rng.pick(STRING_PIECES);
+            let (piece, piece_value) = *self.rng.pick(pieces);
             source.push_str(piece);
             value.push_str(piece_value);
         }
@@ -361,7 +561,7 @@ impl Gen {
     fn lambda_body(&mut self, ty: Ty, depth: u32, scope: &Scope) -> String {
         if depth > 0 && self.rng.chance(20) {
             self.count("val in lambda");
-            let local_ty = *self.rng.pick(&VALUE_TYPES);
+            let local_ty = *self.rng.pick(self.value_types());
             let local = self.fresh();
             let value = self.expr(local_ty, depth - 1, scope);
             let mut inner = scope.clone();
@@ -502,6 +702,20 @@ impl Gen {
     }
 
     fn boolean(&mut self, d: u32, scope: &Scope) -> String {
+        if self.web && self.rng.chance(15) {
+            let ty = *self.rng.pick(&[Ty::Double, Ty::Float]);
+            let op = *self.rng.pick(&["<", "<=", ">", ">=", "==", "!="]);
+            self.count(if ty == Ty::Double {
+                "Double comparison"
+            } else {
+                "Float comparison"
+            });
+            return format!(
+                "({} {op} {})",
+                self.expr(ty, d, scope),
+                self.expr(ty, d, scope)
+            );
+        }
         match self.rng.below(14) {
             0 => self.leaf(Ty::Bool),
             1..=3 => {
@@ -797,6 +1011,229 @@ impl Gen {
         }
     }
 
+    fn double_literal(&mut self) -> String {
+        self.count("Double literal");
+        let literal = *self.rng.pick(DOUBLE_LITERALS);
+        if self.rng.chance(20) {
+            format!("(-{literal})")
+        } else {
+            literal.to_string()
+        }
+    }
+
+    fn float_literal(&mut self) -> String {
+        self.count("Float literal");
+        let literal = *self.rng.pick(FLOAT_LITERALS);
+        if self.rng.chance(20) {
+            format!("(-{literal})")
+        } else {
+            literal.to_string()
+        }
+    }
+
+    /// `Double`/`Float` arithmetic (`+ - * /`, negation) over finite literals: overflow gives
+    /// `Infinity`, `0.0 / 0.0` and `Infinity - Infinity` give `NaN`.
+    fn number(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        let double = ty == Ty::Double;
+        match self.rng.below(12) {
+            0..=2 => self.leaf(ty),
+            3..=6 => {
+                let op = *self.rng.pick(&["+", "-", "*", "/"]);
+                self.count(match (double, op) {
+                    (true, "+") => "Double +",
+                    (true, "-") => "Double -",
+                    (true, "*") => "Double *",
+                    (true, _) => "Double /",
+                    (false, "+") => "Float +",
+                    (false, "-") => "Float -",
+                    (false, "*") => "Float *",
+                    (false, _) => "Float /",
+                });
+                format!(
+                    "({} {op} {})",
+                    self.expr(ty, d, scope),
+                    self.expr(ty, d, scope)
+                )
+            }
+            7 => {
+                self.count(if double {
+                    "Double unary -"
+                } else {
+                    "Float unary -"
+                });
+                format!("(-{})", self.expr(ty, d, scope))
+            }
+            8 => self.if_expr(ty, d, scope),
+            9 => self.when_forma(ty, d, scope),
+            10 => self.fold(ty, d, scope),
+            _ => self.when_int(ty, d, scope),
+        }
+    }
+
+    fn double(&mut self, d: u32, scope: &Scope) -> String {
+        self.number(Ty::Double, d, scope)
+    }
+
+    fn float(&mut self, d: u32, scope: &Scope) -> String {
+        self.number(Ty::Float, d, scope)
+    }
+
+    /// A `Ui` expression: a `UI { … }` fragment, `if`/`when`/`fold` with `Ui` results, or a
+    /// call of a prelude component (`cartao`, `desenho`).
+    fn ui(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(10) {
+            0..=3 => {
+                self.count("UI fragment");
+                format!("UI {}", self.ui_block(d, scope))
+            }
+            4 => self.if_expr(Ty::Ui, d, scope),
+            5 => self.when_forma(Ty::Ui, d, scope),
+            6 => {
+                if self.rng.chance(50) {
+                    self.when_int(Ty::Ui, d, scope)
+                } else {
+                    self.when_opt_int(Ty::Ui, d, scope)
+                }
+            }
+            7 => self.fold(Ty::Ui, d, scope),
+            8 => {
+                self.count("component call");
+                format!(
+                    "cartao({}, {})",
+                    self.expr(Ty::Str, d.min(1), scope),
+                    self.expr(Ty::Int, d.min(1), scope)
+                )
+            }
+            _ => {
+                self.count("component call");
+                format!("desenho({})", self.expr(Ty::Forma, d, scope))
+            }
+        }
+    }
+
+    /// A child block: children and `val`s, one per line.
+    fn ui_block(&mut self, d: u32, scope: &Scope) -> String {
+        let mut inner = scope.clone();
+        let mut lines = Vec::new();
+        for _ in 0..self.rng.range(0, 4) {
+            if d > 0 && self.rng.chance(20) {
+                self.count("val among children");
+                let local_ty = *self.rng.pick(self.value_types());
+                let local = self.fresh();
+                let value = self.expr(local_ty, d - 1, &inner);
+                lines.push(format!("val {local}: {} = {value}", local_ty.bind()));
+                inner.push((local, local_ty));
+            } else {
+                let child = self.ui_child(d, &inner);
+                lines.push(child);
+            }
+        }
+        if lines.is_empty() {
+            return "{ }".into();
+        }
+        let body = lines.join("\n").replace('\n', "\n    ");
+        format!("{{\n    {body}\n}}")
+    }
+
+    /// Optional children of an element: none, or a child block.
+    fn ui_children(&mut self, d: u32, scope: &Scope) -> String {
+        if d > 0 && self.rng.chance(60) {
+            format!(" {}", self.ui_block(d - 1, scope))
+        } else {
+            String::new()
+        }
+    }
+
+    /// A node argument: a `String` or an `Int` expression.
+    fn ui_arg(&mut self, d: u32, scope: &Scope) -> String {
+        if self.rng.chance(75) {
+            self.expr(Ty::Str, d.min(1), scope)
+        } else {
+            self.count("Int node argument");
+            self.expr(Ty::Int, d.min(1), scope)
+        }
+    }
+
+    fn ui_child(&mut self, d: u32, scope: &Scope) -> String {
+        let small = d.min(2);
+        match self.rng.below(13) {
+            0 => {
+                self.count("Text of String");
+                format!("Text({})", self.expr(Ty::Str, small, scope))
+            }
+            1 => {
+                self.count("Text of Int");
+                format!("Text({})", self.expr(Ty::Int, small, scope))
+            }
+            2 => {
+                self.count("Text of Boolean");
+                format!("Text({})", self.expr(Ty::Bool, small, scope))
+            }
+            3 => {
+                self.count("Text of Double");
+                format!("Text({})", self.expr(Ty::Double, small, scope))
+            }
+            4 => {
+                self.count("Text of Float");
+                format!("Text({})", self.expr(Ty::Float, small, scope))
+            }
+            5 => {
+                self.count("Text of distinct");
+                format!("Text(Codigo({}))", self.expr(Ty::Int, small, scope))
+            }
+            6 | 7 => {
+                self.count("container node");
+                let name = *self.rng.pick(CONTAINERS);
+                let args: Vec<String> = (0..self.rng.range(0, 3))
+                    .map(|_| self.ui_arg(d, scope))
+                    .collect();
+                let children = self.ui_children(d, scope);
+                if args.is_empty() && !children.is_empty() && self.rng.chance(50) {
+                    format!("{name}{children}")
+                } else {
+                    format!("{name}({}){children}", args.join(", "))
+                }
+            }
+            8 => {
+                self.count("Heading");
+                let mut args = vec![self.expr(Ty::Int, d.min(1), scope)];
+                if self.rng.chance(60) {
+                    args.push(self.ui_arg(d, scope));
+                }
+                let children = self.ui_children(d, scope);
+                format!("Heading({}){children}", args.join(", "))
+            }
+            9 => {
+                self.count("Link");
+                let href = if self.rng.chance(70) {
+                    let href = *self.rng.pick(HREFS);
+                    format!("\"{href}\"")
+                } else {
+                    self.expr(Ty::Str, d.min(1), scope)
+                };
+                let mut args = vec![href];
+                for _ in 0..self.rng.range(0, 3) {
+                    if self.rng.chance(40) {
+                        args.push(self.rng.pick(&["\"_blank\"", "\"_self\""]).to_string());
+                    } else {
+                        args.push(self.ui_arg(d, scope));
+                    }
+                }
+                let children = self.ui_children(d, scope);
+                format!("Link({}){children}", args.join(", "))
+            }
+            10 => {
+                self.count("Rule");
+                if self.rng.chance(70) {
+                    format!("Rule({})", self.ui_arg(d, scope))
+                } else {
+                    "Rule()".into()
+                }
+            }
+            _ => self.expr(Ty::Ui, d, scope),
+        }
+    }
+
     fn when(&mut self, scrutinee: String, arms: Vec<(String, String)>) -> String {
         let arms: Vec<String> = arms
             .into_iter()
@@ -1030,7 +1467,7 @@ impl Gen {
 }
 
 /// (name, result type, Bind source of the function) of each program.
-type Programs = Vec<(String, Ty, String)>;
+pub(crate) type Programs = Vec<(String, Ty, String)>;
 
 /// The generated programs and how many times each construct occurs in them.
 fn programs() -> (Programs, BTreeMap<&'static str, usize>) {
@@ -1051,8 +1488,110 @@ fn programs() -> (Programs, BTreeMap<&'static str, usize>) {
     (out, generator.counts)
 }
 
+/// Seed of the three-way test's generator.
+const WEB_SEED: u64 = 0x00B1_4D00_3E4B_2026;
+
+/// The three-way test's declarations, after [`PRELUDE`]: a distinct type over `Int` and two
+/// SSR-style components built from helpers, with `val` children and `if`/`when` in the tree.
+pub(crate) const WEB_PRELUDE: &str = "
+distinct type Codigo = Int
+
+fun cartao(titulo: String, n: Int): Ui = UI {
+    Article(\"cartao\", titulo) {
+        val rotulo = \"#\" + titulo
+        Heading(n, \"titulo\") { Text(rotulo) }
+        if (n > 2) Strong { Text(n) } else Rule(\"sep\")
+        when (n) {
+            0 -> Text(\"zero\")
+            1 -> Small { Text(0.1 + 0.2) }
+            _ -> Text(Codigo(n * n))
+        }
+    }
+}
+
+fun desenho(f: Forma): Ui = UI {
+    when (f) {
+        Circulo(r) -> Span(\"circulo\") { Text(r) }
+        Retangulo(l, a) -> Div { Text(l); Text(\"x\"); Text(a) }
+        Rotulada(nome, dentro) -> Section(nome) {
+            val sub = desenho(dentro)
+            sub
+        }
+        Vazia -> Text(1e21)
+    }
+}
+";
+
+/// The three-way test's fixed programs: the recursion limit (in plain code and inside a UI
+/// tree), an SSR-style component, and non-finite `Double`/`Float` results.
+const WEB_FIXED: &[(Ty, &str)] = &[
+    (Ty::Int, "fun {name}(): Int = conta(20000, 0)"),
+    (Ty::Int, "fun {name}(): Int = conta(9998, 0)"),
+    (Ty::Int, "fun {name}(): Int = conta(9999, 0)"),
+    (Ty::Ui, "fun {name}(): Ui = UI { Text(conta(20000, 0)) }"),
+    (
+        Ty::Ui,
+        "client component {name}() {
+    UI {
+        Main(\"app\", \"raiz\") {
+            val total = conta(10, 0)
+            Header { Heading(1) { Text(\"Painel <&> 'x'\") } }
+            cartao(\"a & b\", total)
+            cartao(\"<i>\", 1)
+            cartao(\"\", 0)
+            if (total > 50) desenho(Rotulada(\"r\", Retangulo(total, -total))) else Text(total)
+            when (first(listOf(total))) {
+                null -> Rule(\"nada\")
+                n -> Paragraph { Text(Codigo(n)); Text(n > 3) }
+            }
+            Footer { Text(0.1f + 0.2f); Link(\"javascript:alert(1)\", \"c\", \"_blank\", \"rótulo\") { Text(\"x\") } }
+        }
+    }
+}",
+    ),
+    (Ty::Double, "fun {name}(): Double = 1e308 * 10.0"),
+    (Ty::Double, "fun {name}(): Double = (-1e308) * 10.0"),
+    (Ty::Double, "fun {name}(): Double = 0.0 / 0.0"),
+    (Ty::Double, "fun {name}(): Double = (1e308 * 10.0) - (1e308 * 10.0)"),
+    (Ty::Double, "fun {name}(): Double = (-0.0) * 1.0"),
+    (Ty::Float, "fun {name}(): Float = 3.4e38f * 10.0f"),
+    (Ty::Float, "fun {name}(): Float = 0.0f / 0.0f"),
+    (Ty::Float, "fun {name}(): Float = (-1.0f) / 0.0f"),
+    (Ty::Bool, "fun {name}(): Boolean = (0.0 / 0.0) == (0.0 / 0.0)"),
+    (Ty::Bool, "fun {name}(): Boolean = (0.0 / 0.0) != (0.0 / 0.0)"),
+    (Ty::Bool, "fun {name}(): Boolean = (0.0f / 0.0f) < 1.0f"),
+    (Ty::Bool, "fun {name}(): Boolean = (-0.0) == 0.0"),
+    (
+        Ty::Ui,
+        "fun {name}(): Ui = UI { Text(0.0 / 0.0); Text(1e308 * 10.0); Text(-(1e308 * 10.0)); Text(-0.0); Text(3.4e38f * 10.0f); Text(0.0f / 0.0f) }",
+    ),
+];
+
+/// The three-way test's programs (`PROGRAMS` random ones, then [`WEB_FIXED`]) and how many
+/// times each construct occurs in them.
+pub(crate) fn web_programs() -> (Programs, BTreeMap<&'static str, usize>) {
+    let mut generator = Gen::web(WEB_SEED);
+    let mut out = Vec::new();
+    for index in 0..PROGRAMS {
+        let (ty, source) = generator.program(index);
+        out.push((format!("p{index}"), ty, source));
+    }
+    for (offset, (ty, template)) in WEB_FIXED.iter().enumerate() {
+        let name = format!("p{}", PROGRAMS + offset);
+        let source = format!("{}\n", template.replace("{name}", &name));
+        out.push((name, *ty, source));
+    }
+    (out, generator.counts)
+}
+
 fn source(programs: &[(String, Ty, String)]) -> String {
+    source_with("", programs)
+}
+
+/// [`PRELUDE`], then `extra` declarations, then the programs.
+pub(crate) fn source_with(extra: &str, programs: &[(String, Ty, String)]) -> String {
     let mut source = String::from(PRELUDE);
+    source.push_str(extra);
     for (_, _, function) in programs {
         source.push('\n');
         source.push_str(function);
@@ -1062,7 +1601,7 @@ fn source(programs: &[(String, Ty, String)]) -> String {
 
 /// The full front end; the generator must only produce programs without any diagnostic and
 /// whose IR validates.
-fn compile(source: &str) -> CoreProgram {
+pub(crate) fn compile(source: &str) -> CoreProgram {
     let (tokens, mut diagnostics) = crate::lexer::lex("differential.bd", source);
     let (program, mut parse_diagnostics) = crate::parser::parse(tokens);
     diagnostics.append(&mut parse_diagnostics);
@@ -1101,7 +1640,7 @@ fn excerpt(source: &str, diagnostic: &Diagnostic) -> String {
 }
 
 /// `p<i>=<render>` for every program, by the reference evaluator.
-fn expected(program: &CoreProgram, programs: &[(String, Ty, String)]) -> Vec<String> {
+pub(crate) fn expected(program: &CoreProgram, programs: &[(String, Ty, String)]) -> Vec<String> {
     programs
         .iter()
         .map(|(name, _, function)| {
@@ -1119,6 +1658,17 @@ fn expected(program: &CoreProgram, programs: &[(String, Ty, String)]) -> Vec<Str
 
 /// `src/main.rs` of the differential crate.
 fn main_rs(programs: &[(String, Ty, String)]) -> String {
+    main_rs_with(programs, "bind_differential", "", "line")
+}
+
+/// `src/main.rs` of a differential crate named `krate`: the renderer plus `extra` items, and
+/// `encode`, the body of `fn encode(line: String) -> String` (what is printed after `p<i>=`).
+pub(crate) fn main_rs_with(
+    programs: &[(String, Ty, String)],
+    krate: &str,
+    extra: &str,
+    encode: &str,
+) -> String {
     let mut entries = String::new();
     for (name, _, _) in programs {
         let _ = writeln!(
@@ -1126,7 +1676,42 @@ fn main_rs(programs: &[(String, Ty, String)]) -> String {
             "        (\"{name}\", entry(programs::bind_{name}(Ctx::pure()))),"
         );
     }
-    MAIN_TEMPLATE.replace("{{ENTRIES}}", &entries)
+    MAIN_TEMPLATE
+        .replace("{{ENTRIES}}", &entries)
+        .replace("{{CRATE}}", krate)
+        .replace("{{EXTRA}}", extra)
+        .replace("{{ENCODE}}", encode)
+}
+
+/// Writes the crate `target/<name>` (the program source, the generated module and `main`),
+/// checks it with `clippy -D warnings` and returns the stdout of its release build's run.
+pub(crate) fn build_and_run(name: &str, source: &str, module: &str, main: &str) -> String {
+    use std::fs;
+    use std::path::PathBuf;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
+    let crate_dir = super::tests::test_crate_in(&root, name);
+    fs::write(crate_dir.join("program.bd"), source).unwrap();
+    fs::write(crate_dir.join("src/programs.rs"), module).unwrap();
+    fs::write(
+        crate_dir.join("src/lib.rs"),
+        "#![forbid(unsafe_code)]\n#![deny(\n    clippy::unwrap_used,\n    clippy::expect_used,\n    clippy::panic,\n    clippy::unreachable\n)]\n\npub mod bind_runtime;\npub mod programs;\n",
+    )
+    .unwrap();
+    fs::write(crate_dir.join("src/main.rs"), main).unwrap();
+    // Certified servers must pass `clippy -D warnings`: so must this crate of random programs.
+    super::tests::cargo(
+        &crate_dir,
+        &[
+            "clippy",
+            "--quiet",
+            "--release",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    );
+    super::tests::cargo(&crate_dir, &["run", "--quiet", "--release"])
 }
 
 /// The renderer replicates `Value::render` and `json_string` of `core::eval` exactly.
@@ -1135,8 +1720,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bind_differential::bind_runtime::{AppError, BoxFuture, Ctx, Int};
-use bind_differential::programs;
+use {{CRATE}}::bind_runtime::{AppError, BoxFuture, Ctx, Int};
+use {{CRATE}}::programs;
 
 trait Render {
     fn render(&self) -> String;
@@ -1196,7 +1781,11 @@ impl<T: Render> Render for Arc<Vec<T>> {
         format!("[{}]", items.join(", "))
     }
 }
-
+{{EXTRA}}
+/// The printed form of a rendered result.
+fn encode(line: String) -> String {
+    {{ENCODE}}
+}
 fn variant(error: &AppError) -> &'static str {
     match error {
         AppError::BadRequest(_) => "BadRequest",
@@ -1234,7 +1823,7 @@ fn main() {
                 Ok(Err(error)) => format!("!{}", variant(&error)),
                 Err(error) => format!("!Panic({error})"),
             };
-            println!("{name}={line}");
+            println!("{name}={}", encode(line));
         }
     });
 }
@@ -1278,12 +1867,97 @@ fn generator_is_deterministic_and_well_typed() {
     );
 }
 
+/// FNV-1a of `text`.
+fn fnv(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// The server's programs are exactly those of before the three-way test's additions to the
+/// generator (same seed, same draws): the hash of their source as of commit 5d426aa.
+#[test]
+fn server_programs_are_unchanged_by_the_web_generator() {
+    let (programs, _) = programs();
+    let source = source(&programs);
+    assert_eq!(source.len(), 1_110_786);
+    assert_eq!(fnv(&source), 0x9d0b_ccc1_1fa1_e1ee);
+}
+
+/// The three-way test's generator is deterministic, produces well-typed programs only and
+/// covers every construct it adds; the evaluator supports all of them.
+#[test]
+fn web_generator_is_deterministic_and_well_typed() {
+    let (first, counts) = web_programs();
+    let (second, _) = web_programs();
+    assert_eq!(
+        first.iter().map(|p| &p.2).collect::<Vec<_>>(),
+        second.iter().map(|p| &p.2).collect::<Vec<_>>()
+    );
+    assert_eq!(first.len(), PROGRAMS + WEB_FIXED.len());
+    for construct in WEB_CONSTRUCTS {
+        assert!(
+            counts.get(construct).copied().unwrap_or(0) > 0,
+            "{construct}"
+        );
+    }
+    for ty in WEB_RESULT_TYPES {
+        assert!(
+            first[..PROGRAMS].iter().filter(|p| p.1 == ty).count() >= 50,
+            "{ty:?}"
+        );
+    }
+    let program = compile(&source_with(WEB_PRELUDE, &first));
+    let lines = expected(&program, &first);
+    assert_eq!(lines[PROGRAMS], format!("p{PROGRAMS}=!RecursionLimit"));
+    assert_eq!(
+        lines[PROGRAMS + 3],
+        format!("p{}=!RecursionLimit", PROGRAMS + 3)
+    );
+}
+
+/// Constructs every three-way run must contain.
+pub(crate) const WEB_CONSTRUCTS: &[&str] = &[
+    "UI fragment",
+    "val among children",
+    "component call",
+    "container node",
+    "Heading",
+    "Link",
+    "Rule",
+    "Int node argument",
+    "Text of String",
+    "Text of Int",
+    "Text of Boolean",
+    "Text of Double",
+    "Text of Float",
+    "Text of distinct",
+    "Double +",
+    "Double -",
+    "Double *",
+    "Double /",
+    "Double unary -",
+    "Float +",
+    "Float -",
+    "Float *",
+    "Float /",
+    "Float unary -",
+    "Double comparison",
+    "Float comparison",
+    "when over sum type",
+    "when over Int",
+    "when over Int?",
+    "fold",
+    "if",
+];
+
 /// Builds the generated crate and compares its output with the evaluator, line by line.
 #[test]
 #[ignore = "builds a large Rust crate; run with `cargo test differential -- --ignored`"]
 fn differential_evaluator_vs_generated_rust() {
-    use std::fs;
-    use std::path::PathBuf;
     use std::time::Instant;
 
     let started = Instant::now();
@@ -1299,30 +1973,7 @@ fn differential_evaluator_vs_generated_rust() {
         .map(|function| function.name.clone())
         .collect();
     let module = super::render_functions(&program, &names);
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target");
-    let crate_dir = super::tests::test_crate_in(&root, "bind-differential");
-    fs::write(crate_dir.join("program.bd"), &source).unwrap();
-    fs::write(crate_dir.join("src/programs.rs"), module).unwrap();
-    fs::write(
-        crate_dir.join("src/lib.rs"),
-        "#![forbid(unsafe_code)]\n#![deny(\n    clippy::unwrap_used,\n    clippy::expect_used,\n    clippy::panic,\n    clippy::unreachable\n)]\n\npub mod bind_runtime;\npub mod programs;\n",
-    )
-    .unwrap();
-    fs::write(crate_dir.join("src/main.rs"), main_rs(&programs)).unwrap();
-    // Certified servers must pass `clippy -D warnings`: so must this crate of random programs.
-    super::tests::cargo(
-        &crate_dir,
-        &[
-            "clippy",
-            "--quiet",
-            "--release",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ],
-    );
-    let stdout = super::tests::cargo(&crate_dir, &["run", "--quiet", "--release"]);
+    let stdout = build_and_run("bind-differential", &source, &module, &main_rs(&programs));
     let actual: Vec<&str> = stdout.lines().collect();
 
     let mut divergences = Vec::new();

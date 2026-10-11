@@ -9,6 +9,8 @@
 //! Value representation and calling convention: see [`expr`] and the runtime's header.
 
 pub mod codecs;
+#[cfg(test)]
+mod differential;
 pub mod expr;
 pub mod names;
 pub mod page;
