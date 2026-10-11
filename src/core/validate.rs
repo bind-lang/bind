@@ -24,7 +24,7 @@
 //! certainly diverges (see `diverges`) is accepted wherever any type is expected; its parts are
 //! still checked (the returned value against the function's `result`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::types::env::{BUILTINS, builtin_scheme};
 use crate::types::exhaustive::{CtorSig, Signatures, check_match, render};
@@ -48,6 +48,7 @@ pub fn validate(program: &CoreProgram) -> Vec<String> {
         context: String::new(),
         generics: &[],
         result: Type::Error,
+        bound: BTreeSet::new(),
     };
     for ty in &program.types {
         validator.declared_type(ty);
@@ -344,6 +345,9 @@ struct Validator<'p> {
     context: String,
     generics: &'p [usize],
     result: Type,
+    /// The locals bound so far in the current function: each `LocalId` is bound once per
+    /// function (the backends name a local after its id).
+    bound: BTreeSet<LocalId>,
 }
 
 impl<'p> Validator<'p> {
@@ -402,8 +406,10 @@ impl<'p> Validator<'p> {
         self.generics = &function.generics;
         self.result = function.result.clone();
         let mut scope = Scope::new();
+        self.bound.clear();
         for (local, name, ty) in &function.params {
             self.closed(&format!("parameter `{name}`"), ty);
+            self.once(*local, name);
             scope.push((*local, ty.clone()));
         }
         self.closed("the result", &function.result);
@@ -414,7 +420,15 @@ impl<'p> Validator<'p> {
     fn bind(&mut self, scope: &mut Scope, bindings: &[(LocalId, String, Type)]) {
         for (local, name, ty) in bindings {
             self.closed(&format!("binding `{name}`"), ty);
+            self.once(*local, name);
             scope.push((*local, ty.clone()));
+        }
+    }
+
+    /// Records the binding of `local`; a second binding in the same function is a problem.
+    fn once(&mut self, local: LocalId, name: &str) {
+        if !self.bound.insert(local) {
+            self.problem(format!("local {local} (`{name}`) is bound twice"));
         }
     }
 

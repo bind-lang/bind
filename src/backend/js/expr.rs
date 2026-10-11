@@ -62,8 +62,19 @@ pub(super) fn function_with<'p>(
         generator.names.insert(*local, js_local(name, *local));
         params.push(js_local(name, *local));
     }
-    collect_names(&function.body, &mut generator.names);
-    let body = generator.body(&function.body);
+    let mut twice = Vec::new();
+    collect_names(&function.body, &mut generator.names, &mut twice);
+    let body = match twice.first() {
+        // An internal error, in release builds too (never a duplicate declaration).
+        Some(local) => format!(
+            "throw new Error({});",
+            js_string(&format!(
+                "bindc: internal error: local {local} is bound twice in function {}",
+                function.name
+            ))
+        ),
+        None => generator.body(&function.body),
+    };
     format!(
         "async function {}({}) {{\n{body}\n}}\n",
         js_value(&function.name),
@@ -71,20 +82,20 @@ pub(super) fn function_with<'p>(
     )
 }
 
-/// Names every local bound inside `expr` (lets, pattern variables, lambda parameters).
+/// Names every local bound inside `expr` (lets, pattern variables, lambda parameters) and
+/// returns the locals bound more than once.
 ///
 /// Every local becomes a `const` (or parameter) named after its id, so a `LocalId` bound
 /// twice in one function would be declared twice in one JS scope (a SyntaxError) or shadow
-/// itself. The IR binds each id once per function; the debug assertion makes a lowering that
-/// breaks this fail the tests (every `tests/codegen` case is translated by
-/// `backend::js::tests::every_codegen_case_translates`) instead of emitting invalid JS.
-fn collect_names(expr: &Expr, names: &mut BTreeMap<LocalId, String>) {
+/// itself. The IR binds each id once per function, which `core::validate` checks (`verify`
+/// stops with E9001 otherwise); should a faulty IR still get here, the function is emitted as
+/// one that throws instead of as invalid JS (`function_with`). Every `tests/codegen` case is
+/// translated by `backend::js::tests::every_codegen_case_translates`.
+fn collect_names(expr: &Expr, names: &mut BTreeMap<LocalId, String>, twice: &mut Vec<LocalId>) {
     let mut bind = |local: LocalId, name: &str| {
-        let previous = names.insert(local, js_local(name, local));
-        debug_assert!(
-            previous.is_none(),
-            "bindc: local {local} (`{name}`) is bound twice in one function"
-        );
+        if names.insert(local, js_local(name, local)).is_some() {
+            twice.push(local);
+        }
     };
     match &expr.kind {
         ExprKind::Lambda { params, .. } => {
@@ -103,7 +114,7 @@ fn collect_names(expr: &Expr, names: &mut BTreeMap<LocalId, String>) {
         _ => {}
     }
     for child in children(expr) {
-        collect_names(child, names);
+        collect_names(child, names, twice);
     }
 }
 
@@ -1079,8 +1090,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[should_panic(expected = "is bound twice in one function")]
-    fn a_local_bound_twice_fails_in_debug_builds() {
+    fn a_local_bound_twice_is_an_internal_error() {
         let program =
             crate::core::lower::tests::compile("fun f(x: Int): Int {\n    val y = x\n    y\n}\n");
         let mut function = program.functions.first().expect("function").clone();
@@ -1098,7 +1108,24 @@ mod tests {
                 body: Box::new(function.body.clone()),
             },
         };
-        super::function(&function, &program);
+        let text = super::function(&function, &program);
+        assert!(
+            text.contains(&format!(
+                "throw new Error(\"bindc: internal error: local {param} is bound twice in function f\");"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("const "), "{text}");
+        // `verify` never gets this far: the IR validator reports the second binding (E9001).
+        let mut faulty = program.clone();
+        faulty.functions[0] = function;
+        let problems = crate::core::validate::validate(&faulty);
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("is bound twice")),
+            "{problems:?}"
+        );
     }
 
     #[test]
