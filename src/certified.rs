@@ -625,6 +625,7 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
         output.push_str(&elm_type_declaration(declaration, app)?);
     }
     output.push_str("andMap : Decoder a -> Decoder (a -> b) -> Decoder b\nandMap valueDecoder functionDecoder =\n    D.map2 (|>) valueDecoder functionDecoder\n\n");
+    output.push_str(INT_CODEC);
     for declaration in &app.program.types {
         output.push_str(&elm_codec(declaration, app)?);
     }
@@ -724,17 +725,92 @@ fn elm_main(app: &VerifiedApplication, plan: &ComponentPlan) -> Result<String, S
             output.push_str("\n                , ");
         }
         output.push_str("p [] [ text ");
-        output.push_str(&elm_ui_text(
+        output.push_str(&parenthesize_expr(&elm_ui_text(
             expression,
             binding,
             &procedure.declared_return(),
             app,
-        )?);
+        )?));
         output.push_str(" ]");
     }
     output.push_str("\n                ]\n\nhttpError : Http.Error -> String\nhttpError error =\n    case error of\n        Http.BadUrl _ ->\n            \"Invalid server URL\"\n\n        Http.Timeout ->\n            \"The server timed out\"\n\n        Http.NetworkError ->\n            \"The server is unreachable\"\n\n        Http.BadStatus status ->\n            \"Server returned HTTP \" ++ String.fromInt status\n\n        Http.BadBody message ->\n            \"Contract decoding failed: \" ++ message\n");
     Ok(output)
 }
+
+/// `Int` travels as a JSON string (`bind-json-v2`). The decoder accepts only the canonical
+/// form `-?[0-9]+` (no leading zeros, no `-0`) whose absolute value is at most 2^53 - 1, so an
+/// `Int` the Elm runtime cannot hold exactly fails decoding instead of being rounded. It
+/// compares digit counts and, for 16 digits, the text against `9007199254740991`. The value is
+/// rebuilt from two exact halves because `String.toInt` rounds near 2^53.
+const INT_CODEC: &str = r#"intDecoder : D.Decoder Int
+intDecoder =
+    D.string
+        |> D.andThen
+            (\text_ ->
+                let
+                    negative_ =
+                        String.startsWith "-" text_
+
+                    digits_ =
+                        if negative_ then
+                            String.dropLeft 1 text_
+
+                        else
+                            text_
+
+                    length_ =
+                        String.length digits_
+
+                    canonical_ =
+                        length_
+                            > 0
+                            && String.all Char.isDigit digits_
+                            && (digits_ == "0" || not (String.startsWith "0" digits_))
+                            && not (negative_ && digits_ == "0")
+
+                    inRange_ =
+                        length_ < 16 || (length_ == 16 && digits_ <= "9007199254740991")
+                in
+                if not canonical_ then
+                    D.fail ("Expected an integer string, got \"" ++ text_ ++ "\"")
+
+                else if not inRange_ then
+                    D.fail ("Integer out of range (|n| <= 9007199254740991): " ++ text_)
+
+                else
+                    -- `String.toInt` accumulates in floating point and rounds near 2^53, so
+                    -- the digits are converted in two exact halves.
+                    case
+                        ( if length_ <= 8 then
+                            Just 0
+
+                          else
+                            String.toInt (String.dropRight 8 digits_)
+                        , String.toInt (String.right 8 digits_)
+                        )
+                    of
+                        ( Just high_, Just low_ ) ->
+                            let
+                                magnitude_ =
+                                    high_ * 100000000 + low_
+                            in
+                            D.succeed
+                                (if negative_ then
+                                    negate magnitude_
+
+                                 else
+                                    magnitude_
+                                )
+
+                        _ ->
+                            D.fail ("Expected an integer string, got \"" ++ text_ ++ "\"")
+            )
+
+encodeInt : Int -> E.Value
+encodeInt value_ =
+    E.string (String.fromInt value_)
+
+"#;
 
 fn elm_type_declaration(
     declaration: &TypeDecl,
@@ -814,7 +890,7 @@ fn elm_codec(declaration: &TypeDecl, app: &VerifiedApplication) -> Result<String
                 output.push_str(&format!(
                     "\n        |> andMap (D.field \"{}\" {})",
                     field.name,
-                    elm_decoder(&field.type_ref, app)?
+                    parenthesize_expr(&elm_decoder(&field.type_ref, app)?)
                 ));
             }
             output.push_str(&format!(
@@ -895,7 +971,8 @@ fn elm_decoder(type_ref: &TypeRef, app: &VerifiedApplication) -> Result<String, 
         "Unit" => "D.succeed ()".to_string(),
         "String" | "Decimal" | "Money" | "Email" | "Url" | "Date" | "DateTime" | "Instant"
         | "Duration" | "UUID" => "D.string".to_string(),
-        "Int" | "Long" => "D.int".to_string(),
+        "Int" => "intDecoder".to_string(),
+        "Long" => "D.int".to_string(),
         "Float" | "Double" => "D.float".to_string(),
         "Boolean" => "D.bool".to_string(),
         "List" if parsed.arguments.len() == 1 => format!(
@@ -937,7 +1014,8 @@ fn elm_encoder(
         "Unit" => Ok("E.null".to_string()),
         "String" | "Decimal" | "Money" | "Email" | "Url" | "Date" | "DateTime" | "Instant"
         | "Duration" | "UUID" => Ok(format!("E.string {value}")),
-        "Int" | "Long" => Ok(format!("E.int {value}")),
+        "Int" => Ok(format!("encodeInt {value}")),
+        "Long" => Ok(format!("E.int {value}")),
         "Float" | "Double" => Ok(format!("E.float {value}")),
         "Boolean" => Ok(format!("E.bool {value}")),
         "List" if parsed.arguments.len() == 1 => Ok(format!(
@@ -1042,6 +1120,7 @@ fn elm_text_input_type(type_ref: &TypeRef, app: &VerifiedApplication) -> bool {
             | "DateTime"
             | "Instant"
             | "Duration"
+            | "Int"
     )
 }
 
@@ -1062,6 +1141,8 @@ fn elm_encode_text_input(
     match underlying_name(&type_ref.name, app).as_str() {
         "String" | "UUID" | "Email" | "Url" | "Decimal" | "Money" | "Date" | "DateTime"
         | "Instant" | "Duration" => Ok(format!("E.string {value}")),
+        // The server validates the canonical form; the text is sent as the user typed it.
+        "Int" => Ok(format!("E.string (String.trim {value})")),
         other => Err(format!("No certified text input encoder for `{other}`")),
     }
 }
@@ -1686,6 +1767,38 @@ mod tests {
             );
         }
         assert!(generated.contains("features = [\"derive\", \"rc\"]"));
+    }
+
+    /// The Elm client of `tests/codegen/client_int.bd` (`BIND_BLESS=1` regenerates the
+    /// snapshot): `Int` travels as a string, through `intDecoder` and `encodeInt`.
+    #[test]
+    fn client_int_snapshot() {
+        let cases = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/codegen");
+        let root = std::env::temp_dir().join(format!("bindc-client-int-{}", std::process::id()));
+        fs::create_dir_all(root.join("app")).unwrap();
+        fs::copy(cases.join("client_int.bd"), root.join("app/main.bd")).unwrap();
+        fs::copy(cases.join("client_int.csv"), root.join("schema.csv")).unwrap();
+        fs::write(
+            root.join("bind.toml"),
+            "[project]\nname = \"test\"\nsource = \"app\"\n[database.main]\nschema = \"schema.csv\"\nverification = \"static\"\n[target.vercel]\nclient = \"elm\"\nserver = \"rust\"\ndeployment = \"vercel\"\ncapabilities = [\"ui.dom\", \"server.http\", \"db.read\"]\n",
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let result = crate::compiler::verify(&config, "vercel");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        let plan = component_plan(&app).unwrap();
+        let elm = elm_main(&app, &plan).unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        let path = cases.join("client_int.elm.expected");
+        if std::env::var_os("BIND_BLESS").is_some() {
+            fs::write(&path, &elm).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap_or_default(), elm);
+        assert!(elm.contains("intDecoder : D.Decoder Int"));
+        assert!(elm.contains("encodeInt : Int -> E.Value"));
+        assert!(!elm.contains("D.int") && !elm.contains("E.int"));
     }
 
     /// A generation that fails leaves the previous output untouched.

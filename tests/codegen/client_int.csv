@@ -1,0 +1,5 @@
+table,model,primary_key,column,type,nullable,required,has_default,engine
+items,Item,id,id,UUID,false,true,true,postgresql
+items,Item,id,name,String,false,true,false,postgresql
+items,Item,id,quantity,Int,false,true,false,postgresql
+items,Item,id,reserved,Int,true,false,false,postgresql

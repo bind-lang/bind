@@ -1,0 +1,22 @@
+package app.stock
+
+entity Item(
+    val id: UUID,
+    val name: String,
+    val quantity: Int,
+    val reserved: Int?
+)
+
+server fun reservar(id: UUID, quantidade: Int): Item
+    effects [db.read] {
+    return db.items.require(id)
+}
+
+client component ItemPage(id: UUID, quantidade: Int) {
+    val item = server.reservar(id, quantidade)
+
+    UI {
+        Text(item.name)
+        Text(item.quantity)
+    }
+}
