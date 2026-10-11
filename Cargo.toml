@@ -16,8 +16,10 @@ name = "bind"
 path = "src/main.rs"
 
 [dev-dependencies]
+chrono = { version = "=0.4.41", default-features = false }
 num-bigint = "=0.4.6"
 proptest = "=1.11.0"
+rust_decimal = { version = "=1.37.2", default-features = false }
 
 [profile.release]
 strip = true

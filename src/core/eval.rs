@@ -3,8 +3,11 @@
 //! remainder following the dividend, `None` for a zero divisor, capture-by-copy closures and a
 //! call-depth limit of 10,000. Task 9 compares it with the generated program.
 //!
-//! Anything the server runtime does not model in memory (database, `Double`/`Float`/`Decimal`,
-//! durations, dates, UI, environment values, server calls) is `EvalError::Unsupported`.
+//! `Double` is Rust's `f64` and `Float` Rust's `f32` (IEEE binary64/binary32, as JS numbers and
+//! `Math.fround`); a UI tree is a `Value::Ui`, rendered as the page's HTML; `Display*`
+//! primitives give the text `Text` shows (`core::display`). Anything else the generated code
+//! does not model in memory (database, `Decimal`, durations, dates, environment values, server
+//! calls) is `EvalError::Unsupported`.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -14,7 +17,9 @@ use std::sync::Arc;
 use num_bigint::BigInt;
 
 use crate::types::exhaustive::Pat;
+use crate::types::ty::Type;
 
+use super::display::{self, UiArg, UiTree};
 use super::ir::*;
 
 /// Maximum number of nested function/closure calls; call number 10,001 fails.
@@ -26,6 +31,8 @@ const STACK_SIZE: usize = 512 * 1024 * 1024;
 #[derive(Clone, Debug)]
 pub enum Value {
     Int(BigInt),
+    Double(f64),
+    Float(f32),
     Bool(bool),
     Str(String),
     Unit,
@@ -45,6 +52,12 @@ pub enum Value {
     },
     Function(String),
     Builtin(String),
+    /// A UI node; `args` are `Str` or `Int` values and `children` are `Ui` values.
+    Ui {
+        node: UiNode,
+        args: Vec<Value>,
+        children: Vec<Value>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -56,15 +69,19 @@ pub enum EvalError {
 impl Value {
     /// The canonical form compared by the differential test:
     /// - `Int`: decimal digits (`-` prefix when negative);
+    /// - `Double`: `display::js_number_to_string`; `Float`: the same on the value as `f64`;
     /// - `Str`: JSON string; escapes `"`, `\`, `\n`, `\r`, `\t`, and other control characters
     ///   below U+0020 as `\u00XX`; everything else (including non-ASCII) is written as is;
     /// - `Bool`: `true` / `false`; `None`: `null`; `Some(v)`: just `v`;
     /// - `Ctor`: `Nome` when it has no fields, otherwise `Nome(a, b)`;
     /// - `List`: `[a, b]`; `Unit`: `()`;
-    /// - `Closure`, `Function`, `Builtin`: `<fun>` (not comparable).
+    /// - `Closure`, `Function`, `Builtin`: `<fun>` (not comparable);
+    /// - `Ui`: its HTML, `display::render_html_value`.
     pub fn render(&self) -> String {
         match self {
             Value::Int(value) => value.to_string(),
+            Value::Double(value) => display::js_number_to_string(*value),
+            Value::Float(value) => display::js_number_to_string(f64::from(*value)),
             Value::Bool(value) => value.to_string(),
             Value::Str(text) => json_string(text),
             Value::Unit => "()".into(),
@@ -74,6 +91,36 @@ impl Value {
             Value::Ctor { name, fields } => format!("{name}({})", join(fields)),
             Value::List(items) => format!("[{}]", join(items)),
             Value::Closure { .. } | Value::Function(_) | Value::Builtin(_) => "<fun>".into(),
+            Value::Ui { .. } => display::render_html_value(&self.ui_tree()),
+        }
+    }
+
+    /// The tree `render_html_value` takes. Evaluation only builds well-formed nodes; anything
+    /// else is shown as its canonical form (an argument) or as nothing (a child).
+    fn ui_tree(&self) -> UiTree {
+        let Value::Ui {
+            node,
+            args,
+            children,
+        } = self
+        else {
+            return UiTree {
+                node: UiNode::Empty,
+                args: Vec::new(),
+                children: Vec::new(),
+            };
+        };
+        UiTree {
+            node: *node,
+            args: args
+                .iter()
+                .map(|arg| match arg {
+                    Value::Str(text) => UiArg::Str(text.clone()),
+                    Value::Int(value) => UiArg::Int(value.to_string()),
+                    other => UiArg::Str(other.render()),
+                })
+                .collect(),
+            children: children.iter().map(Value::ui_tree).collect(),
         }
     }
 }
@@ -206,7 +253,7 @@ impl Interp<'_> {
 
     fn eval(&mut self, expr: &Expr, env: &mut Env) -> Eval {
         match &expr.kind {
-            ExprKind::Lit(literal) => Ok(literal_value(literal)?),
+            ExprKind::Lit(literal) => Ok(literal_value(literal, &expr.ty)?),
             ExprKind::Local(id) => env
                 .get(id)
                 .cloned()
@@ -279,7 +326,34 @@ impl Interp<'_> {
             }
             ExprKind::Db { .. } => Err(unsupported("database access").into()),
             ExprKind::Return(value) => Err(Signal::Return(self.eval(value, env)?)),
-            ExprKind::Ui { .. } => Err(unsupported("UI tree").into()),
+            ExprKind::Ui {
+                node,
+                args,
+                children,
+            } => {
+                let args = self.eval_all(args, env)?;
+                if let Some(bad) = args
+                    .iter()
+                    .find(|arg| !matches!(arg, Value::Str(_) | Value::Int(_)))
+                {
+                    return Err(unsupported(&format!("UI argument {}", bad.render())).into());
+                }
+                let children = match self.eval(children, env)? {
+                    Value::List(items)
+                        if items.iter().all(|item| matches!(item, Value::Ui { .. })) =>
+                    {
+                        items
+                    }
+                    other => {
+                        return Err(unsupported(&format!("UI children {}", other.render())).into());
+                    }
+                };
+                Ok(Value::Ui {
+                    node: *node,
+                    args,
+                    children,
+                })
+            }
         }
     }
 
@@ -379,15 +453,33 @@ fn bind_params(
     Ok(ids.zip(args).collect())
 }
 
-fn literal_value(literal: &Literal) -> Result<Value, EvalError> {
+/// The value of a literal of type `ty` (an integer literal may be typed `Double` or `Float`).
+fn literal_value(literal: &Literal, ty: &Type) -> Result<Value, EvalError> {
+    let invalid = |text: &str| unsupported(&format!("invalid number literal `{text}`"));
     match literal {
+        Literal::Int(digits) | Literal::Double(digits) if scalar(ty) == Some("Double") => digits
+            .parse()
+            .map(Value::Double)
+            .map_err(|_| invalid(digits)),
+        Literal::Int(digits) | Literal::Float(digits) if scalar(ty) == Some("Float") => digits
+            .parse()
+            .map(Value::Float)
+            .map_err(|_| invalid(digits)),
         Literal::Int(digits) => BigInt::parse_bytes(digits.as_bytes(), 10)
             .map(Value::Int)
             .ok_or_else(|| unsupported(&format!("invalid integer literal `{digits}`"))),
         Literal::Str(text) => Ok(Value::Str(text.clone())),
         Literal::Bool(value) => Ok(Value::Bool(*value)),
         Literal::Unit => Ok(Value::Unit),
-        Literal::Double(_) | Literal::Float(_) => Err(unsupported("floating-point literal")),
+        Literal::Double(text) | Literal::Float(text) => Err(invalid(text)),
+    }
+}
+
+/// The name of a type constructor without arguments (`Double`, `Float`, ...).
+fn scalar(ty: &Type) -> Option<&str> {
+    match ty {
+        Type::Con(name, args) if args.is_empty() => Some(name),
+        _ => None,
     }
 }
 
@@ -465,26 +557,41 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
         (Prim::IntRemChecked, Some(Value::Int(a)), Some(Value::Int(b))) => {
             option((b != zero).then(|| Value::Int(a % b)))
         }
+        (Prim::DoubleAdd, Some(Value::Double(a)), Some(Value::Double(b))) => Value::Double(a + b),
+        (Prim::DoubleSub, Some(Value::Double(a)), Some(Value::Double(b))) => Value::Double(a - b),
+        (Prim::DoubleMul, Some(Value::Double(a)), Some(Value::Double(b))) => Value::Double(a * b),
+        (Prim::DoubleDiv, Some(Value::Double(a)), Some(Value::Double(b))) => Value::Double(a / b),
+        (Prim::DoubleNeg, Some(Value::Double(a)), None) => Value::Double(-a),
+        (Prim::FloatAdd, Some(Value::Float(a)), Some(Value::Float(b))) => Value::Float(a + b),
+        (Prim::FloatSub, Some(Value::Float(a)), Some(Value::Float(b))) => Value::Float(a - b),
+        (Prim::FloatMul, Some(Value::Float(a)), Some(Value::Float(b))) => Value::Float(a * b),
+        (Prim::FloatDiv, Some(Value::Float(a)), Some(Value::Float(b))) => Value::Float(a / b),
+        (Prim::FloatNeg, Some(Value::Float(a)), None) => Value::Float(-a),
+        (Prim::DisplayString, Some(Value::Str(a)), None) => Value::Str(a),
+        // `Long` values are `Int`s in the evaluator.
+        (Prim::DisplayInt | Prim::DisplayLong, Some(Value::Int(a)), None) => {
+            Value::Str(a.to_string())
+        }
+        (Prim::DisplayDouble, Some(a @ Value::Double(_)), None)
+        | (Prim::DisplayFloat, Some(a @ Value::Float(_)), None) => Value::Str(a.render()),
+        (Prim::DisplayBool, Some(Value::Bool(a)), None) => Value::Str(a.to_string()),
         (Prim::StringConcat, Some(Value::Str(a)), Some(Value::Str(b))) => Value::Str(a + &b),
         (Prim::Not, Some(Value::Bool(a)), None) => Value::Bool(!a),
         (Prim::Eq, Some(a), Some(b)) => Value::Bool(equal(&a, &b)?),
         (Prim::NotEq, Some(a), Some(b)) => Value::Bool(!equal(&a, &b)?),
-        (Prim::Lt, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? == Ordering::Less),
-        (Prim::LtEq, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? != Ordering::Greater),
-        (Prim::Gt, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? == Ordering::Greater),
-        (Prim::GtEq, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? != Ordering::Less),
+        // An unordered pair (a NaN operand) makes every comparison false, as in IEEE and JS.
+        (Prim::Lt, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? == Some(Ordering::Less)),
+        (Prim::LtEq, Some(a), Some(b)) => Value::Bool(matches!(
+            compare(&a, &b)?,
+            Some(Ordering::Less | Ordering::Equal)
+        )),
+        (Prim::Gt, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? == Some(Ordering::Greater)),
+        (Prim::GtEq, Some(a), Some(b)) => Value::Bool(matches!(
+            compare(&a, &b)?,
+            Some(Ordering::Greater | Ordering::Equal)
+        )),
         (
-            Prim::DoubleAdd
-            | Prim::DoubleSub
-            | Prim::DoubleMul
-            | Prim::DoubleDiv
-            | Prim::DoubleNeg
-            | Prim::FloatAdd
-            | Prim::FloatSub
-            | Prim::FloatMul
-            | Prim::FloatDiv
-            | Prim::FloatNeg
-            | Prim::DecimalAdd
+            Prim::DecimalAdd
             | Prim::DecimalSub
             | Prim::DecimalMul
             | Prim::DecimalDivChecked
@@ -492,12 +599,6 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
             | Prim::DurationAdd
             | Prim::DurationSub
             | Prim::DurationNeg
-            | Prim::DisplayString
-            | Prim::DisplayInt
-            | Prim::DisplayLong
-            | Prim::DisplayDouble
-            | Prim::DisplayFloat
-            | Prim::DisplayBool
             | Prim::DisplayDecimal
             | Prim::DisplayText,
             _,
@@ -510,6 +611,9 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
 fn equal(a: &Value, b: &Value) -> Result<bool, EvalError> {
     Ok(match (a, b) {
         (Value::Int(a), Value::Int(b)) => a == b,
+        // IEEE equality: `NaN != NaN`, `-0 == 0` (as the generated Rust and JS).
+        (Value::Double(a), Value::Double(b)) => a == b,
+        (Value::Float(a), Value::Float(b)) => a == b,
         (Value::Bool(a), Value::Bool(b)) => a == b,
         (Value::Str(a), Value::Str(b)) => a == b,
         (Value::Unit, Value::Unit) | (Value::None, Value::None) => true,
@@ -542,11 +646,14 @@ fn all_equal(a: &[Value], b: &[Value]) -> Result<bool, EvalError> {
     Ok(true)
 }
 
-fn compare(a: &Value, b: &Value) -> Result<Ordering, EvalError> {
+/// The order of two values; `None` when they are unordered (a `NaN` operand).
+fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>, EvalError> {
     match (a, b) {
-        (Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
-        (Value::Str(a), Value::Str(b)) => Ok(a.cmp(b)),
-        (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+        (Value::Int(a), Value::Int(b)) => Ok(Some(a.cmp(b))),
+        (Value::Double(a), Value::Double(b)) => Ok(a.partial_cmp(b)),
+        (Value::Float(a), Value::Float(b)) => Ok(a.partial_cmp(b)),
+        (Value::Str(a), Value::Str(b)) => Ok(Some(a.cmp(b))),
+        (Value::Bool(a), Value::Bool(b)) => Ok(Some(a.cmp(b))),
         _ => Err(unsupported("ordering on unsupported values")),
     }
 }
@@ -554,6 +661,7 @@ fn compare(a: &Value, b: &Value) -> Result<Ordering, EvalError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::display;
     use crate::core::lower::tests::{CLIENTES, ENTIDADE, compile, compile_with, schema};
 
     fn int(text: &str) -> Value {
@@ -754,11 +862,85 @@ mod tests {
     }
 
     #[test]
-    fn floating_point_is_unsupported() {
-        assert!(matches!(
-            run("fun f(x: Double) = x + 1.5", "f", vec![]),
-            Err(EvalError::Unsupported(_))
-        ));
+    fn doubles_are_ieee_binary64() {
+        assert_eq!(
+            rendered("fun f(x: Double) = x + 1.5", vec![Value::Double(1.0)]),
+            "2.5"
+        );
+        assert_eq!(
+            rendered("fun f() = 0.1 + 0.2", vec![]),
+            "0.30000000000000004"
+        );
+        assert_eq!(rendered("fun f(): Double = 1e21 * 10.0", vec![]), "1e+22");
+        assert_eq!(rendered("fun f(): Double = 1.0 / 0.0", vec![]), "Infinity");
+        assert_eq!(rendered("fun f(): Double = -(0.0 / 0.0)", vec![]), "NaN");
+        assert_eq!(rendered("fun f(): Double = 7.5 - 0.25", vec![]), "7.25");
+        assert_eq!(rendered("fun f(): Double = -0.0", vec![]), "0");
+        let nan = "fun f(): Boolean = 0.0 / 0.0 == 0.0 / 0.0";
+        assert_eq!(rendered(nan, vec![]), "false");
+        let ne = "fun f(): Boolean = 0.0 / 0.0 != 0.0 / 0.0";
+        assert_eq!(rendered(ne, vec![]), "true");
+        for op in ["<", "<=", ">", ">="] {
+            let source = format!("fun f(): Boolean = 0.0 / 0.0 {op} 1.0");
+            assert_eq!(rendered(&source, vec![]), "false", "{op}");
+        }
+        assert_eq!(rendered("fun f(): Boolean = 1.0 < 2.0", vec![]), "true");
+        assert_eq!(rendered("fun f(): Boolean = -0.0 == 0.0", vec![]), "true");
+    }
+
+    #[test]
+    fn floats_are_ieee_binary32() {
+        assert_eq!(
+            rendered("fun f(): Float = 0.1f + 0.2f", vec![]),
+            display::js_number_to_string((0.1f32 + 0.2f32) as f64)
+        );
+        assert_eq!(
+            rendered("fun f(): Float = 0.1f", vec![]),
+            "0.10000000149011612"
+        );
+        assert_eq!(
+            rendered("fun f(x: Float): Float = x * 3.0f", vec![Value::Float(0.1)]),
+            display::js_number_to_string((0.1f32 * 3.0f32) as f64)
+        );
+        assert_eq!(
+            rendered("fun f(): Float = 16777216.0f + 1.0f", vec![]),
+            "16777216"
+        );
+        assert_eq!(rendered("fun f(): Boolean = 0.5f < 1.0f", vec![]), "true");
+    }
+
+    #[test]
+    fn ui_renders_as_html() {
+        assert_eq!(
+            rendered("fun f() = UI { Div { Text(1 + 1) } }", vec![]),
+            "<div class=\"bind-site\"><div>2</div></div>"
+        );
+        let source = r#"
+            fun f(name: String, ok: Boolean, x: Double, y: Float) = UI {
+                Section("hero", "top") {
+                    val greeting = "Hi " + name
+                    Heading(2, "title") { Text(greeting) }
+                    Text(ok)
+                    Text(x)
+                    Text(y)
+                    if (ok) Text("<yes>") else Rule("sep")
+                    Link("https://x", "c", "_blank") { Text(10000000000000000000000) }
+                }
+            }
+        "#;
+        let args = vec![
+            Value::Str("A & B".into()),
+            Value::Bool(true),
+            Value::Double(1e21),
+            Value::Float(0.1),
+        ];
+        assert_eq!(
+            rendered(source, args),
+            "<div class=\"bind-site\"><section class=\"hero\" id=\"top\">\
+             <h2 class=\"title\">Hi A &amp; B</h2>true1e+210.10000000149011612&lt;yes&gt;\
+             <a href=\"https://x\" class=\"c\" target=\"_blank\" rel=\"noopener noreferrer\">\
+             10000000000000000000000</a></section></div>"
+        );
     }
 
     #[test]
