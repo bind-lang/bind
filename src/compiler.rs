@@ -459,7 +459,8 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     let rpc_contracts = program
         .functions
         .iter()
-        .filter(|item| item.domain == Domain::Server)
+        // The router serves server functions; a server component is not an RPC procedure.
+        .filter(|item| item.domain == Domain::Server && !item.component)
         .map(|function| RpcContract {
             name: function.name.clone(),
             parameters: function.parameters.clone(),
@@ -1733,6 +1734,24 @@ client component CustomerPage(id: CustomerId) {
             vec!["CustomerPage".to_string(), "getCustomer".to_string()]
         );
         assert_eq!(app.rpc_contracts[0].path, "/api/getCustomer");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn server_components_are_not_rpc_procedures() {
+        let source = "server component Painel(x: Int) {\n    UI {\n        Text(\"p\")\n    }\n}\nserver fun a(x: Int): Int = x\n";
+        let (root, config) = fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result.application.expect("verifies");
+        let names: Vec<&str> = app
+            .rpc_contracts
+            .iter()
+            .map(|rpc| rpc.name.as_str())
+            .collect();
+        // The same procedures as the generated router.
+        assert_eq!(names, vec!["a"]);
+        let router = crate::backend::rust::server_library(&app).unwrap();
+        assert!(router.contains("\"/api/a\" =>") && !router.contains("/api/Painel"));
         fs::remove_dir_all(root).unwrap();
     }
 
