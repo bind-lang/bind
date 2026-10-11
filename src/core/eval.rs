@@ -972,6 +972,12 @@ mod tests {
             "16777216"
         );
         assert_eq!(rendered("fun f(): Boolean = 0.5f < 1.0f", vec![]), "true");
+        // A negative zero `Float` is shown as `0`, as `String(-0)` in JS.
+        assert_eq!(rendered("fun f(): Float = -0.0f", vec![]), "0");
+        assert_eq!(rendered("fun f(): Float = (-1.0f) * 0.0f", vec![]), "0");
+        assert_eq!(rendered("fun f(): Boolean = -0.0f == 0.0f", vec![]), "true");
+        assert_eq!(rendered("fun f(): Ui = UI { Text(-0.0f) }", vec![]), "0");
+        assert_eq!(display::js_number_to_string(f64::from(-0.0f32)), "0");
     }
 
     #[test]
