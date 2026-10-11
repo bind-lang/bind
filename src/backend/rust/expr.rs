@@ -608,7 +608,7 @@ impl Generator<'_, '_> {
                     .collect();
                 let children = self.expr(children).text;
                 atom(format!(
-                    "{RUNTIME}::Node::Element {{\ntag: {RUNTIME}::NodeTag::{node:?},\nargs: ::std::vec![{}],\nchildren: {ARC}::unwrap_or_clone({children}),\n}}",
+                    "{RUNTIME}::Node::Element {{\ntag: {RUNTIME}::NodeTag::{node:?},\nargs: ::std::vec![{}],\nchildren: {children},\n}}",
                     args.join(", ")
                 ))
             }

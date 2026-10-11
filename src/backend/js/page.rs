@@ -12,7 +12,7 @@
 use crate::compiler::VerifiedApplication;
 use crate::config::{Mode, ProjectConfig, TargetConfig};
 use crate::core::display::{UiArg, UiTree, escape_html, render_html_value};
-use crate::core::eval::{PRERENDER_BUDGET, Value, eval_function_within};
+use crate::core::eval::{PRERENDER_BUDGET, eval_function_within};
 use crate::core::ir::{CoreProgram, UiNode};
 
 use super::names::js_string;
@@ -110,17 +110,19 @@ pub fn loading_html() -> String {
 
 /// The HTML of the page's component evaluated at compile time, when it is static: no
 /// parameters, no server call, and `core::eval` evaluates it to a UI tree within
-/// `PRERENDER_BUDGET` (so `generate` never hangs). Otherwise (it fails, exceeds the budget or
+/// `PRERENDER_BUDGET` whose HTML has at most `PRERENDER_BUDGET.html_bytes` bytes (and nodes).
+/// The budget bounds the evaluation's work (operations, `Int` and string sizes, values
+/// compared, UI nodes built) and the rendering's (bytes written, nodes visited: subtrees are
+/// shared, so a tree that doubles at each step has an exponential HTML in linear memory), so
+/// the pre-render takes bounded time and memory. Otherwise (it fails, exceeds the budget or
 /// uses what the evaluator does not model) `None`: the page is rendered at run time, where a
 /// failure shows its error screen with its status.
 pub fn prerender(core: &CoreProgram, plan: &FrontendPlan) -> Option<String> {
     if !plan.may_be_static() {
         return None;
     }
-    match eval_function_within(core, &plan.component, Vec::new(), PRERENDER_BUDGET) {
-        Ok(value @ Value::Ui { .. }) => Some(value.render()),
-        _ => None,
-    }
+    let value = eval_function_within(core, &plan.component, Vec::new(), PRERENDER_BUDGET).ok()?;
+    value.render_html_within(PRERENDER_BUDGET.html_bytes)
 }
 
 /// The default stylesheet (no `[web].stylesheet`): the page wrapper and the standard screens.
@@ -230,7 +232,8 @@ fn split_index(meta: &PageMeta, export: &str) -> String {
 /// exported as `export`: `readParams(search)` reads the component's parameters with the strict
 /// text decoders (absent, repeated or invalid: `BindError("BadParameter", name)`, as the SSR's
 /// 400 page) and `boot(container, search, document)` shows the loading screen, runs the
-/// component and renders its UI or `rt.errorScreen` of the failure into `container`.
+/// component and renders its UI into `container`, or `rt.errorScreen` of any failure (reading
+/// the parameters, running the component or rendering its UI).
 pub fn app_module(core: &CoreProgram, plan: &FrontendPlan, api_url: &str, export: &str) -> String {
     let module = super::render_app_with(core, std::slice::from_ref(&plan.component), api_url);
     let specs: Vec<String> = plan
@@ -264,15 +267,15 @@ return rt.readParams(search, [{specs}]);
 }}
 
 async function bootPage(container, search, document) {{
-container.replaceChildren(...rt.render(rt.LOADING, document));
-let tree;
+rt.mount(container, rt.render(rt.LOADING, document));
 try {{
 const params = readPageParams(search);
-tree = await {component}({arguments});
+const tree = await {component}({arguments});
+rt.mount(container, rt.render(tree, document));
 }} catch (error) {{
-tree = rt.errorScreen(error).tree;
+// Any failure, rendering included, shows its error screen (never a page stuck loading).
+rt.mount(container, rt.render(rt.errorScreen(error).tree, document));
 }}
-container.replaceChildren(...rt.render(tree, document));
 }}
 
 const page = Object.freeze({{ readParams: readPageParams, boot: bootPage }});
@@ -412,6 +415,67 @@ mod tests {
         assert_eq!(prerender(&core, &page), None);
     }
 
+    /// A component whose tree doubles at each `val` (`aN = Div { aN-1; aN-1 }`): `levels`
+    /// steps of evaluation, a tree of 2^levels leaves.
+    fn doubling(levels: usize) -> String {
+        let mut source = String::from("client component C() {\n    val a0 = UI { Text(\"x\") }\n");
+        for level in 1..=levels {
+            source.push_str(&format!(
+                "    val a{level} = UI {{ Div {{ a{}; a{} }} }}\n",
+                level - 1,
+                level - 1
+            ));
+        }
+        source.push_str(&format!("    UI {{ a{levels} }}\n}}\n"));
+        source
+    }
+
+    /// A component rendering a tree `20 * n` levels deep: `n` nested calls, each adding 20
+    /// nested `Div`s.
+    fn deep(n: usize) -> String {
+        let open = "Div { ".repeat(20);
+        let close = " }".repeat(20);
+        format!(
+            "fun t(n: Int): Ui = if (n == 0) UI {{ Text(\"x\") }} else UI {{ {open}t(n - 1){close} }}\nclient component C() {{\n    UI {{ t({n}) }}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn shared_subtrees_and_deep_trees_fall_back_to_run_time_rendering() {
+        // Small: pre-rendered, the shared subtree written each time it occurs.
+        let (core, page) = plan(&doubling(2));
+        assert_eq!(
+            prerender(&core, &page).as_deref(),
+            Some("<div><div>xx</div><div>xx</div></div>")
+        );
+        // 22 and 30 levels: a few steps of evaluation, but 4 million and a billion leaves
+        // (about 50 MB and 13 GB of HTML): past the HTML budget, so rendered at run time,
+        // quickly and in little memory.
+        for levels in [22, 30] {
+            let started = std::time::Instant::now();
+            let (core, page) = plan(&doubling(levels));
+            assert_eq!(prerender(&core, &page), None, "{levels} levels");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(10),
+                "{levels}: {elapsed:?}"
+            );
+        }
+        // 20 levels of 20 nested `Div`s are pre-rendered; 9,990 levels (about 200,000 nested
+        // elements) exceed the budget and are rendered at run time, without overflowing the
+        // stack (the renderers and the value's drop are iterative).
+        let (core, page) = plan(&deep(20));
+        let html = prerender(&core, &page).expect("pre-rendered");
+        assert_eq!(
+            html,
+            format!("{}x{}", "<div>".repeat(400), "</div>".repeat(400))
+        );
+        let started = std::time::Instant::now();
+        let (core, page) = plan(&deep(9990));
+        assert_eq!(prerender(&core, &page), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(30));
+    }
+
     #[test]
     fn the_page_object_reads_parameters_and_boots_the_component() {
         let (core, page) =
@@ -420,10 +484,13 @@ mod tests {
         assert!(module.contains(
             "return rt.readParams(search, [[\"id\", rt.textUuid], [\"nome\", rt.textString]]);"
         ));
+        assert!(module.contains(
+            "const tree = await u_C(rt.newCtx(), params[\"id\"], params[\"nome\"]);\n        rt.mount(container, rt.render(tree, document));\n    } catch (error) {"
+        ), "{module}");
         assert!(
-            module.contains("tree = await u_C(rt.newCtx(), params[\"id\"], params[\"nome\"]);")
+            module
+                .contains("rt.mount(container, rt.render(rt.errorScreen(error).tree, document));")
         );
-        assert!(module.contains("tree = rt.errorScreen(error).tree;"));
         assert!(
             module.ends_with("export { page as \"bind:page\" };\n"),
             "{module}"
@@ -555,6 +622,115 @@ mod tests {
         )
     }
 
+    /// `generate` of the pathological pages: fast, with the page rendered at run time.
+    #[test]
+    fn generating_huge_or_deep_static_pages_falls_back_to_the_split_page() {
+        for (name, source) in [
+            ("doubling-22", doubling(22)),
+            ("doubling-30", doubling(30)),
+            ("deep", deep(9990)),
+        ] {
+            let started = std::time::Instant::now();
+            let project = split_project(name, &source);
+            let build =
+                web_build(&project.app, &project.config, &project.config.targets["t"]).unwrap();
+            assert!(!build.is_static, "{name}");
+            let paths: Vec<&str> = build.files.iter().map(|(path, _)| path.as_str()).collect();
+            assert_eq!(
+                paths,
+                [
+                    "web/index.html",
+                    "web/app.js",
+                    "web/bind-runtime.js",
+                    "web/styles.css"
+                ],
+                "{name}"
+            );
+            assert!(
+                build
+                    .files
+                    .iter()
+                    .all(|(_, content)| content.len() < 1_000_000)
+            );
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(30),
+                "{name}: {elapsed:?}"
+            );
+        }
+    }
+
+    /// The `ssr` server of a page whose tree is about 200,000 elements deep (not pre-rendered,
+    /// so rendered at `GET /`), compiled into a crate whose test serves the page: 200 with the
+    /// whole tree, no stack overflow while rendering it or dropping it.
+    #[test]
+    #[ignore = "builds a Rust crate; run with `cargo test backend::js -- --ignored`"]
+    fn the_ssr_server_renders_a_deep_tree() {
+        let project = project(
+            "ssr-deep",
+            &[
+                ("app/main.bd", deep(9990)),
+                ("schema.csv", SCHEMA.to_string()),
+                (
+                    "bind.toml",
+                    "[project]\nname = \"t\"\nsource = \"app\"\n[database.main]\nschema = \"schema.csv\"\nverification = \"static\"\n[target.t]\nclient = \"web\"\nserver = \"rust\"\ndeployment = \"aws-lambda\"\nmode = \"ssr\"\ncapabilities = [\"ui.dom\", \"server.http\", \"db.read\"]\n".to_string(),
+                ),
+            ],
+            "t",
+        );
+        let output = project.root.join("generated");
+        crate::certified::generate(&project.app, &project.config, Some(&output)).unwrap();
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = crate::backend::rust::tests::test_crate_in(
+            &root.join("target/bind-codegen-tests"),
+            "bind-ssr-deep",
+        );
+        std::fs::copy(output.join("src/lib.rs"), crate_dir.join("src/lib.rs")).unwrap();
+        std::fs::copy(
+            output.join("src/bind_runtime.rs"),
+            crate_dir.join("src/bind_runtime.rs"),
+        )
+        .unwrap();
+        std::fs::create_dir_all(crate_dir.join("tests")).unwrap();
+        std::fs::write(
+            crate_dir.join("tests/deep.rs"),
+            r#"#![allow(clippy::unwrap_used)]
+
+#[test]
+fn the_deep_page_renders() {
+    // The runtime of the generated entry points: 64 MiB worker stacks for deep Bind recursion.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_stack_size(64 * 1024 * 1024)
+        .build()
+        .unwrap();
+    let pool = runtime.block_on(async {
+        sqlx::postgres::PgPoolOptions::new().connect_lazy("postgresql://bind-test.invalid/none")
+    }).unwrap();
+    let page = runtime.block_on(bind_ssr_deep::serve_page(String::new(), pool));
+    assert_eq!(page.status, 200, "{}", &page.body[..page.body.len().min(500)]);
+    let tree = format!("{}x{}", "<div>".repeat(199_800), "</div>".repeat(199_800));
+    assert!(page.body.contains(&format!("<div class=\"bind-site\">{tree}</div>")));
+}
+"#,
+        )
+        .unwrap();
+        crate::backend::rust::tests::cargo(
+            &crate_dir,
+            &[
+                "clippy",
+                "--quiet",
+                "--release",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ],
+        );
+        crate::backend::rust::tests::cargo(&crate_dir, &["test", "--quiet", "--release"]);
+    }
+
     /// Review Focus 1 in the split mode: the generated `app.js` reads its parameters with
     /// `rt.readParams` as the SSR does (`%XX` and `+` decoded; absent, repeated or invalid is
     /// `BadParameter`), and `boot` renders the component or the SSR's error screen.
@@ -629,6 +805,21 @@ lines.push(await boot(customer, `?id=${uuid}`));
 lines.push(await boot(customer, "?id=00000000-0000-4000-8000-000000000000"));
 lines.push(await boot(customer, "?id=a&id=b"));
 lines.push(await boot(greeting, "?nome=Jo%C3%A3o+Silva"));
+// A failure while rendering the component's tree (a RangeError, say) shows the error screen,
+// never a page stuck on the loading screen.
+const broken = async (page, search) => {
+  const document = createDocument();
+  const createElement = document.createElement;
+  let paragraphs = 0;
+  document.createElement = (name) => {
+    if (name === "p" && ++paragraphs === 2) throw new RangeError("Maximum call stack size exceeded");
+    return createElement(name);
+  };
+  const container = document.createElement("div");
+  await page.boot(container, search, document);
+  return container.childNodes.map(serialize).join("");
+};
+lines.push(await broken(greeting, "?nome=Ana"));
 lines.push(...requests);
 console.log(lines.join("\n"));
 "#,
@@ -660,6 +851,7 @@ console.log(lines.join("\n"));
             error("Page not found", "not found"),
             error("Bad request", "invalid parameter: id"),
             "<p>Olá, João Silva</p>".to_string(),
+            error("Something went wrong", "internal error"),
             "/api/getCustomer {\"id\":\"1b4e28ba-2fa1-4d3b-a3f5-ef19ae7a0c12\"}".to_string(),
             "/api/getCustomer {\"id\":\"00000000-0000-4000-8000-000000000000\"}".to_string(),
         ];

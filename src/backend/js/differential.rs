@@ -27,8 +27,8 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::backend::rust::differential::{
-    PROGRAMS, WEB_CONSTRUCTS, WEB_PRELUDE, build_and_run, compile, expected, main_rs_with,
-    source_with, web_programs,
+    PROGRAMS, TEMPORAL_PRELUDE, WEB_CONSTRUCTS, WEB_PRELUDE, build_and_run, compile, expected,
+    main_rs_with, source_with, temporal_calls, temporal_expected, web_programs,
 };
 
 /// The line-safe form of a render: `\` → `\\`, LF → `\n`, CR → `\r` (injective).
@@ -138,10 +138,12 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
     for construct in WEB_CONSTRUCTS {
         assert!(counts.contains_key(construct), "{construct} not generated");
     }
-    let source = source_with(WEB_PRELUDE, &programs);
+    let calls = temporal_calls();
+    let source = source_with(&format!("{WEB_PRELUDE}{TEMPORAL_PRELUDE}"), &programs);
     let program = compile(&source);
     let expected: Vec<String> = expected(&program, &programs)
         .iter()
+        .chain(&temporal_expected(&program, &calls))
         .map(|line| line_safe_entry(line))
         .collect();
     let evaluated = started.elapsed();
@@ -153,13 +155,24 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         .map(|function| function.name.clone())
         .collect();
     let module = crate::backend::rust::render_functions(&program, &names);
-    let main = main_rs_with(&programs, "bind_differential_web", RUST_EXTRA, RUST_ENCODE);
+    let main = main_rs_with(
+        &programs,
+        &calls,
+        "bind_differential_web",
+        RUST_EXTRA,
+        RUST_ENCODE,
+    );
     let rust_stdout = build_and_run("bind-differential-web", &source, &module, &main);
     let rust: Vec<&str> = rust_stdout.lines().collect();
     let rust_done = started.elapsed();
 
     // JavaScript.
-    let program_names: Vec<String> = programs.iter().map(|(name, _, _)| name.clone()).collect();
+    let mut program_names: Vec<String> = programs.iter().map(|(name, _, _)| name.clone()).collect();
+    for call in &calls {
+        if !program_names.contains(&call.function) {
+            program_names.push(call.function.clone());
+        }
+    }
     let app = super::render_app(&program, &program_names);
     let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bind-differential-web-js");
     if folder.exists() {
@@ -179,15 +192,20 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         include_str!("tests/differential.mjs"),
     )
     .unwrap();
+    let js = super::names::js_string;
     let list: Vec<String> = programs
         .iter()
-        .map(|(name, ty, _)| {
+        .map(|(name, ty, _)| format!("[{}, {}]", js(name), js(ty.bind())))
+        .chain(calls.iter().map(|call| {
             format!(
-                "[{}, {}]",
-                super::names::js_string(name),
-                super::names::js_string(ty.bind())
+                "[{}, {}, {}, [{}, {}]]",
+                js(&call.line),
+                js(call.result.bind()),
+                js(&call.function),
+                js(&call.a),
+                js(&call.b)
             )
-        })
+        }))
         .collect();
     fs::write(
         folder.join("programs.json"),
@@ -209,14 +227,22 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
     let js: Vec<&str> = js_stdout.lines().collect();
 
     let mut divergences = Vec::new();
-    for (index, (name, ty, function)) in programs.iter().enumerate() {
+    let described = programs
+        .iter()
+        .map(|(name, ty, function)| format!("{name}: {}\n{function}", ty.bind()))
+        .chain(calls.iter().map(|call| {
+            format!(
+                "{}: {}({:?}, {:?})\n",
+                call.line, call.function, call.a, call.b
+            )
+        }));
+    for (index, description) in described.enumerate() {
         let want = &expected[index];
         let from_rust = rust.get(index).copied().unwrap_or("<missing>");
         let from_js = js.get(index).copied().unwrap_or("<missing>");
         if want != from_rust || want != from_js {
             divergences.push(format!(
-                "{name}: {}\n{function}evaluator: {want}\n     rust: {from_rust}\n       js: {from_js}",
-                ty.bind()
+                "{description}evaluator: {want}\n     rust: {from_rust}\n       js: {from_js}"
             ));
         }
     }
@@ -225,15 +251,16 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         *by_type.entry(ty.bind()).or_insert(0) += 1;
     }
     eprintln!(
-        "three-way differential: {} programs (result types {by_type:?}), evaluator+front end {:.1?}, rust {:.1?}, js {:.1?}, total {:.1?}\nconstructs {counts:?}",
+        "three-way differential: {} programs (result types {by_type:?}) and {} temporal calls, evaluator+front end {:.1?}, rust {:.1?}, js {:.1?}, total {:.1?}\nconstructs {counts:?}",
         programs.len(),
+        calls.len(),
         evaluated,
         rust_done - evaluated,
         started.elapsed() - rust_done,
         started.elapsed()
     );
-    assert_eq!(rust.len(), programs.len(), "rust line count");
-    assert_eq!(js.len(), programs.len(), "js line count");
+    assert_eq!(rust.len(), expected.len(), "rust line count");
+    assert_eq!(js.len(), expected.len(), "js line count");
     assert!(
         divergences.is_empty(),
         "{} divergences:\n\n{}",

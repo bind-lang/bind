@@ -840,8 +840,10 @@ impl Generator<'_, '_> {
     }
 
     /// `==`, `!=`, `<`, … on operands of type `ty`: JS operators on BigInts, numbers, booleans
-    /// and strings (equality only: strings are ordered by code point, `rt.compare`), the
-    /// runtime's structural `equals` / `compare` otherwise.
+    /// and strings (equality only: strings are ordered by code point, `rt.compare`; `Date`,
+    /// `DateTime` and `Instant` texts by `rt.compareDate` / `rt.compareDateTime` /
+    /// `rt.compareInstant`, their canonical texts being unique so `===` is their equality),
+    /// the runtime's structural `equals` / `compare` otherwise.
     fn comparison(
         &mut self,
         op: Prim,
@@ -900,10 +902,13 @@ impl Generator<'_, '_> {
         if numeric {
             return infix(&a, &b, symbol);
         }
-        let function = if matches!(scalar, "Decimal" | "Money") {
-            "decimalCompare"
-        } else {
-            "compare"
+        let function = match scalar {
+            "Decimal" | "Money" => "decimalCompare",
+            // Ordered as chrono orders the values, not by text (fractions, extended years).
+            "Date" => "compareDate",
+            "DateTime" => "compareDateTime",
+            "Instant" => "compareInstant",
+            _ => "compare",
         };
         Code::complex(
             format!("rt.{function}({}, {}) {symbol} 0", a.text, b.text),
@@ -1126,6 +1131,23 @@ mod tests {
                 .any(|problem| problem.contains("is bound twice")),
             "{problems:?}"
         );
+    }
+
+    #[test]
+    fn temporal_values_are_ordered_by_the_typed_comparators() {
+        for (ty, function) in [
+            ("Date", "compareDate"),
+            ("DateTime", "compareDateTime"),
+            ("Instant", "compareInstant"),
+        ] {
+            let program = crate::core::lower::tests::compile(&format!(
+                "fun f(a: {ty}, b: {ty}): List<Boolean> = listOf(a < b, a >= b, a == b)\n"
+            ));
+            let text = super::function(&program.functions[0], &program);
+            assert!(text.contains(&format!("rt.{function}(")), "{text}");
+            assert!(text.contains(" === "), "{text}");
+            assert!(!text.contains("rt.compare("), "{text}");
+        }
     }
 
     #[test]

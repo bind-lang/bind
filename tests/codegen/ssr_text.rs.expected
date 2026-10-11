@@ -49,15 +49,15 @@ pub mod app {
             ::std::result::Result::Ok(crate::bind_runtime::Node::Element {
                 tag: crate::bind_runtime::NodeTag::Ui,
                 args: ::std::vec![],
-                children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
+                children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
                     tag: crate::bind_runtime::NodeTag::Section,
                     args: ::std::vec![crate::bind_runtime::NodeArg::Str(::std::string::String::from("ficha")), crate::bind_runtime::NodeArg::Str(::std::string::String::from("top"))],
-                    children: ::std::sync::Arc::unwrap_or_clone({
+                    children: {
                         let v9_oi: ::std::string::String = ::std::string::String::from("Oi ") + &v0_nome;
                         crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
                             tag: crate::bind_runtime::NodeTag::Heading,
                             args: ::std::vec![crate::bind_runtime::NodeArg::Int(crate::bind_runtime::Int::from_i64(2)), crate::bind_runtime::NodeArg::Str(::std::string::String::from("title"))],
-                            children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(v9_oi.clone())])),
+                            children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(v9_oi.clone())]),
                         }, crate::bind_runtime::Node::Text(match &v1_codigo {
                             Codigo { value: p0 } => {
                                 let v10_value = p0.clone();
@@ -72,21 +72,21 @@ pub mod app {
                             crate::bind_runtime::Node::Element {
                                 tag: crate::bind_runtime::NodeTag::Strong,
                                 args: ::std::vec![],
-                                children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(::std::string::String::from("positivo"))])),
+                                children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(::std::string::String::from("positivo"))]),
                             }
                         } else {
                             crate::bind_runtime::Node::Element {
                                 tag: crate::bind_runtime::NodeTag::Rule,
                                 args: ::std::vec![crate::bind_runtime::NodeArg::Str(::std::string::String::from("sep"))],
-                                children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::empty_list::<crate::bind_runtime::Node>()),
+                                children: crate::bind_runtime::empty_list::<crate::bind_runtime::Node>(),
                             }
                         }, crate::bind_runtime::Node::Element {
                             tag: crate::bind_runtime::NodeTag::Link,
                             args: ::std::vec![crate::bind_runtime::NodeArg::Str(::std::string::String::from("https://x.y/?a=1&b=2")), crate::bind_runtime::NodeArg::Str(::std::string::String::from("c")), crate::bind_runtime::NodeArg::Str(::std::string::String::from("_blank"))],
-                            children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(crate::bind_runtime::Int::from_parts(false, &[2990538752, 434162106, 542]).to_string())])),
+                            children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(crate::bind_runtime::Int::from_parts(false, &[2990538752, 434162106, 542]).to_string())]),
                         }])
-                    }),
-                }])),
+                    },
+                }]),
             })
         })
     }

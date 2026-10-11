@@ -40,7 +40,7 @@ fn node(value: &Value) -> Node {
                     }
                 })
                 .collect(),
-            children,
+            children: std::sync::Arc::new(children),
         },
     }
 }
@@ -204,5 +204,41 @@ fn param_vectors() {
             }
             other => panic!("unknown kind {other}"),
         }
+    }
+}
+
+/// The order of `a` and `b` read as chrono values of type `T` (the order of the generated
+/// Rust); each text must be canonical (chrono writes it back unchanged).
+fn chrono_order<T>(a: &str, b: &str) -> std::cmp::Ordering
+where
+    T: serde::de::DeserializeOwned + serde::Serialize + Ord,
+{
+    let read = |text: &str| -> T {
+        let value: T = serde_json::from_value(Value::String(text.to_string()))
+            .unwrap_or_else(|error| panic!("{text}: {error}"));
+        assert_eq!(display_text(&value).unwrap(), text, "not canonical");
+        value
+    };
+    read(a).cmp(&read(b))
+}
+
+#[test]
+fn temporal_order_vectors() {
+    let cases = vectors("temporal-order.json");
+    assert!(cases.len() >= 30);
+    for case in &cases {
+        let (a, b) = (case["a"].as_str().unwrap(), case["b"].as_str().unwrap());
+        let order = match case["type"].as_str().unwrap() {
+            "Date" => chrono_order::<chrono::NaiveDate>(a, b),
+            "DateTime" => chrono_order::<chrono::NaiveDateTime>(a, b),
+            "Instant" => chrono_order::<chrono::DateTime<chrono::Utc>>(a, b),
+            other => panic!("unknown type {other}"),
+        };
+        let expected = match order {
+            std::cmp::Ordering::Less => "<",
+            std::cmp::Ordering::Equal => "=",
+            std::cmp::Ordering::Greater => ">",
+        };
+        assert_eq!(case["order"].as_str().unwrap(), expected, "{case}");
     }
 }

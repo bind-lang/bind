@@ -264,21 +264,38 @@ export function jsNumberToString(x) {
 // Structural equality and order
 // ---------------------------------------------------------------------------------------------
 
-/** Structural equality: BigInt, numbers (IEEE ==), Decimal by value, null, arrays, records/variants. */
+/**
+ * Structural equality: BigInt, numbers (IEEE ==), Decimal by value, null, arrays,
+ * records/variants. Iterative: values nested to any depth compare without a RangeError.
+ */
 export function equals(a, b) {
-  if (a === null || b === null) return a === b;
-  if (typeof a !== "object") return a === b;
-  if (a instanceof Decimal) return b instanceof Decimal && decimalCompare(a, b) === 0;
-  if (Array.isArray(a)) {
-    if (!Array.isArray(b) || a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) if (!equals(a[i], b[i])) return false;
-    return true;
-  }
-  if (typeof b !== "object" || Array.isArray(b) || b instanceof Decimal) return false;
-  const keys = Object.keys(a);
-  if (keys.length !== Object.keys(b).length) return false;
-  for (const key of keys) {
-    if (!Object.hasOwn(b, key) || !equals(a[key], b[key])) return false;
+  const pending = [[a, b]];
+  while (pending.length > 0) {
+    const [x, y] = pending.pop();
+    if (x === null || y === null) {
+      if (x !== y) return false;
+      continue;
+    }
+    if (typeof x !== "object") {
+      if (x !== y) return false;
+      continue;
+    }
+    if (x instanceof Decimal) {
+      if (!(y instanceof Decimal) || decimalCompare(x, y) !== 0) return false;
+      continue;
+    }
+    if (Array.isArray(x)) {
+      if (!Array.isArray(y) || x.length !== y.length) return false;
+      for (let i = x.length - 1; i >= 0; i--) pending.push([x[i], y[i]]);
+      continue;
+    }
+    if (typeof y !== "object" || Array.isArray(y) || y instanceof Decimal) return false;
+    const keys = Object.keys(x);
+    if (keys.length !== Object.keys(y).length) return false;
+    for (let i = keys.length - 1; i >= 0; i--) {
+      if (!Object.hasOwn(y, keys[i])) return false;
+      pending.push([x[keys[i]], y[keys[i]]]);
+    }
   }
   return true;
 }
@@ -297,12 +314,8 @@ function compareStrings(a, b) {
   }
 }
 
-/**
- * Structural order: -1, 0 or 1 (NaN when two numbers are unordered, so every `<`, `<=`, `>`,
- * `>=` against 0 is false, as for Rust's f64). null sorts before any value (Option order);
- * arrays and records compare element by element (records in field order); false < true.
- */
-export function compare(a, b) {
+/** The order of two non-composite values (numbers, BigInts, booleans, strings, Decimal, null). */
+function compareScalars(a, b) {
   if (a === null || b === null) return a === b ? 0 : a === null ? -1 : 1;
   switch (typeof a) {
     case "bigint":
@@ -313,17 +326,99 @@ export function compare(a, b) {
     case "string":
       return compareStrings(a, b);
     default:
-      break;
+      return decimalCompare(a, b);
   }
-  if (a instanceof Decimal) return decimalCompare(a, b);
-  const xs = Array.isArray(a) ? a : Object.values(a);
-  const ys = Array.isArray(b) ? b : Object.values(b);
-  const n = Math.min(xs.length, ys.length);
-  for (let i = 0; i < n; i++) {
-    const order = compare(xs[i], ys[i]);
+}
+
+function isComposite(value) {
+  return value !== null && typeof value === "object" && !(value instanceof Decimal);
+}
+
+/**
+ * Structural order: -1, 0 or 1 (NaN when two numbers are unordered, so every `<`, `<=`, `>`,
+ * `>=` against 0 is false, as for Rust's f64). null sorts before any value (Option order);
+ * arrays and records compare element by element (records in field order); false < true.
+ * Iterative (an explicit stack of [xs, ys, next index]): any depth, no RangeError.
+ */
+export function compare(a, b) {
+  if (!isComposite(a) || !isComposite(b)) return compareScalars(a, b);
+  const items = (value) => (Array.isArray(value) ? value : Object.values(value));
+  const stack = [[items(a), items(b), 0]];
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1];
+    const [xs, ys, i] = frame;
+    if (i >= xs.length || i >= ys.length) {
+      stack.pop();
+      if (xs.length !== ys.length) return xs.length < ys.length ? -1 : 1;
+      continue;
+    }
+    frame[2] = i + 1;
+    const [x, y] = [xs[i], ys[i]];
+    if (isComposite(x) && isComposite(y)) {
+      stack.push([items(x), items(y), 0]);
+      continue;
+    }
+    const order = compareScalars(x, y);
     if (order !== 0) return order;
   }
-  return xs.length === ys.length ? 0 : xs.length < ys.length ? -1 : 1;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Date / DateTime / Instant order (bindc's core::display::compare_temporal)
+// ---------------------------------------------------------------------------------------------
+
+const TEMPORAL_TEXT = /^([+-]?)(\d{4,9})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?)?Z?$/;
+
+/** [year, month, day, seconds of the day, nanoseconds] of a canonical text, or null. */
+function temporalKey(text) {
+  const match = typeof text === "string" ? TEMPORAL_TEXT.exec(text) : null;
+  if (match === null) return null;
+  const [, sign, year, month, day, hour, minute, second, fraction] = match;
+  const seconds = hour === undefined ? 0 : Number(hour) * 3600 + Number(minute) * 60 + Number(second);
+  return [
+    (sign === "-" ? -1 : 1) * Number(year),
+    Number(month),
+    Number(day),
+    seconds,
+    Number((fraction ?? "").padEnd(9, "0")),
+  ];
+}
+
+/**
+ * The order (-1, 0, 1) of two Date, DateTime or Instant values by their canonical wire texts:
+ * read as (signed year, month, day, seconds of the day, nanoseconds, the fraction padded to 9
+ * digits), compared in order, as chrono orders the values (text order is wrong for fractions,
+ * `…T10:00:00Z` vs `…T10:00:00.500Z`, and for extended or negative years). A text without that
+ * form (never produced) sorts after every one that has it; two of them by code point.
+ */
+function compareTemporal(a, b) {
+  const x = temporalKey(a);
+  const y = temporalKey(b);
+  if (x === null || y === null) {
+    if (x !== null) return -1;
+    if (y !== null) return 1;
+    return compareStrings(a, b);
+  }
+  for (let i = 0; i < x.length; i++) {
+    if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1;
+  }
+  return 0;
+}
+
+/** Order of two Date texts (`YYYY-MM-DD`, years beyond 0000..9999 signed): -1, 0 or 1. */
+export function compareDate(a, b) {
+  return compareTemporal(a, b);
+}
+
+/** Order of two DateTime texts (`YYYY-MM-DDTHH:MM:SS[.fraction]`): -1, 0 or 1. */
+export function compareDateTime(a, b) {
+  return compareTemporal(a, b);
+}
+
+/** Order of two Instant texts (a DateTime text followed by `Z`): -1, 0 or 1. */
+export function compareInstant(a, b) {
+  return compareTemporal(a, b);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -782,24 +877,15 @@ function isAllowedHref(url) {
   return true;
 }
 
-function renderInto(out, value, document) {
-  if (value.kind === "empty") return;
-  if (value.kind === "text") {
-    out.push(document.createTextNode(value.text));
-    return;
-  }
-  const { tag, args, children } = value;
-  if (tag === "UI") {
-    for (const child of children) renderInto(out, child, document);
-    return;
-  }
+/** The element and attributes of a UI element node (not "UI"), as the Rust runtime writes them. */
+function elementOf(value, document) {
+  const { tag, args } = value;
   const arg = (index) => (index < args.length ? argText(args[index]) : undefined);
   const attributes = [];
   const push = (name, attribute) => {
     if (attribute !== undefined) attributes.push([name, attribute]);
   };
   let elementName;
-  let renderChildren = true;
   if (tag === "Heading") {
     elementName = `h${headingLevel(args[0])}`;
     push("class", arg(1));
@@ -815,7 +901,6 @@ function renderInto(out, value, document) {
   } else if (tag === "Rule") {
     elementName = "hr";
     push("class", arg(0));
-    renderChildren = false;
   } else {
     elementName = CONTAINERS.get(tag);
     push("class", arg(0));
@@ -823,24 +908,46 @@ function renderInto(out, value, document) {
   }
   const element = document.createElement(elementName);
   for (const [name, attribute] of attributes) element.setAttribute(name, attribute);
-  if (renderChildren) {
-    const nodes = [];
-    for (const child of children) renderInto(nodes, child, document);
-    for (const child of nodes) element.appendChild(child);
-  }
-  out.push(element);
+  return element;
 }
 
 /**
  * The DOM nodes of a UI value, built with document.createElement / createTextNode /
  * setAttribute / appendChild only: an array, since the "UI" root is a fragment and EMPTY is
- * nothing (mount with `container.replaceChildren(...render(tree, document))`). Serialized with
- * the canonical escaping they equal the Rust runtime's render_html.
+ * nothing (mount with `mount(container, render(tree, document))`). Serialized with the
+ * canonical escaping they equal the Rust runtime's render_html. Iterative, with an explicit
+ * stack: a tree of any depth renders without a RangeError.
  */
 export function render(value, document) {
   const out = [];
-  renderInto(out, value, document);
+  // [value, parent]: parent is an element, or null for the top level (`out`).
+  const stack = [[value, null]];
+  while (stack.length > 0) {
+    const [current, parent] = stack.pop();
+    if (current.kind === "empty") continue;
+    let node;
+    if (current.kind === "text") {
+      node = document.createTextNode(current.text);
+    } else if (current.tag === "UI") {
+      // A fragment: its children take its place under the same parent.
+      for (let i = current.children.length - 1; i >= 0; i--) stack.push([current.children[i], parent]);
+      continue;
+    } else {
+      node = elementOf(current, document);
+      if (current.tag !== "Rule") {
+        for (let i = current.children.length - 1; i >= 0; i--) stack.push([current.children[i], node]);
+      }
+    }
+    if (parent === null) out.push(node);
+    else parent.appendChild(node);
+  }
   return out;
+}
+
+/** Replaces the children of `container` by `nodes` (one appendChild each: no argument spread). */
+export function mount(container, nodes) {
+  container.replaceChildren();
+  for (const node of nodes) container.appendChild(node);
 }
 
 // ---------------------------------------------------------------------------------------------

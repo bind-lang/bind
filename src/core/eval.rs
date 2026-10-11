@@ -6,10 +6,18 @@
 //!
 //! `Double` is Rust's `f64` and `Float` Rust's `f32` (IEEE binary64/binary32, as JS numbers and
 //! `Math.fround`); a UI tree is a `Value::Ui`, rendered as the page's HTML; `Display*`
-//! primitives give the text `Text` shows (`core::display`). Anything else the generated code
-//! does not model in memory (database, `Decimal`, durations, dates, environment values, server
-//! calls) is `EvalError::Unsupported`.
+//! primitives give the text `Text` shows (`core::display`). `UUID`, `Date`, `DateTime` and
+//! `Instant` values (only ever arguments: Bind has no literal of these types) are their
+//! canonical wire texts (`Value::Str`), shown as is and ordered by
+//! `display::compare_temporal`. Anything else the generated code does not model in memory
+//! (database, `Decimal`, durations, environment values, server calls) is
+//! `EvalError::Unsupported`.
+//!
+//! Strings, list items, constructor fields and UI children are shared (`Arc`), so copying a
+//! value (reading a local, capturing an environment) costs no more than a few pointers, and a
+//! value nested to any depth is dropped iteratively ([`Shared`]).
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,14 +28,26 @@ use super::bigint::BigInt;
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 
-use super::display::{self, UiArg, UiTree};
+use super::display::{self, UiArgView, UiView};
 use super::ir::*;
 
 /// Maximum number of nested function/closure calls; call number 10,001 fails.
 pub const DEPTH_LIMIT: usize = 10_000;
 
-/// Stack of the evaluation thread: a recursive interpreter needs far more than a test thread has.
+/// Stack of a bounded evaluation's thread (the pre-render): a recursive interpreter needs far
+/// more than a test thread has. [`MAX_NESTING`] keeps it from overflowing.
 const STACK_SIZE: usize = 512 * 1024 * 1024;
+
+/// Stack of an unbounded evaluation's thread (the tests): enough for the deepest programs they
+/// run (10,000 nested calls whose bodies nest 20 UI nodes each, in a debug build). Reserved,
+/// not committed: only the pages the evaluation touches take memory.
+const UNBOUNDED_STACK_SIZE: usize = 8 * 1024 * 1024 * 1024;
+
+/// The deepest nesting of expressions under evaluation (calls included) a bounded evaluation
+/// allows: past it, the evaluation stops as past its budget (the page is rendered at run time)
+/// instead of overflowing its thread's stack. Calls alone nest at most 10,000 deep; a deeper
+/// nesting comes from large expressions (UI trees) in recursive functions.
+const MAX_NESTING: usize = 60_000;
 
 #[derive(Clone, Debug)]
 pub enum Value {
@@ -35,16 +55,16 @@ pub enum Value {
     Double(f64),
     Float(f32),
     Bool(bool),
-    Str(String),
+    Str(Arc<str>),
     Unit,
     None,
     Some(Box<Value>),
     /// A record, variant or distinct value. `name` is the record/variant/distinct type name.
     Ctor {
         name: String,
-        fields: Vec<Value>,
+        fields: Shared,
     },
-    List(Vec<Value>),
+    List(Shared),
     /// Captures its environment by value.
     Closure {
         params: Vec<LocalId>,
@@ -57,8 +77,58 @@ pub enum Value {
     Ui {
         node: UiNode,
         args: Vec<Value>,
-        children: Vec<Value>,
+        children: Shared,
     },
+}
+
+/// The items of a list, the fields of a constructor or the children of a UI node. Shared: a
+/// copy of the value shares them (a UI subtree used twice is one subtree, see
+/// [`Budget::html_bytes`]). Dropped iteratively: a value nested to any depth (a 200,000-level
+/// UI tree) is freed without growing the call stack.
+#[derive(Clone, Debug, Default)]
+pub struct Shared(Arc<Vec<Value>>);
+
+impl From<Vec<Value>> for Shared {
+    fn from(items: Vec<Value>) -> Shared {
+        Shared(Arc::new(items))
+    }
+}
+
+impl std::ops::Deref for Shared {
+    type Target = [Value];
+
+    fn deref(&self) -> &[Value] {
+        &self.0
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // Only the last owner frees the items; their own shared parts are moved to `pending`
+        // (when this was their last owner too) before they drop, so no drop recurses.
+        let Some(items) = Arc::get_mut(&mut self.0) else {
+            return;
+        };
+        let mut pending: Vec<Value> = std::mem::take(items);
+        while let Some(mut value) = pending.pop() {
+            match &mut value {
+                Value::List(shared) | Value::Ctor { fields: shared, .. } => {
+                    if let Some(items) = Arc::get_mut(&mut shared.0) {
+                        pending.append(items);
+                    }
+                }
+                Value::Ui { args, children, .. } => {
+                    pending.append(args);
+                    if let Some(items) = Arc::get_mut(&mut children.0) {
+                        pending.append(items);
+                    }
+                }
+                Value::Some(inner) => pending.push(std::mem::replace(&mut **inner, Value::Unit)),
+                Value::Closure { env, .. } => pending.extend(std::mem::take(env).into_values()),
+                _ => {}
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -68,6 +138,11 @@ pub enum EvalError {
 }
 
 impl Value {
+    /// A list of `items`.
+    pub fn list(items: Vec<Value>) -> Value {
+        Value::List(items.into())
+    }
+
     /// The canonical form compared by the differential test:
     /// - `Int`: decimal digits (`-` prefix when negative);
     /// - `Double`: `display::js_number_to_string`; `Float`: the same on the value as `f64`;
@@ -77,7 +152,7 @@ impl Value {
     /// - `Ctor`: `Nome` when it has no fields, otherwise `Nome(a, b)`;
     /// - `List`: `[a, b]`; `Unit`: `()`;
     /// - `Closure`, `Function`, `Builtin`: `<fun>` (not comparable);
-    /// - `Ui`: its HTML, `display::render_html_value`.
+    /// - `Ui`: its HTML, `display::render_html_limited` (unlimited).
     pub fn render(&self) -> String {
         match self {
             Value::Int(value) => value.to_string(),
@@ -92,36 +167,62 @@ impl Value {
             Value::Ctor { name, fields } => format!("{name}({})", join(fields)),
             Value::List(items) => format!("[{}]", join(items)),
             Value::Closure { .. } | Value::Function(_) | Value::Builtin(_) => "<fun>".into(),
-            Value::Ui { .. } => display::render_html_value(&self.ui_tree()),
+            Value::Ui { .. } => display::render_html_limited(self, usize::MAX).unwrap_or_default(),
         }
     }
 
-    /// The tree `render_html_value` takes. Evaluation only builds well-formed nodes; anything
-    /// else is shown as its canonical form (an argument) or as nothing (a child).
-    fn ui_tree(&self) -> UiTree {
-        let Value::Ui {
-            node,
-            args,
-            children,
-        } = self
-        else {
-            return UiTree {
-                node: UiNode::Empty,
-                args: Vec::new(),
-                children: Vec::new(),
-            };
+    /// The HTML of a UI value when it has at most `limit` bytes (and nodes), else `None`.
+    pub fn render_html_within(&self, limit: usize) -> Option<String> {
+        match self {
+            Value::Ui { .. } => display::render_html_limited(self, limit),
+            _ => None,
+        }
+    }
+
+    /// The kind of value, for error messages (never the value itself, which may be huge).
+    fn kind(&self) -> &'static str {
+        match self {
+            Value::Int(_) => "an Int",
+            Value::Double(_) => "a Double",
+            Value::Float(_) => "a Float",
+            Value::Bool(_) => "a Boolean",
+            Value::Str(_) => "a String",
+            Value::Unit => "()",
+            Value::None => "null",
+            Value::Some(_) => "an optional value",
+            Value::Ctor { .. } => "a constructor",
+            Value::List(_) => "a list",
+            Value::Closure { .. } | Value::Function(_) | Value::Builtin(_) => "a function",
+            Value::Ui { .. } => "a UI node",
+        }
+    }
+}
+
+/// Evaluation only builds well-formed UI nodes (`Str` or `Int` arguments, `Ui` children); any
+/// other value renders as nothing.
+impl UiView for Value {
+    fn ui_node(&self) -> UiNode {
+        match self {
+            Value::Ui { node, .. } => *node,
+            _ => UiNode::Empty,
+        }
+    }
+
+    fn ui_arg(&self, index: usize) -> Option<UiArgView<'_>> {
+        let Value::Ui { args, .. } = self else {
+            return None;
         };
-        UiTree {
-            node: *node,
-            args: args
-                .iter()
-                .map(|arg| match arg {
-                    Value::Str(text) => UiArg::Str(text.clone()),
-                    Value::Int(value) => UiArg::Int(value.to_string()),
-                    other => UiArg::Str(other.render()),
-                })
-                .collect(),
-            children: children.iter().map(Value::ui_tree).collect(),
+        match args.get(index)? {
+            Value::Str(text) => Some(UiArgView::Str(text)),
+            Value::Int(value) => Some(UiArgView::Int(Cow::Owned(value.to_string()))),
+            _ => None,
+        }
+    }
+
+    fn ui_children(&self) -> &[Value] {
+        match self {
+            Value::Ui { children, .. } => children,
+            _ => &[],
         }
     }
 }
@@ -156,7 +257,9 @@ fn json_string(text: &str) -> String {
     out
 }
 
-/// Evaluates the function `name` on `args` in a thread with a large stack.
+/// Evaluates the function `name` on `args` in a thread with a large stack, without a budget
+/// (the tests' reference; the pre-render uses [`eval_function_within`]).
+#[cfg(test)]
 pub fn eval_function(
     program: &CoreProgram,
     name: &str,
@@ -165,22 +268,30 @@ pub fn eval_function(
     run(program, name, args, None)
 }
 
-/// A bound on one evaluation (the compile-time pre-render): at most `steps` evaluated
-/// expressions, `Int`s of at most `int_limbs` 32-bit limbs and strings of at most
-/// `string_bytes` bytes. Past any of them the evaluation stops with
-/// `EvalError::Unsupported("evaluation budget exhausted")`.
+/// A bound on one evaluation (the compile-time pre-render). `work` counts down one unit per
+/// evaluated expression plus the size of what an operation goes through: the limbs of `Int`
+/// arithmetic (their product for `*`, `/`, `%` and for the decimal text), a 64th of the bytes of
+/// a concatenation, the locals a closure captures, the children a UI node gets and every pair of
+/// values `==` / `!=` visits. Every other operation takes constant time (values are shared), so
+/// the whole evaluation does at most a constant times `work` steps. `Int`s have at most
+/// `int_limbs` 32-bit limbs and strings at most `string_bytes` bytes. Past any of them the
+/// evaluation stops with `EvalError::Unsupported("evaluation budget exhausted")`.
+/// `html_bytes` bounds the rendering of the result (`Value::render_html_within`): output bytes
+/// and visited nodes, since shared subtrees make a tree's HTML exponential in its memory.
 #[derive(Clone, Copy, Debug)]
 pub struct Budget {
-    pub steps: u64,
+    pub work: u64,
     pub int_limbs: usize,
     pub string_bytes: usize,
+    pub html_bytes: usize,
 }
 
 /// The budget of the static pre-render: a page that needs more is rendered at run time.
 pub const PRERENDER_BUDGET: Budget = Budget {
-    steps: 2_000_000,
+    work: 2_000_000,
     int_limbs: 1024,
     string_bytes: 4 * 1024 * 1024,
+    html_bytes: 1024 * 1024,
 };
 
 /// [`eval_function`] within `budget`.
@@ -200,12 +311,18 @@ fn run(
     budget: Option<Budget>,
 ) -> Result<Value, EvalError> {
     std::thread::scope(|scope| {
+        let stack = if budget.is_some() {
+            STACK_SIZE
+        } else {
+            UNBOUNDED_STACK_SIZE
+        };
         let handle = std::thread::Builder::new()
-            .stack_size(STACK_SIZE)
+            .stack_size(stack)
             .spawn_scoped(scope, || {
                 let mut interp = Interp {
                     program,
                     depth: 0,
+                    nesting: 0,
                     budget,
                 };
                 interp.call(Value::Function(name.to_string()), args)
@@ -241,7 +358,9 @@ type Eval = Result<Value, Signal>;
 struct Interp<'p> {
     program: &'p CoreProgram,
     depth: usize,
-    /// The remaining budget, if bounded (`steps` counts down).
+    /// Expressions under evaluation (see [`MAX_NESTING`]).
+    nesting: usize,
+    /// The remaining budget, if bounded (`work` counts down).
     budget: Option<Budget>,
 }
 
@@ -249,7 +368,64 @@ fn exhausted() -> EvalError {
     unsupported("evaluation budget exhausted")
 }
 
+/// The value of local `id`.
+fn local(env: &Env, id: LocalId) -> Eval {
+    match env.get(&id) {
+        Some(value) => Ok(value.clone()),
+        None => Err(unbound(id).into()),
+    }
+}
+
+#[cold]
+fn unbound(id: LocalId) -> EvalError {
+    unsupported(&format!("unbound local {id}"))
+}
+
+#[cold]
+fn not_modelled(what: &str, detail: &str) -> EvalError {
+    unsupported(&format!("{what} {detail}"))
+}
+
+/// The limbs of an `Int` value (1 for anything else).
+fn limbs(value: &Value) -> u64 {
+    match value {
+        Value::Int(value) => value.limb_count().max(1) as u64,
+        _ => 1,
+    }
+}
+
+/// The work of `op` on `args` beyond the expression itself (see [`Budget`]).
+fn prim_cost(op: Prim, args: &[Value]) -> u64 {
+    let (a, b) = (args.first(), args.get(1));
+    let size = |value: Option<&Value>| value.map_or(1, limbs);
+    match op {
+        Prim::IntAdd | Prim::IntSub | Prim::IntNeg => size(a).max(size(b)) / 8,
+        Prim::IntMul | Prim::IntDivChecked | Prim::IntRemChecked => size(a) * size(b) / 8,
+        Prim::DisplayInt | Prim::DisplayLong => size(a) * size(a) / 8,
+        Prim::StringConcat => {
+            let bytes = |value: Option<&Value>| match value {
+                Some(Value::Str(text)) => text.len() as u64,
+                _ => 0,
+            };
+            (bytes(a) + bytes(b)) / 64
+        }
+        _ => 0,
+    }
+}
+
 impl Interp<'_> {
+    /// Takes `units` of work from the budget, if bounded.
+    fn charge(&mut self, units: u64) -> Result<(), EvalError> {
+        if let Some(budget) = &mut self.budget {
+            if budget.work < units {
+                budget.work = 0;
+                return Err(exhausted());
+            }
+            budget.work -= units;
+        }
+        Ok(())
+    }
+
     /// Calls a function value; a `Return` inside ends only this call.
     fn call(&mut self, callee: Value, args: Vec<Value>) -> Result<Value, EvalError> {
         // Like the generated `ctx.enter()?`: only Bind functions and closures count.
@@ -295,143 +471,215 @@ impl Interp<'_> {
                 self.eval(&body, &mut env)
             }
             Value::Builtin(name) => self.builtin(&name, args),
-            other => Err(unsupported(&format!("call of non-function {}", other.render())).into()),
+            other => Err(unsupported(&format!("call of {}", other.kind())).into()),
         }
     }
 
     fn eval(&mut self, expr: &Expr, env: &mut Env) -> Eval {
-        if let Some(budget) = &mut self.budget {
-            if budget.steps == 0 {
-                return Err(exhausted().into());
-            }
-            budget.steps -= 1;
+        self.charge(1)?;
+        if self.budget.is_some() && self.nesting >= MAX_NESTING {
+            return Err(exhausted().into());
         }
+        self.nesting += 1;
+        let value = self.eval_nested(expr, env);
+        self.nesting -= 1;
+        value
+    }
+
+    fn eval_nested(&mut self, expr: &Expr, env: &mut Env) -> Eval {
         match &expr.kind {
-            ExprKind::Lit(literal) => Ok(literal_value(literal, &expr.ty)?),
-            ExprKind::Local(id) => env
-                .get(id)
-                .cloned()
-                .ok_or_else(|| unsupported(&format!("unbound local {id}")).into()),
+            ExprKind::Lit(literal) => literal_value(literal, &expr.ty).map_err(Signal::Error),
+            ExprKind::Local(id) => local(env, *id),
             ExprKind::Global { name, .. } => Ok(Value::Function(name.clone())),
             ExprKind::Builtin { name, .. } => Ok(Value::Builtin(name.clone())),
-            ExprKind::Environment(name) => {
-                Err(unsupported(&format!("environment value `{name}`")).into())
-            }
-            ExprKind::Ctor { ctor, args, .. } => Ok(Value::Ctor {
-                name: ctor.clone(),
-                fields: self.eval_all(args, env)?,
-            }),
+            ExprKind::Environment(name) => Err(not_modelled("environment value", name).into()),
+            ExprKind::Ctor { ctor, args, .. } => self.ctor_expr(ctor, args, env),
             ExprKind::None => Ok(Value::None),
-            ExprKind::Some(inner) => Ok(Value::Some(Box::new(self.eval(inner, env)?))),
-            ExprKind::Call { callee, args } => {
-                let callee = self.eval(callee, env)?;
-                let args = self.eval_all(args, env)?;
-                Ok(self.call(callee, args)?)
-            }
+            ExprKind::Some(inner) => self.some_expr(inner, env),
+            ExprKind::Call { callee, args } => self.call_expr(callee, args, env),
             ExprKind::ServerCall { function, .. } => {
-                Err(unsupported(&format!("server call `{function}`")).into())
+                Err(not_modelled("server call", function).into())
             }
-            ExprKind::Lambda { params, body } => Ok(Value::Closure {
-                params: params.iter().map(|(id, _, _)| *id).collect(),
-                body: Arc::new((**body).clone()),
-                env: env.clone(),
-            }),
+            ExprKind::Lambda { params, body } => self.lambda(params, body, env),
             ExprKind::Let {
                 local, value, body, ..
-            } => {
-                let value = self.eval(value, env)?;
-                env.insert(*local, value);
-                self.eval(body, env)
-            }
-            ExprKind::Seq { value, body } => {
-                self.eval(value, env)?;
-                self.eval(body, env)
-            }
+            } => self.let_expr(*local, value, body, env),
+            ExprKind::Seq { value, body } => self.seq_expr(value, body, env),
             ExprKind::If {
                 condition,
                 then_branch,
                 else_branch,
-            } => match self.eval(condition, env)? {
-                Value::Bool(true) => self.eval(then_branch, env),
-                Value::Bool(false) => self.eval(else_branch, env),
-                other => {
-                    Err(unsupported(&format!("non-Boolean condition {}", other.render())).into())
-                }
-            },
-            ExprKind::Match { scrutinee, arms } => {
-                let value = self.eval(scrutinee, env)?;
-                for arm in arms {
-                    if matches(&arm.pattern, &value) {
-                        for ((id, _, _), path) in arm.bindings.iter().zip(&arm.binding_paths) {
-                            env.insert(*id, follow(&value, path)?);
-                        }
-                        return self.eval(&arm.body, env);
-                    }
-                }
-                Err(unsupported("no `when` arm matches").into())
-            }
-            ExprKind::Field { target, name } => {
-                let target = self.eval(target, env)?;
-                Ok(self.field(&target, name)?)
-            }
-            ExprKind::Prim { op, args } => {
-                let args = self.eval_all(args, env)?;
-                let value = prim(*op, args)?;
-                if let Some(budget) = &self.budget {
-                    let too_big = match &value {
-                        Value::Int(value) => value.limb_count() > budget.int_limbs,
-                        Value::Str(text) => text.len() > budget.string_bytes,
-                        _ => false,
-                    };
-                    if too_big {
-                        return Err(exhausted().into());
-                    }
-                }
-                Ok(value)
-            }
+            } => self.if_expr(condition, then_branch, else_branch, env),
+            ExprKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, env),
+            ExprKind::Field { target, name } => self.field_expr(target, name, env),
+            ExprKind::Prim { op, args } => self.prim_expr(*op, args, env),
             ExprKind::Db { .. } => Err(unsupported("database access").into()),
-            ExprKind::Return(value) => Err(Signal::Return(self.eval(value, env)?)),
+            ExprKind::Return(value) => self.return_expr(value, env),
             ExprKind::Ui {
                 node,
                 args,
                 children,
-            } => {
-                let args = self.eval_all(args, env)?;
-                if let Some(bad) = args
-                    .iter()
-                    .find(|arg| !matches!(arg, Value::Str(_) | Value::Int(_)))
-                {
-                    return Err(unsupported(&format!("UI argument {}", bad.render())).into());
-                }
-                let children = match self.eval(children, env)? {
-                    Value::List(items)
-                        if items.iter().all(|item| matches!(item, Value::Ui { .. })) =>
-                    {
-                        items
-                    }
-                    other => {
-                        return Err(unsupported(&format!("UI children {}", other.render())).into());
-                    }
-                };
-                Ok(Value::Ui {
-                    node: *node,
-                    args,
-                    children,
-                })
-            }
+            } => self.ui_expr(*node, args, children, env),
         }
     }
 
+    #[inline(never)]
+    fn ctor_expr(&mut self, ctor: &str, args: &[Expr], env: &mut Env) -> Eval {
+        Ok(Value::Ctor {
+            name: ctor.to_string(),
+            fields: self.eval_all(args, env)?.into(),
+        })
+    }
+
+    #[inline(never)]
+    fn some_expr(&mut self, inner: &Expr, env: &mut Env) -> Eval {
+        Ok(Value::Some(Box::new(self.eval(inner, env)?)))
+    }
+
+    #[inline(never)]
+    fn call_expr(&mut self, callee: &Expr, args: &[Expr], env: &mut Env) -> Eval {
+        let callee = self.eval(callee, env)?;
+        let args = self.eval_all(args, env)?;
+        Ok(self.call(callee, args)?)
+    }
+
+    #[inline(never)]
+    fn let_expr(&mut self, local: LocalId, value: &Expr, body: &Expr, env: &mut Env) -> Eval {
+        let value = self.eval(value, env)?;
+        env.insert(local, value);
+        self.eval(body, env)
+    }
+
+    #[inline(never)]
+    fn seq_expr(&mut self, value: &Expr, body: &Expr, env: &mut Env) -> Eval {
+        self.eval(value, env)?;
+        self.eval(body, env)
+    }
+
+    #[inline(never)]
+    fn if_expr(
+        &mut self,
+        condition: &Expr,
+        then_branch: &Expr,
+        else_branch: &Expr,
+        env: &mut Env,
+    ) -> Eval {
+        match self.eval(condition, env)? {
+            Value::Bool(true) => self.eval(then_branch, env),
+            Value::Bool(false) => self.eval(else_branch, env),
+            other => Err(not_modelled("condition that is", other.kind()).into()),
+        }
+    }
+
+    #[inline(never)]
+    fn field_expr(&mut self, target: &Expr, name: &str, env: &mut Env) -> Eval {
+        let target = self.eval(target, env)?;
+        Ok(self.field(&target, name)?)
+    }
+
+    #[inline(never)]
+    fn return_expr(&mut self, value: &Expr, env: &mut Env) -> Eval {
+        Err(Signal::Return(self.eval(value, env)?))
+    }
+
+    // The arms below are separate functions so that `eval_nested`, which recurses once per
+    // nested expression, keeps a small stack frame (debug builds give a function one slot per
+    // local of every arm).
+
+    #[inline(never)]
+    fn lambda(&mut self, params: &[(LocalId, String, Type)], body: &Expr, env: &mut Env) -> Eval {
+        self.charge(env.len() as u64)?;
+        Ok(Value::Closure {
+            params: params.iter().map(|(id, _, _)| *id).collect(),
+            body: Arc::new(body.clone()),
+            env: env.clone(),
+        })
+    }
+
+    #[inline(never)]
+    fn match_expr(&mut self, scrutinee: &Expr, arms: &[Arm], env: &mut Env) -> Eval {
+        let value = self.eval(scrutinee, env)?;
+        for arm in arms {
+            if matches(&arm.pattern, &value) {
+                for ((id, _, _), path) in arm.bindings.iter().zip(&arm.binding_paths) {
+                    env.insert(*id, follow(&value, path)?);
+                }
+                return self.eval(&arm.body, env);
+            }
+        }
+        Err(unsupported("no `when` arm matches").into())
+    }
+
+    #[inline(never)]
+    fn prim_expr(&mut self, op: Prim, args: &[Expr], env: &mut Env) -> Eval {
+        let temporal = args
+            .first()
+            .and_then(|arg| scalar(&arg.ty))
+            .is_some_and(|name| matches!(name, "Date" | "DateTime" | "Instant"));
+        let args = self.eval_all(args, env)?;
+        self.charge(prim_cost(op, &args))?;
+        let value = match op {
+            _ if temporal => temporal_prim(op, args)?,
+            Prim::Eq | Prim::NotEq => {
+                let [a, b] = <[Value; 2]>::try_from(args)
+                    .map_err(|_| unsupported(&format!("bad operands for {op:?}")))?;
+                let equal = self.equal(&a, &b)?;
+                Value::Bool(equal == (op == Prim::Eq))
+            }
+            _ => prim(op, args)?,
+        };
+        if let Some(budget) = &self.budget {
+            let too_big = match &value {
+                Value::Int(value) => value.limb_count() > budget.int_limbs,
+                Value::Str(text) => text.len() > budget.string_bytes,
+                _ => false,
+            };
+            if too_big {
+                return Err(exhausted().into());
+            }
+        }
+        Ok(value)
+    }
+
+    #[inline(never)]
+    fn ui_expr(&mut self, node: UiNode, args: &[Expr], children: &Expr, env: &mut Env) -> Eval {
+        let args = self.eval_all(args, env)?;
+        if let Some(bad) = args
+            .iter()
+            .find(|arg| !matches!(arg, Value::Str(_) | Value::Int(_)))
+        {
+            return Err(not_modelled("UI argument that is", bad.kind()).into());
+        }
+        let children = match self.eval(children, env)? {
+            Value::List(items) => items,
+            other => return Err(not_modelled("UI children in", other.kind()).into()),
+        };
+        self.charge(children.len() as u64)?;
+        if let Some(bad) = children
+            .iter()
+            .find(|child| !matches!(child, Value::Ui { .. }))
+        {
+            return Err(not_modelled("UI child that is", bad.kind()).into());
+        }
+        Ok(Value::Ui {
+            node,
+            args,
+            children,
+        })
+    }
+
+    /// A plain loop (iterator adapters would add stack frames to every nesting level).
     fn eval_all(&mut self, exprs: &[Expr], env: &mut Env) -> Result<Vec<Value>, Signal> {
-        exprs.iter().map(|expr| self.eval(expr, env)).collect()
+        let mut values = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            values.push(self.eval(expr, env)?);
+        }
+        Ok(values)
     }
 
     fn field(&self, target: &Value, name: &str) -> Result<Value, EvalError> {
         let Value::Ctor { name: ctor, fields } = target else {
-            return Err(unsupported(&format!(
-                "field `{name}` of {}",
-                target.render()
-            )));
+            return Err(unsupported(&format!("field `{name}` of {}", target.kind())));
         };
         let names: Option<Vec<&String>> = self.program.types.iter().find_map(|ty| match ty {
             CoreType::Record {
@@ -452,25 +700,73 @@ impl Interp<'_> {
             .ok_or_else(|| unsupported(&format!("no field `{name}` in `{ctor}`")))
     }
 
+    /// Structural equality, iteratively (any depth), one unit of work per visited pair. IEEE
+    /// equality for numbers: `NaN != NaN`, `-0 == 0` (as the generated Rust and JS).
+    fn equal(&mut self, a: &Value, b: &Value) -> Result<bool, EvalError> {
+        let mut pending = vec![(a, b)];
+        while let Some(pair) = pending.pop() {
+            self.charge(1)?;
+            match pair {
+                (Value::Int(a), Value::Int(b)) if a != b => return Ok(false),
+                (Value::Double(a), Value::Double(b)) if a != b => return Ok(false),
+                (Value::Float(a), Value::Float(b)) if a != b => return Ok(false),
+                (Value::Bool(a), Value::Bool(b)) if a != b => return Ok(false),
+                (Value::Str(a), Value::Str(b)) if a != b => return Ok(false),
+                (Value::Int(_), Value::Int(_))
+                | (Value::Double(_), Value::Double(_))
+                | (Value::Float(_), Value::Float(_))
+                | (Value::Bool(_), Value::Bool(_))
+                | (Value::Str(_), Value::Str(_))
+                | (Value::Unit, Value::Unit)
+                | (Value::None, Value::None) => {}
+                (Value::None, Value::Some(_)) | (Value::Some(_), Value::None) => return Ok(false),
+                (Value::Some(a), Value::Some(b)) => pending.push((a, b)),
+                (
+                    Value::Ctor {
+                        name: na,
+                        fields: fa,
+                    },
+                    Value::Ctor {
+                        name: nb,
+                        fields: fb,
+                    },
+                ) => {
+                    if na != nb || fa.len() != fb.len() {
+                        return Ok(false);
+                    }
+                    pending.extend(fa.iter().zip(fb.iter()).rev());
+                }
+                (Value::List(a), Value::List(b)) => {
+                    if a.len() != b.len() {
+                        return Ok(false);
+                    }
+                    pending.extend(a.iter().zip(b.iter()).rev());
+                }
+                _ => return Err(unsupported("equality on incomparable values")),
+            }
+        }
+        Ok(true)
+    }
+
     fn builtin(&mut self, name: &str, args: Vec<Value>) -> Eval {
         let bad = || unsupported(&format!("bad arguments for builtin `{name}`"));
         let mut args = args.into_iter();
         let value = match name {
-            "listOf" => Value::List(args.collect()),
-            "emptyList" => Value::List(Vec::new()),
+            "listOf" => Value::list(args.collect()),
+            "emptyList" => Value::list(Vec::new()),
             "length" => match args.next() {
                 Some(Value::List(items)) => Value::Int(BigInt::from(items.len())),
                 _ => return Err(bad().into()),
             },
             "first" => match args.next() {
-                Some(Value::List(items)) => option(items.into_iter().next()),
+                Some(Value::List(items)) => option(items.first().cloned()),
                 _ => return Err(bad().into()),
             },
             "get" => match (args.next(), args.next()) {
                 (Some(Value::List(items)), Some(Value::Int(index))) => {
                     let item = usize::try_from(&index)
                         .ok()
-                        .and_then(|index| items.into_iter().nth(index));
+                        .and_then(|index| items.get(index).cloned());
                     option(item)
                 }
                 _ => return Err(bad().into()),
@@ -478,17 +774,17 @@ impl Interp<'_> {
             "map" => match (args.next(), args.next()) {
                 (Some(Value::List(items)), Some(function)) => {
                     let mut out = Vec::with_capacity(items.len());
-                    for item in items {
-                        out.push(self.call(function.clone(), vec![item])?);
+                    for item in items.iter() {
+                        out.push(self.call(function.clone(), vec![item.clone()])?);
                     }
-                    Value::List(out)
+                    Value::list(out)
                 }
                 _ => return Err(bad().into()),
             },
             "fold" => match (args.next(), args.next(), args.next()) {
                 (Some(Value::List(items)), Some(mut acc), Some(function)) => {
-                    for item in items {
-                        acc = self.call(function.clone(), vec![acc, item])?;
+                    for item in items.iter() {
+                        acc = self.call(function.clone(), vec![acc, item.clone()])?;
                     }
                     acc
                 }
@@ -533,7 +829,7 @@ fn literal_value(literal: &Literal, ty: &Type) -> Result<Value, EvalError> {
         Literal::Int(digits) => BigInt::parse_bytes(digits.as_bytes(), 10)
             .map(Value::Int)
             .ok_or_else(|| unsupported(&format!("invalid integer literal `{digits}`"))),
-        Literal::Str(text) => Ok(Value::Str(text.clone())),
+        Literal::Str(text) => Ok(Value::Str(text.as_str().into())),
         Literal::Bool(value) => Ok(Value::Bool(*value)),
         Literal::Unit => Ok(Value::Unit),
         Literal::Double(text) | Literal::Float(text) => Err(invalid(text)),
@@ -565,7 +861,7 @@ fn matches(pattern: &Pat, value: &Value) -> bool {
                 && args.len() == fields.len()
                 && args
                     .iter()
-                    .zip(fields)
+                    .zip(fields.iter())
                     .all(|(arg, field)| matches(arg, field))
         }
         _ => false,
@@ -635,15 +931,18 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
         (Prim::DisplayString, Some(Value::Str(a)), None) => Value::Str(a),
         // `Long` values are `Int`s in the evaluator.
         (Prim::DisplayInt | Prim::DisplayLong, Some(Value::Int(a)), None) => {
-            Value::Str(a.to_string())
+            Value::Str(a.to_string().into())
         }
         (Prim::DisplayDouble, Some(a @ Value::Double(_)), None)
-        | (Prim::DisplayFloat, Some(a @ Value::Float(_)), None) => Value::Str(a.render()),
-        (Prim::DisplayBool, Some(Value::Bool(a)), None) => Value::Str(a.to_string()),
-        (Prim::StringConcat, Some(Value::Str(a)), Some(Value::Str(b))) => Value::Str(a + &b),
+        | (Prim::DisplayFloat, Some(a @ Value::Float(_)), None) => Value::Str(a.render().into()),
+        (Prim::DisplayBool, Some(Value::Bool(a)), None) => Value::Str(a.to_string().into()),
+        // `UUID`, `Date`, `DateTime`, `Instant`: their canonical text, shown as is (the
+        // evaluator has no `Duration` values).
+        (Prim::DisplayText, Some(Value::Str(a)), None) => Value::Str(a),
+        (Prim::StringConcat, Some(Value::Str(a)), Some(Value::Str(b))) => {
+            Value::Str(format!("{a}{b}").into())
+        }
         (Prim::Not, Some(Value::Bool(a)), None) => Value::Bool(!a),
-        (Prim::Eq, Some(a), Some(b)) => Value::Bool(equal(&a, &b)?),
-        (Prim::NotEq, Some(a), Some(b)) => Value::Bool(!equal(&a, &b)?),
         // An unordered pair (a NaN operand) makes every comparison false, as in IEEE and JS.
         (Prim::Lt, Some(a), Some(b)) => Value::Bool(compare(&a, &b)? == Some(Ordering::Less)),
         (Prim::LtEq, Some(a), Some(b)) => Value::Bool(matches!(
@@ -673,42 +972,26 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
     })
 }
 
-fn equal(a: &Value, b: &Value) -> Result<bool, EvalError> {
-    Ok(match (a, b) {
-        (Value::Int(a), Value::Int(b)) => a == b,
-        // IEEE equality: `NaN != NaN`, `-0 == 0` (as the generated Rust and JS).
-        (Value::Double(a), Value::Double(b)) => a == b,
-        (Value::Float(a), Value::Float(b)) => a == b,
-        (Value::Bool(a), Value::Bool(b)) => a == b,
-        (Value::Str(a), Value::Str(b)) => a == b,
-        (Value::Unit, Value::Unit) | (Value::None, Value::None) => true,
-        (Value::None, Value::Some(_)) | (Value::Some(_), Value::None) => false,
-        (Value::Some(a), Value::Some(b)) => equal(a, b)?,
-        (
-            Value::Ctor {
-                name: na,
-                fields: fa,
-            },
-            Value::Ctor {
-                name: nb,
-                fields: fb,
-            },
-        ) => na == nb && all_equal(fa, fb)?,
-        (Value::List(a), Value::List(b)) => all_equal(a, b)?,
-        _ => return Err(unsupported("equality on incomparable values")),
-    })
-}
-
-fn all_equal(a: &[Value], b: &[Value]) -> Result<bool, EvalError> {
-    if a.len() != b.len() {
-        return Ok(false);
-    }
-    for (a, b) in a.iter().zip(b) {
-        if !equal(a, b)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// A comparison of `Date`, `DateTime` or `Instant` values, which the evaluator holds as their
+/// canonical texts (`Value::Str`, given as arguments: Bind has no literal of these types):
+/// equality is that of the texts (canonical, so unique), order is `display::compare_temporal`
+/// (the order of the values, as chrono's in the generated Rust and the JS runtime's), never
+/// the text order.
+fn temporal_prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
+    let (a, b) = match args.as_slice() {
+        [Value::Str(a), Value::Str(b)] => (a, b),
+        _ => return prim(op, args),
+    };
+    let order = display::compare_temporal(a, b);
+    Ok(Value::Bool(match op {
+        Prim::Eq => a == b,
+        Prim::NotEq => a != b,
+        Prim::Lt => order == Ordering::Less,
+        Prim::LtEq => order != Ordering::Greater,
+        Prim::Gt => order == Ordering::Greater,
+        Prim::GtEq => order != Ordering::Less,
+        _ => return prim(op, args),
+    }))
 }
 
 /// The order of two values; `None` when they are unordered (a `NaN` operand).
@@ -744,7 +1027,7 @@ mod tests {
     fn ctor(name: &str, fields: Vec<Value>) -> Value {
         Value::Ctor {
             name: name.into(),
-            fields,
+            fields: fields.into(),
         }
     }
 
@@ -782,14 +1065,14 @@ mod tests {
     #[test]
     fn closures_and_builtins() {
         let source = "fun f(xs: List<Int>) = fold(map(xs, { x -> x * 2 }), 0, { s, x -> s + x })";
-        let xs = Value::List(vec![int("1"), int("2"), int("3")]);
+        let xs = Value::list(vec![int("1"), int("2"), int("3")]);
         assert_eq!(rendered(source, vec![xs]), "12");
     }
 
     #[test]
     fn list_builtins_never_panic() {
         let source = "fun f(xs: List<Int>, i: Int) = get(xs, i) ?: -1";
-        let xs = || Value::List(vec![int("5"), int("6")]);
+        let xs = || Value::list(vec![int("5"), int("6")]);
         assert_eq!(rendered(source, vec![xs(), int("1")]), "6");
         assert_eq!(rendered(source, vec![xs(), int("2")]), "-1");
         assert_eq!(rendered(source, vec![xs(), int("-1")]), "-1");
@@ -800,7 +1083,7 @@ mod tests {
         assert_eq!(
             rendered(
                 "fun f(xs: List<Int>) = first(xs) ?: 0",
-                vec![Value::List(vec![])]
+                vec![Value::list(vec![])]
             ),
             "0"
         );
@@ -1038,10 +1321,10 @@ mod tests {
             "No(1, \"a\")"
         );
         assert_eq!(
-            Value::List(vec![int("1"), Value::None]).render(),
+            Value::list(vec![int("1"), Value::None]).render(),
             "[1, null]"
         );
-        assert_eq!(Value::List(vec![]).render(), "[]");
+        assert_eq!(Value::list(vec![]).render(), "[]");
     }
 
     #[test]

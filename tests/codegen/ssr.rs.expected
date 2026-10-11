@@ -52,32 +52,32 @@ pub mod app {
             ::std::result::Result::Ok(crate::bind_runtime::Node::Element {
                 tag: crate::bind_runtime::NodeTag::Ui,
                 args: ::std::vec![],
-                children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
+                children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
                     tag: crate::bind_runtime::NodeTag::Main,
                     args: ::std::vec![crate::bind_runtime::NodeArg::Str(::std::string::String::from("customer"))],
-                    children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
+                    children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Element {
                         tag: crate::bind_runtime::NodeTag::Heading,
                         args: ::std::vec![crate::bind_runtime::NodeArg::Int(crate::bind_runtime::Int::from_i64(1))],
-                        children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(bind_saudacao(ctx.clone(), v1_customer.name.clone()).await?)])),
+                        children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(bind_saudacao(ctx.clone(), v1_customer.name.clone()).await?)]),
                     }, crate::bind_runtime::Node::Element {
                         tag: crate::bind_runtime::NodeTag::Paragraph,
                         args: ::std::vec![],
-                        children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(v1_customer.email.clone())])),
+                        children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(v1_customer.email.clone())]),
                     }, crate::bind_runtime::Node::Element {
                         tag: crate::bind_runtime::NodeTag::Paragraph,
                         args: ::std::vec![crate::bind_runtime::NodeArg::Str(::std::string::String::from("balance"))],
-                        children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(crate::bind_runtime::display_decimal(&v1_customer.balance))])),
+                        children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(crate::bind_runtime::display_decimal(&v1_customer.balance))]),
                     }, crate::bind_runtime::Node::Element {
                         tag: crate::bind_runtime::NodeTag::Small,
                         args: ::std::vec![],
-                        children: ::std::sync::Arc::unwrap_or_clone(crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(match &v1_customer.id {
+                        children: crate::bind_runtime::list_of::<crate::bind_runtime::Node>(::std::vec![crate::bind_runtime::Node::Text(match &v1_customer.id {
                             CustomerId { value: p0 } => {
                                 let v2_value = *p0;
                                 crate::bind_runtime::display_text(&v2_value)?
                             }
-                        })])),
-                    }])),
-                }])),
+                        })]),
+                    }]),
+                }]),
             })
         })
     }

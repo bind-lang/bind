@@ -86,7 +86,9 @@ fn shortest_digits(value: f64) -> (String, i64) {
 /// mantissa's decimal digits are left-padded with zeros to more than `scale` digits and a `.`
 /// is put `scale` digits from the right (none when `scale` is 0); trailing zeros are kept
 /// (`1.50`, `0.00`). The sign flag is printed even for zero (`-0`, `-0.00`), as
-/// `rust_decimal` does for a negated zero.
+/// `rust_decimal` does for a negated zero. (The canonical definition, checked by the tests
+/// against `rust_decimal`; the runtimes implement it.)
+#[cfg(test)]
 pub fn display_decimal(negative: bool, mantissa: u128, scale: u32) -> String {
     let scale = scale as usize;
     let mut digits = mantissa.to_string();
@@ -107,6 +109,9 @@ pub fn display_decimal(negative: bool, mantissa: u128, scale: u32) -> String {
 /// `Display`, an ISO-8601 duration in seconds only. Zero is `P0D`; otherwise `P`, `T`, the
 /// whole seconds of the absolute value, a `.` and the nanoseconds without trailing zeros when
 /// they are not zero, and `S`; a negative duration is prefixed by `-` (`-PT0.5S`, `PT86400S`).
+///
+/// (The canonical definition, checked by the tests against chrono; the runtimes implement it.)
+#[cfg(test)]
 pub fn display_duration(seconds: i64, nanos: u32) -> String {
     let (sign, seconds, nanos) = if seconds < 0 {
         let seconds = i128::from(seconds);
@@ -129,19 +134,105 @@ pub fn display_duration(seconds: i64, nanos: u32) -> String {
     format!("{sign}PT{seconds}{fraction}S")
 }
 
+/// The order of two `Date`, `DateTime` or `Instant` values given by their canonical wire texts
+/// (what chrono's serde writes and the JS frontend holds): `[+-]YYYY…` or `YYYY`, `-MM-DD`,
+/// then for `DateTime`/`Instant` `THH:MM:SS`, an optional `.` and 1 to 9 fraction digits, and
+/// for `Instant` a final `Z`. The texts are read as (signed year, month, day, seconds of the
+/// day, nanoseconds: the fraction right-padded to 9 digits) and those are compared in order, as
+/// chrono orders the values; comparing the texts would not (`…T10:00:00Z` sorts after
+/// `…T10:00:00.500Z`, `-0001` after `0000`, `+10000` before `9999`). A leap second (`:60`) sorts
+/// after `:59` of the same minute, as in chrono. The JS runtime's `compareDate`,
+/// `compareDateTime` and `compareInstant` implement the same function (shared vectors:
+/// `runtime/vectors/temporal-order.json`). A text that does not have this form (never produced
+/// by either runtime) is ordered after every one that does, and two such texts by code point.
+pub fn compare_temporal(a: &str, b: &str) -> std::cmp::Ordering {
+    match (temporal_key(a), temporal_key(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.cmp(b),
+    }
+}
+
+/// (year, month, day, seconds of the day, nanoseconds) of a canonical temporal text.
+fn temporal_key(text: &str) -> Option<(i64, u32, u32, u32, u32)> {
+    let text = text.strip_suffix('Z').unwrap_or(text);
+    let (date, time) = match text.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
+    let (sign, unsigned) = match date.as_bytes().first() {
+        Some(b'+') => (1, &date[1..]),
+        Some(b'-') => (-1, &date[1..]),
+        _ => (1, date),
+    };
+    let mut parts = unsigned.split('-');
+    let (year, month, day) = (parts.next()?, parts.next()?, parts.next()?);
+    let digits = |part: &str, length: usize| {
+        part.len() == length && part.bytes().all(|b| b.is_ascii_digit())
+    };
+    if parts.next().is_some()
+        || year.len() < 4
+        || year.len() > 9
+        || !year.bytes().all(|b| b.is_ascii_digit())
+        || !digits(month, 2)
+        || !digits(day, 2)
+    {
+        return None;
+    }
+    let year = sign * year.parse::<i64>().ok()?;
+    let (month, day) = (month.parse().ok()?, day.parse().ok()?);
+    let Some(time) = time else {
+        return Some((year, month, day, 0, 0));
+    };
+    let (clock, fraction) = match time.split_once('.') {
+        Some((clock, fraction)) => (clock, fraction),
+        None => (time, ""),
+    };
+    let mut fields = clock.split(':');
+    let (hour, minute, second) = (fields.next()?, fields.next()?, fields.next()?);
+    if fields.next().is_some()
+        || !digits(hour, 2)
+        || !digits(minute, 2)
+        || !digits(second, 2)
+        || (time.contains('.') && fraction.is_empty())
+        || fraction.len() > 9
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let seconds = hour.parse::<u32>().ok()? * 3600
+        + minute.parse::<u32>().ok()? * 60
+        + second.parse::<u32>().ok()?;
+    let nanos = format!("{fraction:0<9}").parse().ok()?;
+    Some((year, month, day, seconds, nanos))
+}
+
 /// An argument of a UI node: a `String` or the decimal digits of an `Int`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiArg {
     Str(String),
+    /// (Only the tests build `UiTree`s with `Int` arguments; `core::eval` renders its own
+    /// values, see `UiView`.)
+    #[cfg(test)]
     Int(String),
 }
 
-/// A rendered UI value.
+/// A rendered UI value. Dropped iteratively (any depth).
 #[derive(Clone, Debug, PartialEq)]
 pub struct UiTree {
     pub node: UiNode,
     pub args: Vec<UiArg>,
     pub children: Vec<UiTree>,
+}
+
+impl Drop for UiTree {
+    fn drop(&mut self) {
+        let mut pending = std::mem::take(&mut self.children);
+        while let Some(mut tree) = pending.pop() {
+            pending.append(&mut tree.children);
+        }
+    }
 }
 
 /// The HTML of a UI value: the markup the former Elm client put in the DOM (pinned by
@@ -181,81 +272,161 @@ pub struct UiTree {
 /// Example: `UI { Section("hero", "top") { Heading(1) { Text("A & B") } } }` →
 /// `<section class="hero" id="top"><h1>A &amp; B</h1></section>`.
 pub fn render_html_value(tree: &UiTree) -> String {
+    render_html_limited(tree, usize::MAX).unwrap_or_default()
+}
+
+/// A UI value [`render_html_limited`] walks: [`UiTree`], and `core::eval`'s values.
+pub trait UiView: Sized {
+    /// The node (`Empty` for anything that is not a UI value).
+    fn ui_node(&self) -> UiNode;
+    /// Argument `index`, if present.
+    fn ui_arg(&self, index: usize) -> Option<UiArgView<'_>>;
+    fn ui_children(&self) -> &[Self];
+}
+
+/// An argument as [`render_html_limited`] reads it: a `String`, or an `Int`'s decimal digits.
+pub enum UiArgView<'a> {
+    Str(&'a str),
+    Int(std::borrow::Cow<'a, str>),
+}
+
+impl UiArgView<'_> {
+    fn text(&self) -> &str {
+        match self {
+            UiArgView::Str(text) => text,
+            UiArgView::Int(digits) => digits,
+        }
+    }
+}
+
+impl UiView for UiTree {
+    fn ui_node(&self) -> UiNode {
+        self.node
+    }
+
+    fn ui_arg(&self, index: usize) -> Option<UiArgView<'_>> {
+        self.args.get(index).map(|arg| match arg {
+            UiArg::Str(text) => UiArgView::Str(text),
+            #[cfg(test)]
+            UiArg::Int(digits) => UiArgView::Int(std::borrow::Cow::Borrowed(digits)),
+        })
+    }
+
+    fn ui_children(&self) -> &[UiTree] {
+        &self.children
+    }
+}
+
+/// [`render_html_value`] of any [`UiView`], or `None` once the output exceeds `limit` bytes or
+/// more than `limit` nodes have been visited (a tree whose subtrees are shared can be far
+/// larger than the memory it takes). Iterative, with an explicit stack: a tree of any depth
+/// renders without growing the call stack (the Rust and JS runtimes render the same way).
+pub fn render_html_limited<T: UiView>(root: &T, limit: usize) -> Option<String> {
+    enum Step<'a, T> {
+        Node(&'a T),
+        Close(&'static str),
+    }
     let mut out = String::new();
-    render_into(&mut out, tree);
-    out
-}
-
-fn render_into(out: &mut String, tree: &UiTree) {
-    let arg = |index: usize| tree.args.get(index).map(arg_text);
-    let mut attributes: Vec<(&str, String)> = Vec::new();
-    let mut push = |name: &'static str, value: Option<&str>| {
-        if let Some(value) = value {
-            attributes.push((name, value.to_string()));
+    let mut stack = vec![Step::Node(root)];
+    let mut visited: usize = 0;
+    while let Some(step) = stack.pop() {
+        visited += 1;
+        if visited > limit {
+            return None;
         }
-    };
-    let tag: String = match tree.node {
-        UiNode::Empty => return,
-        UiNode::Text => {
-            if let Some(text) = arg(0) {
-                out.push_str(&escape_html(text));
+        let tree = match step {
+            Step::Close(tag) => {
+                out.push_str("</");
+                out.push_str(tag);
+                out.push('>');
+                if out.len() > limit {
+                    return None;
+                }
+                continue;
             }
-            return;
-        }
-        UiNode::Ui => {
-            for child in &tree.children {
-                render_into(out, child);
+            Step::Node(tree) => tree,
+        };
+        let arg = |index: usize| tree.ui_arg(index);
+        let mut attributes: Vec<(&str, String)> = Vec::new();
+        let mut push = |name: &'static str, value: Option<&str>| {
+            if let Some(value) = value {
+                attributes.push((name, value.to_string()));
             }
-            return;
-        }
-        UiNode::Heading => {
-            let level = match tree.args.first() {
-                Some(UiArg::Int(digits)) => heading_level(digits),
-                _ => 1,
-            };
-            push("class", arg(1));
-            format!("h{level}")
-        }
-        UiNode::Link => {
-            let href = arg(0).map(|url| if is_allowed_href(url) { url } else { "" });
-            push("href", href);
-            push("class", arg(1));
-            push("target", arg(2));
-            if arg(2) == Some("_blank") {
-                push("rel", Some("noopener noreferrer"));
+        };
+        let tag: &'static str = match tree.ui_node() {
+            UiNode::Empty => continue,
+            UiNode::Text => {
+                if let Some(text) = arg(0) {
+                    out.push_str(&escape_html(text.text()));
+                }
+                if out.len() > limit {
+                    return None;
+                }
+                continue;
             }
-            push("aria-label", arg(3));
-            "a".into()
+            UiNode::Ui => {
+                for child in tree.ui_children().iter().rev() {
+                    stack.push(Step::Node(child));
+                }
+                continue;
+            }
+            UiNode::Heading => {
+                let level = match arg(0) {
+                    Some(UiArgView::Int(digits)) => heading_level(&digits),
+                    _ => 1,
+                };
+                push("class", arg(1).as_ref().map(UiArgView::text));
+                ["h1", "h2", "h3", "h4", "h5", "h6"][usize::from(level.clamp(1, 6)) - 1]
+            }
+            UiNode::Link => {
+                let href = arg(0);
+                let href = href.as_ref().map(|url| {
+                    if is_allowed_href(url.text()) {
+                        url.text()
+                    } else {
+                        ""
+                    }
+                });
+                push("href", href);
+                push("class", arg(1).as_ref().map(UiArgView::text));
+                let target = arg(2);
+                let target = target.as_ref().map(UiArgView::text);
+                push("target", target);
+                if target == Some("_blank") {
+                    push("rel", Some("noopener noreferrer"));
+                }
+                push("aria-label", arg(3).as_ref().map(UiArgView::text));
+                "a"
+            }
+            UiNode::Rule => {
+                push("class", arg(0).as_ref().map(UiArgView::text));
+                out.push_str("<hr");
+                write_attributes(&mut out, &attributes);
+                out.push('>');
+                if out.len() > limit {
+                    return None;
+                }
+                continue;
+            }
+            container => {
+                push("class", arg(0).as_ref().map(UiArgView::text));
+                push("id", arg(1).as_ref().map(UiArgView::text));
+                container_tag(container)
+            }
+        };
+        out.push('<');
+        out.push_str(tag);
+        write_attributes(&mut out, &attributes);
+        out.push('>');
+        if out.len() > limit {
+            return None;
         }
-        UiNode::Rule => {
-            push("class", arg(0));
-            out.push_str("<hr");
-            write_attributes(out, &attributes);
-            out.push('>');
-            return;
+        stack.push(Step::Close(tag));
+        for child in tree.ui_children().iter().rev() {
+            stack.push(Step::Node(child));
         }
-        container => {
-            push("class", arg(0));
-            push("id", arg(1));
-            container_tag(container).into()
-        }
-    };
-    out.push('<');
-    out.push_str(&tag);
-    write_attributes(out, &attributes);
-    out.push('>');
-    for child in &tree.children {
-        render_into(out, child);
     }
-    out.push_str("</");
-    out.push_str(&tag);
-    out.push('>');
-}
-
-fn arg_text(arg: &UiArg) -> &str {
-    match arg {
-        UiArg::Str(text) | UiArg::Int(text) => text,
-    }
+    Some(out)
 }
 
 fn write_attributes(out: &mut String, attributes: &[(&str, String)]) {
@@ -592,6 +763,29 @@ mod tests {
             render_html_value(&n(UiNode::Rule, vec![s("sep")], vec![text("ignored")])),
             "<hr class=\"sep\">"
         );
+    }
+
+    #[test]
+    fn deep_trees_render_without_growing_the_stack() {
+        let depth = 200_000;
+        let mut tree = text("x");
+        for _ in 0..depth {
+            tree = n(UiNode::Div, vec![], vec![tree]);
+        }
+        let html = render_html_value(&tree);
+        assert_eq!(html.len(), depth * "<div></div>".len() + 1);
+        assert!(html.starts_with("<div><div>") && html.ends_with("</div></div>"));
+        assert_eq!(render_html_limited(&tree, 1000), None);
+        // A shared-looking fragment of empty nodes is bounded by the nodes it visits.
+        let wide = n(
+            UiNode::Ui,
+            vec![],
+            (0..5000)
+                .map(|_| n(UiNode::Empty, vec![], vec![]))
+                .collect(),
+        );
+        assert_eq!(render_html_limited(&wide, 1000), None);
+        assert_eq!(render_html_limited(&wide, 10_000).as_deref(), Some(""));
     }
 
     #[test]
@@ -1014,5 +1208,118 @@ mod tests {
                 case.get("bits").str()
             );
         }
+    }
+
+    /// (type, a, b) pairs of canonical texts whose order differs from their text order or sits
+    /// at a boundary (fractions, leap seconds, extended and negative years).
+    fn temporal_cases() -> Vec<(&'static str, &'static str, &'static str)> {
+        let mut cases = Vec::new();
+        for (a, b) in [
+            ("2026-01-01T10:00:00Z", "2026-01-01T10:00:00.500Z"),
+            ("2026-01-01T10:00:00.500Z", "2026-01-01T10:00:00.500001Z"),
+            (
+                "2026-01-01T10:00:00.500001Z",
+                "2026-01-01T10:00:00.500000001Z",
+            ),
+            ("2026-01-01T10:00:00.999999999Z", "2026-01-01T10:00:01Z"),
+            ("2026-01-01T10:00:00.100Z", "2026-01-01T10:00:00.099999Z"),
+            ("2026-01-01T10:00:00Z", "2026-01-01T10:00:00Z"),
+            ("2026-01-01T10:00:00.250Z", "2026-01-01T10:00:00.250Z"),
+            ("2026-01-01T09:59:59.999Z", "2026-01-01T10:00:00Z"),
+            ("2025-12-31T23:59:59.999999999Z", "2026-01-01T00:00:00Z"),
+            ("2016-12-31T23:59:60Z", "2016-12-31T23:59:59.999Z"),
+            ("2016-12-31T23:59:60.500Z", "2017-01-01T00:00:00Z"),
+            ("2016-12-31T23:59:60Z", "2016-12-31T23:59:60.500Z"),
+            ("-0001-12-31T23:59:59Z", "0000-01-01T00:00:00Z"),
+            ("-0002-01-01T00:00:00Z", "-0001-01-01T00:00:00Z"),
+            ("-0001-06-01T00:00:00Z", "-9999-01-01T00:00:00Z"),
+            ("-10000-01-01T00:00:00Z", "-9999-01-01T00:00:00Z"),
+            ("+10000-01-01T00:00:00Z", "9999-12-31T23:59:59.999999999Z"),
+            ("+100000-01-01T00:00:00Z", "+20000-01-01T00:00:00Z"),
+            ("+10000-01-01T00:00:00.500Z", "+10000-01-01T00:00:00Z"),
+        ] {
+            cases.push(("Instant", a, b));
+        }
+        for (a, b) in [
+            ("2026-01-01T10:00:00", "2026-01-01T10:00:00.500"),
+            ("2026-01-01T10:00:00.500", "2026-01-01T10:00:00.500001"),
+            (
+                "2026-01-01T10:00:00.999999",
+                "2026-01-01T10:00:00.999999001",
+            ),
+            ("2026-01-01T10:00:00", "2026-01-01T10:00:00"),
+            ("2026-03-01T00:00:00", "2026-02-28T23:59:59.999"),
+            ("2016-12-31T23:59:60", "2016-12-31T23:59:59.999999999"),
+            ("-0002-01-01T00:00:00", "-0001-01-01T00:00:00"),
+            ("+10000-01-01T00:00:00", "9999-12-31T23:59:59"),
+            ("+10000-01-01T00:00:00", "+200000-01-01T00:00:00"),
+        ] {
+            cases.push(("DateTime", a, b));
+        }
+        for (a, b) in [
+            ("2026-01-02", "2026-01-10"),
+            ("2026-01-10", "2026-01-10"),
+            ("2026-12-31", "2027-01-01"),
+            ("-0001-01-01", "0000-01-01"),
+            ("-0005-01-01", "-0001-12-31"),
+            ("-0001-01-01", "-9999-12-31"),
+            ("+10000-01-01", "9999-12-31"),
+            ("+10000-01-01", "+100000-01-01"),
+            ("+20000-01-01", "+100000-01-01"),
+        ] {
+            cases.push(("Date", a, b));
+        }
+        cases
+    }
+
+    fn order_text(order: std::cmp::Ordering) -> &'static str {
+        match order {
+            std::cmp::Ordering::Less => "<",
+            std::cmp::Ordering::Equal => "=",
+            std::cmp::Ordering::Greater => ">",
+        }
+    }
+
+    #[test]
+    fn temporal_vectors_file() {
+        let path = vector_path("temporal-order.json");
+        let entries: Vec<String> = temporal_cases()
+            .iter()
+            .map(|(ty, a, b)| {
+                format!(
+                    "  {{\"type\":{},\"a\":{},\"b\":{},\"order\":\"{}\"}}",
+                    json_string(ty),
+                    json_string(a),
+                    json_string(b),
+                    order_text(compare_temporal(a, b))
+                )
+            })
+            .collect();
+        let expected = format!("[\n{}\n]\n", entries.join(",\n"));
+        if bless() {
+            std::fs::write(&path, &expected).expect("write");
+        }
+        let file = std::fs::read_to_string(&path).expect("vectors file");
+        assert_eq!(file, expected, "stale file: BIND_BLESS=1");
+        for case in parse_json(&file).array() {
+            let (a, b) = (case.get("a").str(), case.get("b").str());
+            assert_eq!(order_text(compare_temporal(a, b)), case.get("order").str());
+            // Antisymmetric, and the text order is wrong on some of the cases.
+            assert_eq!(compare_temporal(b, a), compare_temporal(a, b).reverse());
+        }
+        let text_order_wrong = temporal_cases()
+            .iter()
+            .filter(|(_, a, b)| a.cmp(b) != compare_temporal(a, b))
+            .count();
+        assert!(text_order_wrong >= 10, "{text_order_wrong}");
+        // Not a temporal text: after every temporal text.
+        assert_eq!(
+            compare_temporal("x", "2026-01-01"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_temporal("2026-01-01T10:00:00.Z", "a"),
+            "2026-01-01T10:00:00.Z".cmp("a")
+        );
     }
 }

@@ -1,6 +1,8 @@
 // The JS side of the three-way differential test (src/backend/js/differential.rs):
 // `node differential.mjs`, next to app.js, bind-runtime.js, dom.mjs and programs.json
-// ([[name, result type], ...]). Runs each exported `p<i>(ctx)` in order and prints
+// ([[name, result type], ...], or [line, result type, function, [arguments]] for a call of an
+// exported function on arguments, the temporal calls whose arguments are wire texts). Runs
+// each exported `p<i>(ctx)` (or `function(ctx, ...arguments)`) in order and prints
 // `p<i>=<render>` in the canonical form of `Value::render` in bindc's `core::eval`, made
 // line-safe (`\` -> `\\`, LF -> `\n`, CR -> `\r`):
 //   Int -> decimal; Boolean -> true/false; String -> JSON string (only `"`, `\`, LF, CR, tab
@@ -65,10 +67,10 @@ function lineSafe(text) {
 
 const programs = JSON.parse(readFileSync("programs.json", "utf8"));
 const lines = [];
-for (const [name, type] of programs) {
+for (const [name, type, callee, args] of programs) {
   let line;
   try {
-    const value = await app[name](rt.newCtx());
+    const value = await app[callee ?? name](rt.newCtx(), ...(args ?? []));
     line = type === "Ui" ? html(value) : show(value);
   } catch (error) {
     line = error instanceof rt.BindError ? `!${error.kind}` : `!Exception(${error?.stack ?? error})`;

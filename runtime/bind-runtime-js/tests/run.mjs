@@ -229,6 +229,23 @@ test("jsNumberToString matches numbers.json", () => {
   for (const { bits, text } of cases) eq(rt.jsNumberToString(fromF64Bits(bits)), text, bits);
 });
 
+// ---- Date / DateTime / Instant order (runtime/vectors/temporal-order.json) ----
+
+test("compareDate / compareDateTime / compareInstant match temporal-order.json", () => {
+  const cases = readJson("../../vectors/temporal-order.json");
+  assert(cases.length >= 30, "temporal vectors");
+  const compare = { Date: rt.compareDate, DateTime: rt.compareDateTime, Instant: rt.compareInstant };
+  const symbol = (order) => (order < 0 ? "<" : order > 0 ? ">" : "=");
+  for (const { type, a, b, order } of cases) {
+    eq(symbol(compare[type](a, b)), order, `${type} ${a} ${b}`);
+    eq(symbol(compare[type](b, a)), symbol(-compare[type](a, b)), `${type} ${b} ${a}`);
+  }
+  // Text order would be wrong: "Z" sorts after "." and "+" before digits.
+  eq(rt.compareInstant("2026-01-01T10:00:00Z", "2026-01-01T10:00:00.500Z"), -1);
+  eq(rt.compareDate("+10000-01-01", "9999-12-31"), 1);
+  eq(rt.compareDate("x", "2026-01-01"), 1, "not a temporal text sorts last");
+});
+
 // ---- enter / recursion limit ----
 
 test("enter: 10000 nested entries pass, the 10001st is RecursionLimit", async () => {
@@ -682,6 +699,55 @@ test("errorScreen shows a failure as the SSR shows the same AppError", () => {
   eq(screen(new rt.BindError("Remote", rt.TEXTS.requestFailed)), `500 ${body("Something went wrong", "Request failed")}`);
   // Anything else is a compiler bug: the internal error screen, no details.
   eq(screen(new TypeError("secret detail")), `500 ${body("Something went wrong", "internal error")}`);
+});
+
+// ---- Deep values (no RangeError at any depth) ----
+
+test("render, serialize and mount a 200000-level tree", () => {
+  const depth = 200000;
+  let tree = rt.text("x");
+  for (let i = 0; i < depth; i++) tree = rt.node("Div", [], [tree]);
+  const document = createDocument();
+  const nodes = rt.render(rt.node("UI", [], [tree, rt.EMPTY, rt.text("<y>")]), document);
+  eq(nodes.length, 2, "a fragment's children");
+  const html = nodes.map(serialize).join("");
+  eq(html.length, depth * "<div></div>".length + 1 + "&lt;y&gt;".length);
+  assert(html.startsWith("<div><div>") && html.endsWith("</div></div>&lt;y&gt;"), "html");
+  const container = document.createElement("div");
+  rt.mount(container, nodes);
+  eq(container.childNodes.length, 2);
+  rt.mount(container, rt.render(rt.text("z"), document));
+  eq(serialize(container), "<div>z</div>");
+  // A fragment of 300000 top-level nodes mounts without spreading them as arguments.
+  const wide = rt.render(rt.node("UI", [], Array.from({ length: 300000 }, () => rt.text("a"))), document);
+  rt.mount(container, wide);
+  eq(container.childNodes.length, 300000);
+});
+
+test("equals and compare on values nested 200000 deep", () => {
+  const nest = (leaf) => {
+    let value = rt.variant("Folha", [["u_v", leaf]]);
+    for (let i = 0; i < 200000; i++) value = rt.variant("No", [["u_d", value]]);
+    return value;
+  };
+  eq(rt.equals(nest(1n), nest(1n)), true);
+  eq(rt.equals(nest(1n), nest(2n)), false);
+  let list = rt.listOf(1n);
+  for (let i = 0; i < 200000; i++) list = rt.listOf(list);
+  let other = rt.listOf(2n);
+  for (let i = 0; i < 200000; i++) other = rt.listOf(other);
+  eq(rt.compare(list, other), -1);
+  eq(rt.compare(other, list), 1);
+  eq(rt.compare(list, list), 0);
+  // Unchanged results on small values.
+  eq(rt.compare(rt.listOf(1n, 2n), rt.listOf(1n)), 1);
+  eq(rt.compare(rt.listOf(), rt.listOf(0n)), -1);
+  eq(rt.compare(null, rt.some(1n)), -1);
+  eq(rt.compare(rt.some(2n), rt.some(1n)), 1);
+  assert(Number.isNaN(rt.compare(rt.listOf(NaN), rt.listOf(1))), "unordered");
+  eq(rt.equals(rt.record([["a", NaN]]), rt.record([["a", NaN]])), false);
+  eq(rt.equals(rt.listOf(rt.some(null)), rt.listOf(rt.some(null))), true);
+  eq(rt.equals(rt.listOf(rt.some(null)), rt.listOf(null)), false);
 });
 
 // ---- Runner ----

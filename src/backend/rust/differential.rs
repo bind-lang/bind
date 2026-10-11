@@ -1556,10 +1556,13 @@ fun desenho(f: Forma): Ui = UI {
         Vazia -> Text(1e21)
     }
 }
+
+fun profundo(n: Int): Ui = if (n == 0) UI { Text(\"fim\") } else UI { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { profundo(n - 1) } } } } } } } } } } } } } } } } } } } } }
 ";
 
 /// The three-way test's fixed programs: the recursion limit (in plain code and inside a UI
-/// tree), an SSR-style component, and non-finite `Double`/`Float` results.
+/// tree), an SSR-style component, non-finite `Double`/`Float` results and a tree about
+/// 200,000 elements deep.
 const WEB_FIXED: &[(Ty, &str)] = &[
     (Ty::Int, "fun {name}(): Int = conta(20000, 0)"),
     (Ty::Int, "fun {name}(): Int = conta(9998, 0)"),
@@ -1601,6 +1604,9 @@ const WEB_FIXED: &[(Ty, &str)] = &[
         Ty::Ui,
         "fun {name}(): Ui = UI { Text(0.0 / 0.0); Text(1e308 * 10.0); Text(-(1e308 * 10.0)); Text(-0.0); Text(3.4e38f * 10.0f); Text(0.0f / 0.0f) }",
     ),
+    // A tree 199,800 elements deep (9,990 nested calls of 20 nested `Div`s): every renderer
+    // and the drop of the tree are iterative.
+    (Ty::Ui, "fun {name}(): Ui = profundo(9990)"),
 ];
 
 /// The three-way test's programs (`PROGRAMS` random ones, then [`WEB_FIXED`]) and how many
@@ -1618,6 +1624,158 @@ pub(crate) fn web_programs() -> (Programs, BTreeMap<&'static str, usize>) {
         out.push((name, *ty, source));
     }
     (out, generator.counts)
+}
+
+/// The three-way test's functions of `Date`, `DateTime` and `Instant` parameters (Bind has no
+/// literal of these types, so they are called with arguments, [`temporal_calls`]): every
+/// comparison operator, and the values shown in a UI tree with the result of `<`.
+pub(crate) const TEMPORAL_PRELUDE: &str = "
+fun ordemDate(a: Date, b: Date): List<Boolean> = listOf(a < b, a <= b, a > b, a >= b, a == b, a != b)
+fun ordemDateTime(a: DateTime, b: DateTime): List<Boolean> = listOf(a < b, a <= b, a > b, a >= b, a == b, a != b)
+fun ordemInstant(a: Instant, b: Instant): List<Boolean> = listOf(a < b, a <= b, a > b, a >= b, a == b, a != b)
+fun telaDate(a: Date, b: Date): Ui = UI { Span { Text(a); if (a < b) Text(\" < \") else Text(\" >= \"); Text(b) } }
+fun telaDateTime(a: DateTime, b: DateTime): Ui = UI { Span { Text(a); if (a >= b) Text(\" >= \") else Text(\" < \"); Text(b) } }
+fun telaInstant(a: Instant, b: Instant): Ui = UI { Span { Text(a); if (a > b) Text(\" > \") else Text(\" <= \"); Text(b) } }
+";
+
+/// A call of a [`TEMPORAL_PRELUDE`] function on two canonical wire texts, printed as the line
+/// `line` (`t<k>=<render>`).
+#[derive(Clone, Debug)]
+pub(crate) struct TemporalCall {
+    pub line: String,
+    pub function: String,
+    /// `List` (the comparisons) or `Ui`.
+    pub result: Ty,
+    pub a: String,
+    pub b: String,
+}
+
+/// The canonical wire text (chrono's serde) of a date with signed `year` (`YYYY` for
+/// 0000..=9999, otherwise sign and at least 4 digits), then for a date-time the time of day
+/// `seconds` (`:60` for a leap second) and the fraction of `nanos` in 3, 6 or 9 digits (none
+/// when zero), then `Z` for an instant.
+fn temporal_text(ty: &str, year: i64, month: u32, day: u32, seconds: u32, nanos: u32) -> String {
+    let mut text = if (0..=9999).contains(&year) {
+        format!("{year:04}-{month:02}-{day:02}")
+    } else {
+        format!("{year:+05}-{month:02}-{day:02}")
+    };
+    if ty == "Date" {
+        return text;
+    }
+    let (hour, minute, second) = if seconds >= 86_400 {
+        (23, 59, 60)
+    } else {
+        (seconds / 3600, seconds / 60 % 60, seconds % 60)
+    };
+    let _ = write!(text, "T{hour:02}:{minute:02}:{second:02}");
+    if nanos != 0 {
+        if nanos.is_multiple_of(1_000_000) {
+            let _ = write!(text, ".{:03}", nanos / 1_000_000);
+        } else if nanos.is_multiple_of(1000) {
+            let _ = write!(text, ".{:06}", nanos / 1000);
+        } else {
+            let _ = write!(text, ".{nanos:09}");
+        }
+    }
+    if ty == "Instant" {
+        text.push('Z');
+    }
+    text
+}
+
+/// The three-way test's temporal calls: every pair of `runtime/vectors/temporal-order.json`,
+/// then random pairs of each type (extended and negative years, fractions of 0, 3, 6 or 9
+/// digits, leap seconds; `b` often equal to `a` or one field away from it), each pair through
+/// `ordem<T>` and `tela<T>`.
+pub(crate) fn temporal_calls() -> Vec<TemporalCall> {
+    let mut pairs: Vec<(String, String, String)> = Vec::new();
+    let vectors = include_str!("../../../runtime/vectors/temporal-order.json");
+    for line in vectors.lines().filter(|line| line.contains("\"type\"")) {
+        // `{"type":"T","a":"…","b":"…","order":"…"}`: the texts hold no quotes or escapes.
+        let fields: Vec<&str> = line.split('"').collect();
+        pairs.push((
+            fields[3].to_string(),
+            fields[7].to_string(),
+            fields[11].to_string(),
+        ));
+    }
+    let mut rng = Rng(0x00B1_4D00_7E4F_2026);
+    let years: &[i64] = &[
+        2026, 2026, 1970, 0, -1, -2, -9999, -10000, 9999, 10000, 12345, 262_142,
+    ];
+    for ty in ["Date", "DateTime", "Instant"] {
+        for _ in 0..60 {
+            let random = |rng: &mut Rng| {
+                let nanos = match rng.below(5) {
+                    0 => 0,
+                    1 => rng.below(1000) as u32 * 1_000_000,
+                    2 => rng.below(1_000_000) as u32 * 1000,
+                    3 => rng.below(1_000_000_000) as u32,
+                    _ => 500_000_000,
+                };
+                let leap = rng.chance(5);
+                (
+                    *rng.pick(years),
+                    1 + rng.below(12) as u32,
+                    1 + rng.below(28) as u32,
+                    if leap {
+                        86_400
+                    } else {
+                        rng.below(86_400) as u32
+                    },
+                    nanos,
+                )
+            };
+            let a = random(&mut rng);
+            let mut b = a;
+            match rng.below(7) {
+                0 => {}
+                1 => b.4 = random(&mut rng).4,
+                2 => b.3 = random(&mut rng).3,
+                3 => b.0 = random(&mut rng).0,
+                4 => b.2 = random(&mut rng).2,
+                5 => b.0 = -a.0,
+                _ => b = random(&mut rng),
+            }
+            let text = |(year, month, day, seconds, nanos): (i64, u32, u32, u32, u32)| {
+                temporal_text(ty, year, month, day, seconds, nanos)
+            };
+            pairs.push((ty.to_string(), text(a), text(b)));
+        }
+    }
+    let mut calls = Vec::new();
+    for (ty, a, b) in pairs {
+        for (prefix, result) in [("ordem", Ty::List), ("tela", Ty::Ui)] {
+            calls.push(TemporalCall {
+                line: format!("t{}", calls.len()),
+                function: format!("{prefix}{ty}"),
+                result,
+                a: a.clone(),
+                b: b.clone(),
+            });
+        }
+    }
+    calls
+}
+
+/// `t<k>=<render>` for every temporal call, by the reference evaluator (the values are their
+/// wire texts).
+pub(crate) fn temporal_expected(program: &CoreProgram, calls: &[TemporalCall]) -> Vec<String> {
+    calls
+        .iter()
+        .map(|call| {
+            let args = vec![
+                crate::core::eval::Value::Str(call.a.as_str().into()),
+                crate::core::eval::Value::Str(call.b.as_str().into()),
+            ];
+            let rendered = match eval_function(program, &call.function, args) {
+                Ok(value) => value.render(),
+                Err(error) => panic!("{}: {error:?}", call.line),
+            };
+            format!("{}={rendered}", call.line)
+        })
+        .collect()
 }
 
 fn source(programs: &[(String, Ty, String)]) -> String {
@@ -1694,13 +1852,16 @@ pub(crate) fn expected(program: &CoreProgram, programs: &[(String, Ty, String)])
 
 /// `src/main.rs` of the differential crate.
 fn main_rs(programs: &[(String, Ty, String)]) -> String {
-    main_rs_with(programs, "bind_differential", "", "line")
+    main_rs_with(programs, &[], "bind_differential", "", "line")
 }
 
 /// `src/main.rs` of a differential crate named `krate`: the renderer plus `extra` items, and
 /// `encode`, the body of `fn encode(line: String) -> String` (what is printed after `p<i>=`).
+/// The `calls` (see [`TemporalCall`]) follow the programs, their arguments read from their
+/// wire texts.
 pub(crate) fn main_rs_with(
     programs: &[(String, Ty, String)],
+    calls: &[TemporalCall],
     krate: &str,
     extra: &str,
     encode: &str,
@@ -1710,6 +1871,13 @@ pub(crate) fn main_rs_with(
         let _ = writeln!(
             entries,
             "        (\"{name}\", entry(programs::bind_{name}(Ctx::pure()))),"
+        );
+    }
+    for call in calls {
+        let _ = writeln!(
+            entries,
+            "        (\"{}\", entry(programs::bind_{}(Ctx::pure(), wire({:?}), wire({:?})))),",
+            call.line, call.function, call.a, call.b
         );
     }
     MAIN_TEMPLATE
@@ -1836,6 +2004,18 @@ fn variant(error: &AppError) -> &'static str {
 
 type Rendered = Pin<Box<dyn Future<Output = Result<String, AppError>> + Send>>;
 
+/// A value read from its JSON string `text`, as the server reads a request.
+#[allow(dead_code)]
+fn wire<T: serde::de::DeserializeOwned>(text: &str) -> T {
+    match serde_json::from_value(serde_json::Value::String(text.to_string())) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("cannot read {text:?}: {error}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn entry<T: Render + Send + 'static>(future: BoxFuture<T>) -> Rendered {
     Box::pin(async move { future.await.map(|value| value.render()) })
 }
@@ -1953,6 +2133,12 @@ fn web_generator_is_deterministic_and_well_typed() {
         lines[PROGRAMS + 3],
         format!("p{}=!RecursionLimit", PROGRAMS + 3)
     );
+    // The deep tree: 199,800 nested `<div>`s around `fim`.
+    let deep = lines.last().unwrap();
+    assert_eq!(
+        deep.split_once('=').unwrap().1,
+        format!("{}fim{}", "<div>".repeat(199_800), "</div>".repeat(199_800))
+    );
     // NaN and Infinity are frequent random results, not only fixed ones.
     let numbers: Vec<&String> = lines[..PROGRAMS]
         .iter()
@@ -1968,6 +2154,47 @@ fn web_generator_is_deterministic_and_well_typed() {
     eprintln!("random Double/Float results: {nan} NaN, {infinite} ±Infinity");
     assert!(nan >= 20, "{nan} NaN results");
     assert!(infinite >= 20, "{infinite} Infinity results");
+}
+
+/// The temporal calls compile with the three-way test's programs and the evaluator orders the
+/// vector pairs as the vectors say; the random pairs include many whose text order is wrong.
+#[test]
+fn temporal_calls_are_well_typed_and_ordered_by_value() {
+    let calls = temporal_calls();
+    let program = compile(&source_with(TEMPORAL_PRELUDE, &[]));
+    let lines = temporal_expected(&program, &calls);
+    assert_eq!(lines.len(), calls.len());
+    let vectors = include_str!("../../../runtime/vectors/temporal-order.json");
+    let orders: Vec<&str> = vectors
+        .lines()
+        .filter(|line| line.contains("\"order\""))
+        .map(|line| line.split('"').nth(15).unwrap())
+        .collect();
+    for (index, order) in orders.iter().enumerate() {
+        let comparisons = match *order {
+            "<" => "[true, true, false, false, false, true]",
+            "=" => "[false, true, false, true, true, false]",
+            _ => "[false, false, true, true, false, true]",
+        };
+        assert_eq!(lines[2 * index], format!("t{}={comparisons}", 2 * index));
+        assert!(lines[2 * index + 1].starts_with(&format!("t{}=<span>", 2 * index + 1)));
+    }
+    let wrong_by_text = calls
+        .iter()
+        .zip(&lines)
+        .filter(|(call, line)| {
+            call.result == Ty::List
+                && line.ends_with(if call.a < call.b {
+                    "=[false, false, true, true, false, true]"
+                } else {
+                    "=[true, true, false, false, false, true]"
+                })
+        })
+        .count();
+    assert!(wrong_by_text >= 20, "{wrong_by_text}");
+    assert!(calls.iter().any(|call| call.a.contains(":60")));
+    assert!(calls.iter().any(|call| call.a.starts_with('+')));
+    assert!(calls.iter().any(|call| call.a.starts_with('-')));
 }
 
 /// Constructs every three-way run must contain.

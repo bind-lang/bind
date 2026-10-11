@@ -569,16 +569,39 @@ pub enum NodeArg {
     Int(Int),
 }
 
-/// A UI value.
+/// A UI value. Children are shared: a subtree used twice (a local shown twice) is one
+/// subtree, never copied. Dropped iteratively: a tree of any depth is freed without growing
+/// the call stack.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Node {
     Element {
         tag: NodeTag,
         args: Vec<NodeArg>,
-        children: Vec<Node>,
+        children: Arc<Vec<Node>>,
     },
     Text(String),
     Empty,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        // Only the last owner of a child list frees it; the children's own lists are moved to
+        // `pending` (when this was their last owner too) before the children drop.
+        let Node::Element { children, .. } = self else {
+            return;
+        };
+        let Some(items) = Arc::get_mut(children) else {
+            return;
+        };
+        let mut pending: Vec<Node> = std::mem::take(items);
+        while let Some(mut node) = pending.pop() {
+            if let Node::Element { children, .. } = &mut node
+                && let Some(items) = Arc::get_mut(children)
+            {
+                pending.append(items);
+            }
+        }
+    }
 }
 
 /// HTML escaping of text and attribute values: `&`, `<`, `>`, `"` and `'`.
@@ -600,10 +623,104 @@ pub fn escape_html(text: &str) -> String {
 /// The HTML of a UI value, byte for byte that of `render_html_value` in `bindc`: the `UI`
 /// root is a fragment, `Text` an escaped text node, `Empty` nothing; arguments are used
 /// leniently (heading level clamped to 1..=6, hrefs with a scheme other than http/https/mailto/tel emptied, extra arguments
-/// ignored). The page shell (`page_html`) adds the `bind-site` wrapper.
+/// ignored). The page shell (`page_html`) adds the `bind-site` wrapper. Iterative, with an
+/// explicit stack: a tree of any depth renders without growing the call stack.
 pub fn render_html(node: &Node) -> String {
+    enum Step<'a> {
+        Node(&'a Node),
+        Close(&'static str),
+    }
     let mut out = String::new();
-    render_into(&mut out, node);
+    let mut stack = vec![Step::Node(node)];
+    while let Some(step) = stack.pop() {
+        let (tag, args, children) = match step {
+            Step::Close(element) => {
+                out.push_str("</");
+                out.push_str(element);
+                out.push('>');
+                continue;
+            }
+            Step::Node(Node::Empty) => continue,
+            Step::Node(Node::Text(text)) => {
+                out.push_str(&escape_html(text));
+                continue;
+            }
+            Step::Node(Node::Element {
+                tag,
+                args,
+                children,
+            }) => (*tag, args, children),
+        };
+        let arg = |index: usize| args.get(index).map(arg_text);
+        let mut attributes: Vec<(&str, String)> = Vec::new();
+        let mut push = |name: &'static str, value: Option<String>| {
+            if let Some(value) = value {
+                attributes.push((name, value));
+            }
+        };
+        let element: &'static str = match tag {
+            NodeTag::Ui => {
+                for child in children.iter().rev() {
+                    stack.push(Step::Node(child));
+                }
+                continue;
+            }
+            NodeTag::Heading => {
+                let level = match args.first() {
+                    Some(NodeArg::Int(value)) => heading_level(value),
+                    _ => 1,
+                };
+                push("class", arg(1));
+                match level {
+                    1 => "h1",
+                    2 => "h2",
+                    3 => "h3",
+                    4 => "h4",
+                    5 => "h5",
+                    _ => "h6",
+                }
+            }
+            NodeTag::Link => {
+                let href = arg(0).map(|url| {
+                    if !is_allowed_href(&url) {
+                        String::new()
+                    } else {
+                        url
+                    }
+                });
+                push("href", href);
+                push("class", arg(1));
+                let target = arg(2);
+                let blank = target.as_deref() == Some("_blank");
+                push("target", target);
+                if blank {
+                    push("rel", Some("noopener noreferrer".to_string()));
+                }
+                push("aria-label", arg(3));
+                "a"
+            }
+            NodeTag::Rule => {
+                push("class", arg(0));
+                out.push_str("<hr");
+                write_attributes(&mut out, &attributes);
+                out.push('>');
+                continue;
+            }
+            container => {
+                push("class", arg(0));
+                push("id", arg(1));
+                container.container_element().unwrap_or("div")
+            }
+        };
+        out.push('<');
+        out.push_str(element);
+        write_attributes(&mut out, &attributes);
+        out.push('>');
+        stack.push(Step::Close(element));
+        for child in children.iter().rev() {
+            stack.push(Step::Node(child));
+        }
+    }
     out
 }
 
@@ -612,85 +729,6 @@ fn arg_text(arg: &NodeArg) -> String {
         NodeArg::Str(text) => text.clone(),
         NodeArg::Int(value) => value.to_string(),
     }
-}
-
-fn render_into(out: &mut String, node: &Node) {
-    let (tag, args, children) = match node {
-        Node::Empty => return,
-        Node::Text(text) => {
-            out.push_str(&escape_html(text));
-            return;
-        }
-        Node::Element {
-            tag,
-            args,
-            children,
-        } => (*tag, args, children),
-    };
-    let arg = |index: usize| args.get(index).map(arg_text);
-    let mut attributes: Vec<(&str, String)> = Vec::new();
-    let mut push = |name: &'static str, value: Option<String>| {
-        if let Some(value) = value {
-            attributes.push((name, value));
-        }
-    };
-    let element: String = match tag {
-        NodeTag::Ui => {
-            for child in children {
-                render_into(out, child);
-            }
-            return;
-        }
-        NodeTag::Heading => {
-            let level = match args.first() {
-                Some(NodeArg::Int(value)) => heading_level(value),
-                _ => 1,
-            };
-            push("class", arg(1));
-            format!("h{level}")
-        }
-        NodeTag::Link => {
-            let href = arg(0).map(|url| {
-                if !is_allowed_href(&url) {
-                    String::new()
-                } else {
-                    url
-                }
-            });
-            push("href", href);
-            push("class", arg(1));
-            let target = arg(2);
-            let blank = target.as_deref() == Some("_blank");
-            push("target", target);
-            if blank {
-                push("rel", Some("noopener noreferrer".to_string()));
-            }
-            push("aria-label", arg(3));
-            "a".to_string()
-        }
-        NodeTag::Rule => {
-            push("class", arg(0));
-            out.push_str("<hr");
-            write_attributes(out, &attributes);
-            out.push('>');
-            return;
-        }
-        container => {
-            push("class", arg(0));
-            push("id", arg(1));
-            container.container_element().unwrap_or("div").to_string()
-        }
-    };
-    out.push('<');
-    out.push_str(&element);
-    write_attributes(out, &attributes);
-    out.push('>');
-    for child in children {
-        render_into(out, child);
-    }
-    out.push_str("</");
-    out.push_str(&element);
-    out.push('>');
 }
 
 fn write_attributes(out: &mut String, attributes: &[(&str, String)]) {
@@ -1072,7 +1110,7 @@ mod tests {
                 NodeArg::Str("a\"b".into()),
                 NodeArg::Str("_blank".into()),
             ],
-            children: vec![Node::Text("x".into())],
+            children: Arc::new(vec![Node::Text("x".into())]),
         };
         assert_eq!(
             render_html(&link),
@@ -1081,7 +1119,7 @@ mod tests {
         let heading = |level: Option<NodeArg>| Node::Element {
             tag: NodeTag::Heading,
             args: level.into_iter().collect(),
-            children: vec![],
+            children: Arc::new(vec![]),
         };
         assert_eq!(
             render_html(&heading(Some(NodeArg::Int(int("0"))))),

@@ -89,16 +89,31 @@ class Element {
   insertAdjacentHTML() { htmlApi(this.ownerDocument, "insertAdjacentHTML"); }
 }
 
-export function serialize(node) {
-  if (node instanceof TextNode) return escapeHtml(node.data);
-  let out = `<${node.tagName}`;
-  for (const [name, value] of node.attributes) out += ` ${name}="${escapeHtml(value)}"`;
-  out += ">";
-  if (VOID.has(node.tagName)) {
-    if (node.childNodes.length > 0) throw new Error(`<${node.tagName}> with children`);
-    return out;
+/** The HTML of `root`, iteratively (a tree of any depth serializes without a RangeError). */
+export function serialize(root) {
+  const parts = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (typeof node === "string") {
+      parts.push(node); // an end tag
+      continue;
+    }
+    if (node instanceof TextNode) {
+      parts.push(escapeHtml(node.data));
+      continue;
+    }
+    let open = `<${node.tagName}`;
+    for (const [name, value] of node.attributes) open += ` ${name}="${escapeHtml(value)}"`;
+    parts.push(`${open}>`);
+    if (VOID.has(node.tagName)) {
+      if (node.childNodes.length > 0) throw new Error(`<${node.tagName}> with children`);
+      continue;
+    }
+    stack.push(`</${node.tagName}>`);
+    for (let i = node.childNodes.length - 1; i >= 0; i--) stack.push(node.childNodes[i]);
   }
-  return `${out}${node.childNodes.map(serialize).join("")}</${node.tagName}>`;
+  return parts.join("");
 }
 
 export function createDocument() {
