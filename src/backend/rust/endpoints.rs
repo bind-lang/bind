@@ -48,21 +48,13 @@ pub fn inputs(
 
 /// The HTTP result type, the router and the helpers that run one call in a transaction.
 pub fn router(endpoints: &[&CoreFunction], names: &BTreeMap<String, String>) -> String {
-    let mut output = format!(
-        "/// Response of one RPC call: HTTP status and JSON body.
-#[derive(Debug)]
-pub struct HttpResult {{
-pub status: u16,
-pub body: ::std::string::String,
-}}
-
-/// `{{\"error\": message}}` with the error's status; the message never exposes internals.
-fn error_result(error: &{RUNTIME}::AppError) -> HttpResult {{
-let body = ::serde_json::json!({{ \"error\": error.public_message() }}).to_string();
-HttpResult {{ status: error.status(), body }}
-}}
-
-/// Ends the call's transaction: serializes the value, then commits; any error (including
+    // The per-call helpers, only when there is a call to route (an `ssr` page without
+    // endpoints has none: no dead code in the generated crate).
+    let helpers = if endpoints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "/// Ends the call's transaction: serializes the value, then commits; any error (including
 /// the commit's) rolls back and becomes the response. A call never reports success
 /// without a committed transaction.
 async fn finish<T: ::serde::Serialize>(
@@ -102,10 +94,28 @@ let transaction = pool
 ::std::result::Result::Ok((input, {RUNTIME}::Ctx::with_transaction(transaction)))
 }}
 
-/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+"
+        )
+    };
+    let mut output = format!(
+        "/// Response of one RPC call: HTTP status and JSON body.
+#[derive(Debug)]
+pub struct HttpResult {{
+pub status: u16,
+pub body: ::std::string::String,
+}}
+
+/// `{{\"error\": message}}` with the error's status; the message never exposes internals.
+fn error_result(error: &{RUNTIME}::AppError) -> HttpResult {{
+let body = ::serde_json::json!({{ \"error\": error.public_message() }}).to_string();
+HttpResult {{ status: error.status(), body }}
+}}
+
+{helpers}/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {{
 match path.trim_end_matches('/') {{
-"
+",
+        helpers = helpers
     );
     for endpoint in endpoints {
         let input = &names[&endpoint.name];

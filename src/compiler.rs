@@ -655,6 +655,7 @@ fn validate_type(
         "DatabaseUrl",
         "Port",
         "Secret",
+        "Ui",
         "Result",
         "List",
         "Set",
