@@ -162,7 +162,7 @@ fn parse_toml_subset(text: &str) -> Result<BTreeMap<String, BTreeMap<String, Str
     let mut result: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
     let mut section = String::new();
     for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.split('#').next().unwrap_or("").trim();
+        let line = strip_comment(raw_line).trim();
         if line.is_empty() {
             continue;
         }
@@ -187,6 +187,25 @@ fn parse_toml_subset(text: &str) -> Result<BTreeMap<String, BTreeMap<String, Str
     Ok(result)
 }
 
+/// `line` without its comment: from the first `#` that is outside a quoted string (`"…"`, where
+/// `\` escapes the next character, or `'…'`) to the end of the line.
+fn strip_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (index, c) in line.char_indices() {
+        match quote {
+            Some('"') if escaped => escaped = false,
+            Some('"') if c == '\\' => escaped = true,
+            Some(open) if c == open => quote = None,
+            Some(_) => {}
+            None if c == '"' || c == '\'' => quote = Some(c),
+            None if c == '#' => return &line[..index],
+            None => {}
+        }
+    }
+    line
+}
+
 fn parse_bool(value: Option<String>, fallback: bool) -> bool {
     value.map(|item| item == "true").unwrap_or(fallback)
 }
@@ -203,6 +222,20 @@ fn parse_array(value: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hash_inside_a_quoted_string_is_not_a_comment() {
+        let values = parse_toml_subset(
+            "[web]\ntitle = \"C# & F# tips\" # the title\ndescription = 'a#b' # c\nlanguage = \"en\\\"#\" # quote then hash\n# whole line\nstylesheet = \"s.css\"#x\n",
+        )
+        .unwrap();
+        assert_eq!(values["web"]["title"], "C# & F# tips");
+        assert_eq!(values["web"]["description"], "'a#b'");
+        assert_eq!(values["web"]["language"], "en\\\"#");
+        assert_eq!(values["web"]["stylesheet"], "s.css");
+        assert_eq!(strip_comment("a = 1 # c"), "a = 1 ");
+        assert_eq!(strip_comment("a = \"#\""), "a = \"#\"");
+    }
 
     #[test]
     fn parses_sections() {
