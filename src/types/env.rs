@@ -38,7 +38,8 @@ pub const SCALARS: &[&str] = &[
 /// Built-in generic types and their arity. `Result` is registered as a sealed type instead.
 pub const GENERICS: &[(&str, usize)] = &[("List", 1), ("Set", 1), ("Map", 2), ("Option", 1)];
 
-/// UI nodes accepted by the certified Elm generator in `certified.rs`, plus `UI` and `Text`.
+/// UI nodes of the certified web profile (rendered by `core::display` and both runtimes), plus
+/// `UI` and `Text`.
 pub const UI_NODES: &[&str] = &[
     "UI",
     "Page",

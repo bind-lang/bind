@@ -144,10 +144,10 @@ pub struct UiTree {
     pub children: Vec<UiTree>,
 }
 
-/// The HTML of a UI value: the markup the former Elm client (`elm_ui_node` in `certified.rs`)
-/// put in the DOM, serialized like `outerHTML` but with the escaping below. No whitespace or
+/// The HTML of a UI value: the markup the former Elm client put in the DOM (pinned by
+/// `tests/codegen/website.html.expected`), serialized like `outerHTML` but with the escaping below. No whitespace or
 /// newline is added between nodes. The page shell (not this function) puts the component's
-/// HTML inside the single wrapper `<div class="bind-site">…</div>` of the Elm `view`.
+/// HTML inside the single wrapper `<div class="bind-site">…</div>`.
 ///
 /// Escaping (`escape_html`), in text and in attribute values alike: `&` → `&amp;`,
 /// `<` → `&lt;`, `>` → `&gt;`, `"` → `&quot;`, `'` → `&#39;`; everything else (newlines,
@@ -160,7 +160,7 @@ pub struct UiTree {
 /// | Node | HTML |
 /// |---|---|
 /// | `UI` (the root) | a fragment: just the children's HTML, no element (a `UI` returned by a helper and nested in another adds nothing) |
-/// | `Text(s)` | the escaped text `s`, no element (an Elm `text` node); children ignored |
+/// | `Text(s)` | the escaped text `s`, no element (a DOM text node); children ignored |
 /// | `Empty` | nothing (the empty string) |
 /// | `Page`, `Container`, `Div`, `Grid`, `Stack` | `<div class id>children</div>` |
 /// | `Header`, `Nav`, `Main`, `Section`, `Article`, `Aside`, `Footer` | `<header class id>`, `<nav …>`, `<main …>`, `<section …>`, `<article …>`, `<aside …>`, `<footer …>` |

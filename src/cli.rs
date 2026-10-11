@@ -70,7 +70,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 };
                 let report = pipeline::build(&generated, &app, &config, target_config, mode)?;
                 println!(
-                    "✓ Parsed {} module(s)\n✓ Whole-application verification\n✓ Rust target compilation and tests\n✓ Elm optimized compilation\n{}✓ Artifact hashing and lockfile\n\nApplication {} successfully.\nManifest: {}\nTarget lock: {}\nWeb: {}\nRust artifacts:\n  {}\nCargo lock: {}\nNPM lock: {}\nElm manifest: {}",
+                    "✓ Parsed {} module(s)\n✓ Whole-application verification\n✓ Rust target compilation and tests\n{}✓ Artifact hashing and lockfile\n\nApplication {} successfully.\nManifest: {}\nTarget lock: {}\nWeb:\n  {}\nRust artifacts:\n  {}\nCargo lock: {}\nJS runtime: {}",
                     result.module_count,
                     if mode == BuildMode::Certify {
                         "✓ Rust lint policy\n"
@@ -84,7 +84,12 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                     },
                     report.manifest.display(),
                     report.target_lock.display(),
-                    report.web_artifact.display(),
+                    report
+                        .web_artifacts
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n  "),
                     report
                         .rust_artifacts
                         .iter()
@@ -92,8 +97,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                         .collect::<Vec<_>>()
                         .join("\n  "),
                     report.cargo_lock_hash,
-                    report.npm_lock_hash.as_deref().unwrap_or("not applicable"),
-                    report.elm_json_hash
+                    report.js_runtime_hash
                 );
             }
         }
@@ -154,9 +158,10 @@ fn target_command(args: &[String], config: &ProjectConfig) -> Result<(), String>
         Some("list") => {
             for (name, target) in &config.targets {
                 println!(
-                    "{name}\t{} + {}\t{}\t{}",
+                    "{name}\t{} + {}\t{}\t{}\t{}",
                     target.client,
                     target.server,
+                    target.mode.as_str(),
                     target.deployment,
                     if target.certified {
                         "certified"
@@ -174,9 +179,10 @@ fn target_command(args: &[String], config: &ProjectConfig) -> Result<(), String>
                 .get(&name)
                 .ok_or_else(|| format!("Unknown target `{name}`"))?;
             println!(
-                "Target: {name}\nClient: {}\nServer: {}\nDeployment: {}\nCertification profile: {}\nCapabilities:\n  {}",
+                "Target: {name}\nClient: {}\nServer: {}\nMode: {}\nDeployment: {}\nCertification profile: {}\nCapabilities:\n  {}",
                 target.client,
                 target.server,
+                target.mode.as_str(),
                 target.deployment,
                 if target.certified {
                     "certified"
@@ -239,8 +245,8 @@ fn print_help() {
         r#"Bind 0.1 — whole-application compiler
 
 Usage:
-  bind check [--target aws-lambda|vercel]
-  bind verify [--target aws-lambda|vercel]
+  bind check [--target <target>]
+  bind verify [--target <target>]
   bind generate --target <target> [--emit-ir] [--emit-graph]
   bind build --target <target> [--emit-ir] [--emit-graph]
   bind certify --target <target> [--emit-ir] [--emit-graph]

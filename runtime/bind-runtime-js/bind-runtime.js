@@ -567,7 +567,7 @@ function requestFailed() {
  * POSTs `body` (a JSON-ready value produced by the generated encoders: no BigInt or Decimal
  * left) to `url` with the global `fetch` and decodes the 2xx JSON response with `decode`.
  * A non-2xx response whose body is JSON `{"error": string}` gives BindError("Remote", that
- * string); a network error, a body that is not JSON (any status), any other error body or a
+ * string) with the response's `status`; a network error, a body that is not JSON (any status), any other error body or a
  * decode failure gives BindError("Remote", TEXTS.requestFailed). Not counted by `enter`.
  */
 export async function rpc(ctx, url, body, decode) {
@@ -594,7 +594,10 @@ export async function rpc(ctx, url, body, decode) {
   }
   if (!response.ok) {
     if (isPlainObject(json) && Object.hasOwn(json, "error") && typeof json.error === "string") {
-      throw new BindError("Remote", json.error);
+      // The status of the server's error response selects the screen (errorScreen).
+      const error = new BindError("Remote", json.error);
+      error.status = response.status;
+      throw error;
     }
     throw requestFailed();
   }
@@ -905,4 +908,25 @@ export function errorBody(kind, message) {
   const title = status === 400 ? TEXTS.titleBadRequest : status === 404 ? TEXTS.titleNotFound : TEXTS.titleError;
   const tree = node("Main", ["bind-error"], [node("Heading", [1n], [text(title)]), node("Paragraph", [], [text(publicMessage)])]);
   return Object.freeze({ status, tree });
+}
+
+/** The loading screen, shown until the component's page is ready (bindc's split page has it). */
+export const LOADING = node("Main", ["bind-loading"], [node("Paragraph", [], [text(TEXTS.loading)])]);
+
+/**
+ * The error screen of a failure while reading the parameters or running the component, as
+ * { status, tree }: the same screen the SSR shows for the same error. BadParameter,
+ * RecursionLimit and Overflow are errorBody's; Remote carries the server's public message and
+ * the status of its error response (400: "Bad request" with the message, 404: errorBody's
+ * NotFound, otherwise "Something went wrong" with the message, which is TEXTS.requestFailed for
+ * a network failure or a response that is not the server's error). Anything that is not a
+ * BindError is a compiler bug: the internal error screen, never its details.
+ */
+export function errorScreen(error) {
+  if (!(error instanceof BindError)) return errorBody("Internal", "");
+  if (error.kind !== "Remote") return errorBody(error.kind, error.message);
+  if (error.status === 400) return errorBody("BadRequest", error.message);
+  if (error.status === 404) return errorBody("NotFound", error.message);
+  const tree = node("Main", ["bind-error"], [node("Heading", [1n], [text(TEXTS.titleError)]), node("Paragraph", [], [text(error.message)])]);
+  return Object.freeze({ status: 500, tree });
 }

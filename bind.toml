@@ -14,16 +14,43 @@ schema = "examples/commerce/schema/main.csv"
 env = "DATABASE_URL"
 verification = "static"
 
-[target.aws-lambda]
-client = "elm"
+# One target per deployment and mode. The page is the `CustomerPage` component.
+
+# One Lambda serves the page (rendered by the Rust server), the stylesheet and the API.
+[target.aws-lambda-ssr]
+client = "web"
 server = "rust"
+mode = "ssr"
 deployment = "aws-lambda"
 certified = true
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 
-[target.vercel]
-client = "elm"
+# The Lambda serves the API; `web/` is hosted statically on another origin, which the API
+# answers (CORS) and refuses every other one.
+[target.aws-lambda-split]
+client = "web"
 server = "rust"
+mode = "split"
+deployment = "aws-lambda"
+api_url = "https://api.commerce.example/api"
+frontend_origin = "https://commerce.example"
+certified = true
+capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
+
+# One Vercel project: the page function renders `/`, one function per endpoint.
+[target.vercel-ssr]
+client = "web"
+server = "rust"
+mode = "ssr"
+deployment = "vercel"
+certified = true
+capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
+
+# One Vercel project, same origin: `web/` served as is, one function per endpoint.
+[target.vercel-split]
+client = "web"
+server = "rust"
+mode = "split"
 deployment = "vercel"
 certified = true
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]

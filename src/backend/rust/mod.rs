@@ -85,16 +85,24 @@ clippy::unreachable
 
 /// The `src/lib.rs` of the generated server crate for `app`. Its runtime is the module
 /// `bind_runtime` (`src/bind_runtime.rs`, the runtime source copied verbatim).
+#[cfg(test)]
 pub fn server_library(app: &VerifiedApplication) -> Result<String, String> {
-    server_library_with(app, None)
+    server_library_with(app, None, None)
 }
 
-/// [`server_library`], serving the page `ssr` at `GET /` when given (the `ssr` mode).
+/// [`server_library`], serving the page `ssr` at `GET /` when given (the `ssr` mode), with the
+/// API's CORS (`endpoints::cors`) when `frontend_origin` is given.
 pub fn server_library_with(
     app: &VerifiedApplication,
     ssr: Option<&SsrPage>,
+    frontend_origin: Option<&str>,
 ) -> Result<String, String> {
-    library_with(&app.core, &app.database, ssr)
+    let mut library = library_with(&app.core, &app.database, ssr)?;
+    if let Some(origin) = frontend_origin {
+        library.push('\n');
+        library.push_str(&indent(&endpoints::cors(origin)));
+    }
+    Ok(library)
 }
 
 /// The page the server renders in the `ssr` mode: the application's client component, and the

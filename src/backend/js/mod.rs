@@ -8,33 +8,26 @@
 //! [`names`]); each component is exported under its Bind name (`export { u_Home as "Home" }`).
 //! Value representation and calling convention: see [`expr`] and the runtime's header.
 
-// Used by the page generator (a later task of subproject 3c).
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod codecs;
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod expr;
-#[cfg_attr(not(test), allow(dead_code))]
 pub mod names;
+pub mod page;
+pub mod plan;
 
 use crate::core::ir::CoreProgram;
 
 /// The JS runtime (`runtime/bind-runtime-js/bind-runtime.js`).
-#[cfg_attr(not(test), allow(dead_code))] // used by the JS generator
 pub const RUNTIME: &str = include_str!("../../../runtime/bind-runtime-js/bind-runtime.js");
 
-/// The default base URL of the RPC routes (`api_url` in `bind.toml`).
-pub const DEFAULT_API_URL: &str = "/api";
-
 /// The `app.js` module of the components `names`, with the default API URL.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn render_app(program: &CoreProgram, names: &[String]) -> String {
-    render_app_with(program, names, DEFAULT_API_URL)
+    render_app_with(program, names, crate::config::DEFAULT_API_URL)
 }
 
 /// The `app.js` module of the components `names`: every function they reach
 /// (`core::lower::client_functions`), the codecs of their server calls, and an export of each
 /// component under its Bind name. `api_url` is the base URL of the RPC routes.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn render_app_with(program: &CoreProgram, names: &[String], api_url: &str) -> String {
     let mut functions: Vec<String> = names
         .iter()

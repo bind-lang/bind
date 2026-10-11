@@ -382,9 +382,15 @@ pub fn tests(endpoints: &[&CoreFunction], names: &BTreeMap<String, String>, extr
             names[&endpoint.name], "{\"bindUnknownField\":0}"
         ));
     }
-    let first = endpoints
+    // Without endpoints every path is an unknown procedure; there is no request to malform.
+    let malformed = endpoints
         .first()
-        .map(|endpoint| format!("/api/{}", endpoint.name))
+        .map(|endpoint| {
+            format!(
+                "let malformed = super::handle_rpc({:?}, b\"not json\", &pool).await;\nassert_eq!(malformed.status, 400);\n",
+                format!("/api/{}", endpoint.name)
+            )
+        })
         .unwrap_or_default();
     format!(
         "#[cfg(test)]
@@ -402,12 +408,82 @@ let pool = ::sqlx::postgres::PgPoolOptions::new()
 .connect_lazy(\"postgresql://bind-test.invalid/none\")?;
 let missing = super::handle_rpc(\"/api/bindMissingProcedure\", b\"{{}}\", &pool).await;
 assert_eq!(missing.status, 404);
-let malformed = super::handle_rpc({first:?}, b\"not json\", &pool).await;
-assert_eq!(malformed.status, 400);
-::std::result::Result::Ok(())
+{malformed}::std::result::Result::Ok(())
 }})
 }}
 {extra}}}
+"
+    )
+}
+
+/// CORS of the API when the target declares `frontend_origin` (the frontend is on another
+/// origin): `FRONTEND_ORIGIN`, the `Cors` decision type and `cors`, which the entry points call
+/// before routing an RPC request, and their tests.
+pub fn cors(origin: &str) -> String {
+    format!(
+        "/// The only browser origin allowed to call the API (`frontend_origin`, CORS).
+pub const FRONTEND_ORIGIN: &str = {origin:?};
+
+/// The CORS decision for one RPC request: headers to add to its response, and the response that
+/// ends the request here (a preflight, or a refused origin), if any.
+#[derive(Debug)]
+pub struct Cors {{
+pub headers: ::std::vec::Vec<(&'static str, ::std::string::String)>,
+pub response: ::std::option::Option<HttpResult>,
+}}
+
+/// CORS for a request with `method` and the `Origin` header `origin`. Without an `Origin` the
+/// request is handled as usual (no browser is involved). From `FRONTEND_ORIGIN` it is handled
+/// with the CORS headers, and a preflight (`OPTIONS`) is answered here (204). From any other
+/// origin it is refused (403, no CORS headers: the browser exposes nothing to that page).
+pub fn cors(method: &str, origin: ::std::option::Option<&str>) -> Cors {{
+match origin {{
+::std::option::Option::None => Cors {{ headers: ::std::vec::Vec::new(), response: ::std::option::Option::None }},
+::std::option::Option::Some(origin) if origin == FRONTEND_ORIGIN => {{
+let mut headers = ::std::vec![
+(\"access-control-allow-origin\", ::std::string::String::from(FRONTEND_ORIGIN)),
+(\"vary\", ::std::string::String::from(\"Origin\")),
+];
+if method == \"OPTIONS\" {{
+headers.push((\"access-control-allow-methods\", ::std::string::String::from(\"POST, OPTIONS\")));
+headers.push((\"access-control-allow-headers\", ::std::string::String::from(\"content-type, accept\")));
+headers.push((\"access-control-max-age\", ::std::string::String::from(\"600\")));
+let response = HttpResult {{ status: 204, body: ::std::string::String::new() }};
+Cors {{ headers, response: ::std::option::Option::Some(response) }}
+}} else {{
+Cors {{ headers, response: ::std::option::Option::None }}
+}}
+}}
+::std::option::Option::Some(_) => {{
+let body = ::serde_json::json!({{ \"error\": \"origin not allowed\" }}).to_string();
+Cors {{
+headers: ::std::vec![(\"vary\", ::std::string::String::from(\"Origin\"))],
+response: ::std::option::Option::Some(HttpResult {{ status: 403, body }}),
+}}
+}}
+}}
+}}
+
+#[cfg(test)]
+mod cors_tests {{
+#[test]
+fn only_the_frontend_origin_may_call_the_api() {{
+let preflight = super::cors(\"OPTIONS\", ::std::option::Option::Some(super::FRONTEND_ORIGIN));
+assert_eq!(preflight.response.as_ref().map(|response| response.status), ::std::option::Option::Some(204));
+assert!(preflight.headers.iter().any(|(name, value)| *name == \"access-control-allow-origin\" && value == super::FRONTEND_ORIGIN));
+assert!(preflight.headers.iter().any(|(name, _)| *name == \"access-control-allow-methods\"));
+let call = super::cors(\"POST\", ::std::option::Option::Some(super::FRONTEND_ORIGIN));
+assert!(call.response.is_none());
+assert!(call.headers.iter().any(|(name, value)| *name == \"access-control-allow-origin\" && value == super::FRONTEND_ORIGIN));
+for method in [\"OPTIONS\", \"POST\"] {{
+let refused = super::cors(method, ::std::option::Option::Some(\"https://other.example\"));
+assert_eq!(refused.response.as_ref().map(|response| response.status), ::std::option::Option::Some(403));
+assert!(!refused.headers.iter().any(|(name, _)| name.starts_with(\"access-control-\")));
+}}
+let direct = super::cors(\"POST\", ::std::option::Option::None);
+assert!(direct.response.is_none() && direct.headers.is_empty());
+}}
+}}
 "
     )
 }

@@ -1,5 +1,6 @@
-//! A reference evaluator over the core IR, for tests only. Its semantics are those of the
-//! generated Rust (Task 6): arbitrary-precision `Int`, truncating division with the sign of the
+//! A reference evaluator over the core IR: it pre-renders static pages at compile time
+//! (`backend::js::page::prerender`) and is the reference of the tests. Its semantics are those of
+//! the generated Rust and JS: arbitrary-precision `Int`, truncating division with the sign of the
 //! remainder following the dividend, `None` for a zero divisor, capture-by-copy closures and a
 //! call-depth limit of 10,000. Task 9 compares it with the generated program.
 //!
@@ -14,7 +15,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use num_bigint::BigInt;
+use super::bigint::BigInt;
 
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;

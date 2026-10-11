@@ -33,6 +33,7 @@ use super::names::{js_local, js_string, js_value};
 const MAX_SPREAD: usize = 1000;
 
 /// One function, with the codec helpers its server calls need placed before it.
+#[cfg(test)]
 pub fn function(function: &CoreFunction, program: &CoreProgram) -> String {
     let mut codecs = Codecs::new(program);
     let text = function_with(function, program, &mut codecs);

@@ -25,6 +25,7 @@ use super::names::{js_string, js_value};
 
 /// A JS expression evaluating to a decoder of `ty` (self-contained: an IIFE when helpers are
 /// needed).
+#[cfg(test)]
 pub fn decoder(ty: &Type, program: &CoreProgram) -> String {
     let mut codecs = Codecs::new(program);
     let decoder = codecs.decoder(ty);
@@ -32,6 +33,7 @@ pub fn decoder(ty: &Type, program: &CoreProgram) -> String {
 }
 
 /// A JS expression evaluating to an encoder `(v) => json` of `ty` (self-contained).
+#[cfg(test)]
 pub fn encoder(ty: &Type, program: &CoreProgram) -> String {
     let mut codecs = Codecs::new(program);
     let body = codecs.encode(ty, "v");
@@ -73,6 +75,7 @@ impl<'p> Codecs<'p> {
         self.definitions.join("\n")
     }
 
+    #[cfg(test)]
     fn standalone(&self, expression: String) -> String {
         if self.definitions.is_empty() {
             expression

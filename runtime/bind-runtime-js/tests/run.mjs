@@ -647,6 +647,41 @@ test("readParams and the text decoders match params.json (shared with the SSR)",
   }
 });
 
+// ---- Page screens (boot) ----
+
+test("LOADING renders the loading screen bindc writes into the split page", () => {
+  eq(renderToHtml(rt.LOADING, createDocument()), '<main class="bind-loading"><p>Loading…</p></main>');
+});
+
+test("rpc keeps the HTTP status of an error response", async () => {
+  const ctx = rt.newCtx();
+  let error = await withFetch(respond(404, '{"error":"not found"}'), () => rejects(rt.rpc(ctx, "/api/f", {}, rt.decodeInt), "Remote", "404"));
+  eq(error.status, 404);
+  error = await withFetch(respond(500, "oops"), () => rejects(rt.rpc(ctx, "/api/f", {}, rt.decodeInt), "Remote", "500 html"));
+  eq(error.status, undefined, "no status when the body is not the server's error");
+});
+
+test("errorScreen shows a failure as the SSR shows the same AppError", () => {
+  const document = createDocument();
+  const screen = (error) => {
+    const { status, tree } = rt.errorScreen(error);
+    return `${status} ${renderToHtml(tree, document)}`;
+  };
+  const remote = (message, status) => Object.assign(new rt.BindError("Remote", message), { status });
+  const body = (title, message) => `<main class="bind-error"><h1>${title}</h1><p>${message}</p></main>`;
+  eq(screen(new rt.BindError("BadParameter", "id")), `400 ${body("Bad request", "invalid parameter: id")}`);
+  eq(screen(new rt.BindError("RecursionLimit", "x")), `500 ${body("Something went wrong", "recursion limit exceeded")}`);
+  eq(screen(new rt.BindError("Overflow", "x")), `500 ${body("Something went wrong", "numeric overflow")}`);
+  // The server's public messages, with the status of its response.
+  eq(screen(remote("not found", 404)), `404 ${body("Page not found", "not found")}`);
+  eq(screen(remote("bad <id>", 400)), `400 ${body("Bad request", "bad &lt;id&gt;")}`);
+  eq(screen(remote("database error", 500)), `500 ${body("Something went wrong", "database error")}`);
+  // Network failures and bodies that are not the server's error (Review Focus 2).
+  eq(screen(new rt.BindError("Remote", rt.TEXTS.requestFailed)), `500 ${body("Something went wrong", "Request failed")}`);
+  // Anything else is a compiler bug: the internal error screen, no details.
+  eq(screen(new TypeError("secret detail")), `500 ${body("Something went wrong", "internal error")}`);
+});
+
 // ---- Runner ----
 
 let failures = 0;

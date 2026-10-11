@@ -436,10 +436,19 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     if !missing.is_empty() {
         diagnostics.push(Diagnostic::error("E8101", format!("Target `{target}` cannot implement this application.\n\nMissing capabilities:\n    {}", missing.join("\n    ")), Span::default()));
     }
-    let built_in_target = target_config.client == "elm"
+    // The frontend settings of the target (E8311), `client = "elm"` included.
+    let frontend_target_problems = crate::backend::js::plan::target_problems(target, target_config);
+    for problem in &frontend_target_problems {
+        diagnostics.push(Diagnostic::error(
+            "E8311",
+            problem.message(),
+            Span::default(),
+        ));
+    }
+    let built_in_target = target_config.client == "web"
         && target_config.server == "rust"
         && matches!(target_config.deployment.as_str(), "aws-lambda" | "vercel");
-    if !built_in_target {
+    if !built_in_target && target_config.client != "elm" {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
     if target_config.server == "rust" {
@@ -477,11 +486,14 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         let core = crate::core::lower::lower(&program, &typed, &database);
         let problems = crate::core::validate::validate(&core);
         if problems.is_empty() {
-            let server_diagnostics = if target_config.server == "rust" {
+            let mut server_diagnostics = if target_config.server == "rust" {
                 rust_server_diagnostics(&core, &program, &database)
             } else {
                 Vec::new()
             };
+            if target_config.client == "web" {
+                server_diagnostics.extend(frontend_diagnostics(&core, &program, target));
+            }
             let usable = !has_errors(&server_diagnostics);
             diagnostics.extend(server_diagnostics);
             usable.then_some(core)
@@ -678,54 +690,6 @@ fn validate_certified_surface(
         }
     }
 
-    for function in &program.functions {
-        // Client functions are compiled by the token-based Elm generator, whose wire format
-        // is the original one. Endpoints are checked against the v2 wire types (E8309, for
-        // every Rust-server target); other server code may use the whole language.
-        if function.domain == Domain::Client {
-            for type_ref in function
-                .parameters
-                .iter()
-                .map(Parameter::declared_type)
-                .chain(std::iter::once(function.declared_return()))
-            {
-                if !certified_wire_type(&type_ref.name, program) {
-                    diagnostics.push(Diagnostic::error(
-                        "E8303",
-                        format!(
-                            "Function `{}` exposes unsupported certified wire type `{}`.",
-                            function.name,
-                            type_ref.display()
-                        ),
-                        function.span.clone(),
-                    ));
-                }
-            }
-        }
-    }
-
-    for component in components {
-        let server_calls = component
-            .body
-            .windows(3)
-            .filter(|window| {
-                window[0].text == "server"
-                    && window[1].text == "."
-                    && window[2].kind == TokenKind::Identifier
-            })
-            .count();
-        if server_calls > 1 || !component.body.iter().any(|token| token.text == "UI") {
-            diagnostics.push(Diagnostic::error(
-                "E8306",
-                format!(
-                    "Certified component `{}` must contain at most one bound server call and exactly one UI block.",
-                    component.name
-                ),
-                component.span.clone(),
-            ));
-        }
-    }
-
     if !operations.is_empty() {
         let configured_variable = config.database_url_env.as_deref();
         let database_environment = configured_variable.and_then(|variable| {
@@ -756,6 +720,22 @@ fn validate_certified_surface(
             ),
         }
     }
+}
+
+/// What keeps the web frontend of a verified program from being generated (E8311): the same
+/// plan `backend::js::page::web_files` and the SSR build from, so `generate` never fails.
+fn frontend_diagnostics(core: &CoreProgram, program: &Program, target: &str) -> Vec<Diagnostic> {
+    crate::backend::js::plan::program_problems(core, program, target)
+        .into_iter()
+        .map(|problem| {
+            let span = problem
+                .function()
+                .and_then(|name| program.functions.iter().find(|item| item.name == name))
+                .map(|item| item.span.clone())
+                .unwrap_or_default();
+            Diagnostic::error("E8311", problem.message(), span)
+        })
+        .collect()
 }
 
 /// Checks of every target whose server is generated by the Rust backend (certified or not):
@@ -952,7 +932,7 @@ fn certified_wire_type(name: &str, program: &Program) -> bool {
         .any(|declaration| declaration.name == base)
 }
 
-/// Wire types of profile rust-elm-web-v2: the scalars of the certified wire format except
+/// Wire types of profile rust-web-v3: the scalars of the certified wire format except
 /// `Duration`; `data class`/`entity` (and `distinct type`) whose fields are wire types;
 /// `enum class`/`sealed class` whose variants have no fields; `List<T>` and `T?` of wire
 /// types. Generic user types, functions, `Result`, `Set` and `Map` are not wire types.
@@ -1552,7 +1532,13 @@ mod tests {
         let suffix = FIXTURE_ID.fetch_add(1, Ordering::Relaxed);
         let root = env::temp_dir().join(format!("bindc-test-{}-{suffix}", std::process::id()));
         fs::create_dir_all(root.join("app")).unwrap();
-        fs::write(root.join("app/main.bd"), source).unwrap();
+        // A web target renders one client component: sources about other parts get a page.
+        let page = if source.contains("client component") {
+            ""
+        } else {
+            "\nclient component BindTestPage() {\n    UI {\n        Text(\"test\")\n    }\n}\n"
+        };
+        fs::write(root.join("app/main.bd"), format!("{source}{page}")).unwrap();
         fs::write(root.join("schema.csv"), schema).unwrap();
         fs::write(
             root.join("bind.toml"),
@@ -1563,9 +1549,10 @@ source = "app"
 schema = "schema.csv"
 verification = "static"
 [target.aws-lambda]
-client = "elm"
+client = "web"
 server = "rust"
 deployment = "aws-lambda"
+mode = "ssr"
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 "#,
         )
@@ -1981,9 +1968,10 @@ schema = "schema.csv"
 env = "BIND_TEST_CERTIFIED_DATABASE_URL"
 verification = "static"
 [target.aws-lambda]
-client = "elm"
+client = "web"
 server = "rust"
 deployment = "aws-lambda"
+mode = "ssr"
 certified = true
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 "#,
@@ -2001,23 +1989,23 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         let cases = [
             (
                 "server fun f(x: Int): (Int) -> Int effects [] = { y -> y }\n",
-                "Endpoint `f` uses `(Int) -> Int`, which cannot cross the wire in profile rust-elm-web-v2.",
+                "Endpoint `f` uses `(Int) -> Int`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
                 "server fun g(d: Duration): Int = 1\n",
-                "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-elm-web-v2.",
+                "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
                 "sealed class S { data class A(val n: Int) }\nserver fun h(): S = A(1)\n",
-                "Endpoint `h` uses `S`, which cannot cross the wire in profile rust-elm-web-v2.",
+                "Endpoint `h` uses `S`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
                 "server fun r(): Result<Int, String> = Ok(1)\n",
-                "Endpoint `r` uses `Result<Int, String>`, which cannot cross the wire in profile rust-elm-web-v2.",
+                "Endpoint `r` uses `Result<Int, String>`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
                 "server fun s(xs: List<Duration>?): Int = 1\n",
-                "Endpoint `s` uses `List<Duration>?`, which cannot cross the wire in profile rust-elm-web-v2.",
+                "Endpoint `s` uses `List<Duration>?`, which cannot cross the wire in profile rust-web-v3.",
             ),
         ];
         for (source, message) in cases {
@@ -2063,8 +2051,8 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             found,
             vec![
-                "Entity field `Tarefa.prazo` uses `Duration`, which has no database mapping in profile rust-elm-web-v2.",
-                "Column `tarefas.prazo` uses `Duration`, which has no database mapping in profile rust-elm-web-v2.",
+                "Entity field `Tarefa.prazo` uses `Duration`, which has no database mapping in profile rust-web-v3.",
+                "Column `tarefas.prazo` uses `Duration`, which has no database mapping in profile rust-web-v3.",
             ],
             "{:?}",
             result.diagnostics
@@ -2111,8 +2099,8 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Endpoint `b` has no body, so the generated server cannot run it in profile rust-elm-web-v2.",
-                "Function `registra` is reachable from endpoint `a` but has no body, so the generated server cannot run it in profile rust-elm-web-v2.",
+                "Endpoint `b` has no body, so the generated server cannot run it in profile rust-web-v3.",
+                "Function `registra` is reachable from endpoint `a` but has no body, so the generated server cannot run it in profile rust-web-v3.",
             ]
         );
     }
@@ -2123,7 +2111,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Function `nome` is reachable from endpoint `a` but uses an `environment` value, which the generated server does not support in profile rust-elm-web-v2."
+                "Function `nome` is reachable from endpoint `a` but uses an `environment` value, which the generated server does not support in profile rust-web-v3."
             ]
         );
     }
@@ -2134,7 +2122,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Function `tela` is reachable from endpoint `f` but uses a UI tree, which the generated server does not support in profile rust-elm-web-v2."
+                "Function `tela` is reachable from endpoint `f` but uses a UI tree, which the generated server does not support in profile rust-web-v3."
             ]
         );
     }
@@ -2148,7 +2136,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, &schema),
             vec![
-                "Column `itens.cor` has type `Cor`, which has no database mapping in profile rust-elm-web-v2."
+                "Column `itens.cor` has type `Cor`, which has no database mapping in profile rust-web-v3."
             ]
         );
         // A table no endpoint uses does not matter.
@@ -2165,7 +2153,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, &schema),
             vec![
-                "Column `customers.extra` is assigned by an insert, but model `Customer` declares no field `extra`, so the generated server cannot use it in profile rust-elm-web-v2."
+                "Column `customers.extra` is assigned by an insert, but model `Customer` declares no field `extra`, so the generated server cannot use it in profile rust-web-v3."
             ]
         );
         // (b) A primary key the model does not declare.
@@ -2173,7 +2161,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, SCHEMA),
             vec![
-                "Column `customers.id` is the primary key of the table, but model `Customer` declares no field `id`, so the generated server cannot use it in profile rust-elm-web-v2."
+                "Column `customers.id` is the primary key of the table, but model `Customer` declares no field `id`, so the generated server cannot use it in profile rust-web-v3."
             ]
         );
     }
@@ -2184,7 +2172,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Endpoint `a` uses an `environment` value, which the generated server does not support in profile rust-elm-web-v2."
+                "Endpoint `a` uses an `environment` value, which the generated server does not support in profile rust-web-v3."
             ]
         );
     }
@@ -2253,9 +2241,10 @@ schema = "schema.csv"
 env = "DATABASE_URL"
 verification = "static"
 [target.aws-lambda]
-client = "elm"
+client = "web"
 server = "rust"
 deployment = "aws-lambda"
+mode = "ssr"
 certified = true
 capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 "#,
@@ -2265,5 +2254,162 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         let result = verify(&config, "aws-lambda");
         assert!(result.diagnostics.iter().any(|item| item.code == "E8307"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A fixture with one target `t` declared by `target` (the lines after `[target.t]`).
+    fn web_fixture(source: &str, target: &str) -> (PathBuf, ProjectConfig) {
+        let (root, _) = fixture(source, EMPTY_SCHEMA);
+        // Exactly `source`, without the page `fixture` adds.
+        fs::write(root.join("app/main.bd"), source).unwrap();
+        fs::write(
+            root.join("bind.toml"),
+            format!("[project]\nname = \"test\"\nsource = \"app\"\n[database.main]\nschema = \"schema.csv\"\nverification = \"static\"\n[target.t]\n{target}capabilities = [\"ui.dom\", \"server.http\", \"db.read\", \"db.write\"]\n"),
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        (root, config)
+    }
+
+    const WEB_SSR: &str =
+        "client = \"web\"\nserver = \"rust\"\ndeployment = \"aws-lambda\"\nmode = \"ssr\"\n";
+    const WEB_SPLIT: &str =
+        "client = \"web\"\nserver = \"rust\"\ndeployment = \"vercel\"\nmode = \"split\"\n";
+
+    /// The E8311 messages of `source` on a target declared by `target`.
+    fn e8311(source: &str, target: &str) -> Vec<String> {
+        let (root, config) = web_fixture(source, target);
+        let result = verify(&config, "t");
+        let found: Vec<String> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == "E8311")
+            .map(|item| item.message.clone())
+            .collect();
+        if !found.is_empty() {
+            assert!(result.application.is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+        found
+    }
+
+    const PAGE: &str = "client component Pagina() {\n    UI {\n        Text(\"oi\")\n    }\n}\n";
+
+    #[test]
+    fn decimal_multiplication_and_division_reachable_from_the_component_are_rejected() {
+        // Bind has no `Decimal` literal: the component reaches the functions by reference.
+        let source = "fun dobro(x: Decimal): Decimal = x * x\nfun metade(x: Decimal): Decimal = (x / x) ?: x\nfun solta(x: Decimal): Decimal = x * x\nfun soma(x: Decimal): Decimal = dobro(x + x - x)\nclient component Pagina() {\n    val f = soma\n    val g = metade\n    UI {\n        Text(\"x\")\n    }\n}\n";
+        let messages = e8311(source, WEB_SSR);
+        assert_eq!(
+            messages,
+            vec![
+                "Function `dobro` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
+                "Function `metade` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
+            ]
+        );
+        // The same in the split mode: changing modes never changes which programs are accepted.
+        assert_eq!(messages, e8311(source, WEB_SPLIT));
+    }
+
+    #[test]
+    fn component_parameters_must_fit_in_a_url() {
+        let source = "distinct type Codigo = UUID\ndistinct type Nome = String\nclient component Pagina(a: String, b: Email, c: Url, d: Int, e: Codigo, f: Date, g: DateTime, h: Instant, i: Nome, j: Boolean, k: Decimal, l: Int?, m: List<Int>) {\n    UI {\n        Text(a)\n    }\n}\n";
+        let suffix = ", which a page URL cannot carry in profile rust-web-v3 (allowed: String, Email, Url, Int, UUID, Date, DateTime, Instant and distinct types over them).";
+        assert_eq!(
+            e8311(source, WEB_SPLIT),
+            ["j: Boolean", "k: Decimal", "l: Int?", "m: List<Int>"]
+                .iter()
+                .map(|parameter| {
+                    let (name, ty) = parameter.split_once(": ").unwrap();
+                    format!("Component `Pagina` has parameter `{name}` of type `{ty}`{suffix}")
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_web_target_needs_a_client_component() {
+        assert_eq!(
+            e8311("server fun a(x: Int): Int = x\n", WEB_SSR),
+            vec!["Target `t` has no client component: a web target renders exactly one `client component` as its page.".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_api_on_another_origin_needs_the_frontend_origin() {
+        let cross = format!("{WEB_SPLIT}api_url = \"https://api.example.com/api\"\n");
+        assert_eq!(
+            e8311(PAGE, &cross),
+            vec!["`api_url = \"https://api.example.com/api\"` is on another origin, so the target must declare `frontend_origin`, the only browser origin the API answers (CORS).".to_string()]
+        );
+        let declared = format!("{cross}frontend_origin = \"https://app.example.com\"\n");
+        assert!(e8311(PAGE, &declared).is_empty());
+        assert!(e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"/backend\"\n")).is_empty());
+        assert_eq!(
+            e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"javascript:alert(1)\"\n")),
+            vec!["`api_url = \"javascript:alert(1)\"` must be a path starting with `/` or an `http://` or `https://` URL.".to_string()]
+        );
+        assert_eq!(
+            e8311(PAGE, &format!("{cross}frontend_origin = \"https://app.example.com/page\"\n")),
+            vec!["`frontend_origin = \"https://app.example.com/page\"` must be an origin: `http://` or `https://`, a host and an optional port, without a path.".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_elm_client_was_replaced_by_the_web_client() {
+        let target = "client = \"elm\"\nserver = \"rust\"\ndeployment = \"vercel\"\n";
+        let (root, config) = web_fixture(PAGE, target);
+        let result = verify(&config, "t");
+        assert_eq!(codes(&result), vec!["E8311"], "{:?}", result.diagnostics);
+        assert_eq!(
+            result.diagnostics[0].message,
+            "Target `t` uses `client = \"elm\"`, which is no longer supported: write `client = \"web\"` and choose `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn client_code_the_server_cannot_render_is_rejected_in_both_modes() {
+        let source = "environment development {\n    public val nome: String = env(\"APP_NAME\", default = \"x\")\n}\nfun mais(a: Duration, b: Duration): Duration = a + b\nfun registra(x: Int): Unit\nfun usa(): String {\n    registra(1)\n    return nome\n}\nclient component Pagina() {\n    val f = mais\n    UI {\n        Text(usa())\n    }\n}\n";
+        let expected = vec![
+            "Function `mais` is reachable from component `Pagina` but does arithmetic on `Duration` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
+            "Function `registra` is reachable from component `Pagina` but has no body, so the web frontend cannot run it in profile rust-web-v3.".to_string(),
+            "Function `usa` is reachable from component `Pagina` but uses an `environment` value, which the web frontend does not support in profile rust-web-v3.".to_string(),
+        ];
+        assert_eq!(e8311(source, WEB_SSR), expected);
+        assert_eq!(e8311(source, WEB_SPLIT), expected);
+        // The component itself is named as such.
+        let source = "environment development {\n    public val nome: String = env(\"APP_NAME\", default = \"x\")\n}\nclient component Pagina() {\n    UI {\n        Text(nome)\n    }\n}\n";
+        assert_eq!(
+            e8311(source, WEB_SPLIT),
+            vec!["Component `Pagina` uses an `environment` value, which the web frontend does not support in profile rust-web-v3.".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_commerce_example_verifies_on_every_target() {
+        if env::var_os("DATABASE_URL").is_none() {
+            // SAFETY: read only through `std::env`, whose accesses take the same lock.
+            unsafe { env::set_var("DATABASE_URL", "postgresql://bind:bind@localhost/bind") };
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let names: Vec<&str> = config.targets.keys().map(String::as_str).collect();
+        assert_eq!(
+            names,
+            [
+                "aws-lambda-split",
+                "aws-lambda-ssr",
+                "vercel-split",
+                "vercel-ssr"
+            ]
+        );
+        for target in names {
+            let result = verify(&config, target);
+            assert!(
+                result.diagnostics.is_empty() && result.application.is_some(),
+                "{target}: {:?}",
+                result.diagnostics
+            );
+        }
     }
 }

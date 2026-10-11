@@ -17,10 +17,11 @@ pub enum BuildMode {
 #[derive(Clone, Debug)]
 pub struct BuildReport {
     pub rust_artifacts: Vec<PathBuf>,
-    pub web_artifact: PathBuf,
+    /// The files of `web/` (no build step: they are deployed as generated).
+    pub web_artifacts: Vec<PathBuf>,
     pub cargo_lock_hash: String,
-    pub npm_lock_hash: Option<String>,
-    pub elm_json_hash: String,
+    /// The hash of the JS runtime (`web/bind-runtime.js` when the page uses it).
+    pub js_runtime_hash: String,
     pub target_lock: PathBuf,
     pub manifest: PathBuf,
 }
@@ -34,10 +35,6 @@ pub fn build(
 ) -> Result<BuildReport, String> {
     ensure_tool("cargo", &["--version"])?;
     ensure_version("rustc", &["--version"], "rustc 1.98.0 ")?;
-    ensure_version("elm", &["--version"], "0.19.2")?;
-    if target.deployment == "vercel" {
-        ensure_tool("npm", &["--version"])?;
-    }
 
     if !generated.join("Cargo.lock").exists() {
         run(
@@ -81,9 +78,12 @@ pub fn build(
                 .current_dir(generated),
         )?;
     }
+    let cargo_toml = fs::read_to_string(generated.join("Cargo.toml"))
+        .map_err(|error| format!("Cannot read the generated Cargo.toml: {error}"))?;
+    let binaries = binaries(&cargo_toml);
     let mut rust_build = Command::new("cargo");
     rust_build.args(["build", "--release", "--locked"]);
-    rust_build.arg(if app.rpc_contracts.is_empty() {
+    rust_build.arg(if binaries.is_empty() {
         "--lib"
     } else {
         "--bins"
@@ -93,61 +93,17 @@ pub fn build(
         .current_dir(generated);
     run("build generated Rust release artifacts", &mut rust_build)?;
 
-    let web = generated.join("web");
-    let web_artifact = web.join("dist/main.js");
-    if target.deployment == "vercel" {
-        if !generated.join("package-lock.json").exists() {
-            run(
-                "resolve the pinned npm dependency graph",
-                Command::new("npm")
-                    .args(["install", "--package-lock-only", "--no-audit", "--no-fund"])
-                    .current_dir(generated),
-            )?;
-        }
-        run(
-            "install the locked Vercel web toolchain",
-            Command::new("npm")
-                .args(["ci", "--no-audit", "--no-fund"])
-                .current_dir(generated),
-        )?;
-        run(
-            "compile generated Elm through the Vercel build command",
-            Command::new("npm")
-                .args(["run", "build:web"])
-                .current_dir(generated),
-        )?;
-    } else {
-        run(
-            "compile generated Elm",
-            Command::new("elm")
-                .args([
-                    "make",
-                    "src/Main.elm",
-                    "--optimize",
-                    "--output",
-                    "dist/main.js",
-                ])
-                .current_dir(&web),
-        )?;
+    let web_artifacts = web_artifacts(&generated.join("web"))?;
+    for artifact in &web_artifacts {
+        require_non_empty(artifact)?;
     }
-    fs::copy(web.join("index.html"), web.join("dist/index.html"))
-        .map_err(|error| format!("Cannot stage web/index.html: {error}"))?;
-    fs::copy(web.join("styles.css"), web.join("dist/styles.css"))
-        .map_err(|error| format!("Cannot stage web/styles.css: {error}"))?;
-
-    require_non_empty(&web_artifact)?;
-    let rust_artifacts = stage_rust_artifacts(generated, &cargo_target, app, target)?;
+    let rust_artifacts = stage_rust_artifacts(generated, &cargo_target, &binaries)?;
     for artifact in &rust_artifacts {
         require_non_empty(artifact)?;
     }
 
     let cargo_lock_hash = hash_file(&generated.join("Cargo.lock"))?;
-    let npm_lock_hash = generated
-        .join("package-lock.json")
-        .exists()
-        .then(|| hash_file(&generated.join("package-lock.json")))
-        .transpose()?;
-    let elm_json_hash = hash_file(&web.join("elm.json"))?;
+    let js_runtime_hash = hash_bytes(crate::backend::js::RUNTIME.as_bytes());
     fs::write(
         config.root.join("bind.lock"),
         certified::workspace_lock(config),
@@ -159,19 +115,14 @@ pub fn build(
     let target_lock = lock_directory.join(format!("{}.lock", app.target));
     fs::write(
         &target_lock,
-        certified::dependency_lock(
-            target,
-            Some(&cargo_lock_hash),
-            npm_lock_hash.as_deref(),
-            Some(&elm_json_hash),
-        ),
+        certified::dependency_lock(target, Some(&cargo_lock_hash), &js_runtime_hash),
     )
     .map_err(|error| format!("Cannot write {}: {error}", target_lock.display()))?;
 
     let manifest = generated.join("bind-manifest.json");
     let artifact_entries = rust_artifacts
         .iter()
-        .chain(std::iter::once(&web_artifact))
+        .chain(&web_artifacts)
         .map(|path| {
             let relative = path.strip_prefix(generated).unwrap_or(path);
             Ok(format!(
@@ -221,21 +172,18 @@ pub fn build(
     fs::write(
         &manifest,
         format!(
-            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n  \"npmLockSha256\": {},\n  \"elmJsonSha256\": {},\n  \"wireVersion\": {},\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
+            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"mode\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n  \"jsRuntimeSha256\": {},\n  \"wireVersion\": {},\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
             json(certified::profile_version()),
             mode == BuildMode::Certify,
             json(certification_state),
             json(&app.project_name),
             json(&app.target),
+            json(target.mode.as_str()),
             json(&target.deployment),
             json(&app.source_hash),
             json(&app.database.fingerprint),
             json(&cargo_lock_hash),
-            npm_lock_hash
-                .as_deref()
-                .map(json)
-                .unwrap_or_else(|| "null".to_string()),
-            json(&elm_json_hash),
+            json(&js_runtime_hash),
             json(certified::wire_version()),
             json_array(&app.unsafe_operations),
         ),
@@ -244,30 +192,50 @@ pub fn build(
 
     Ok(BuildReport {
         rust_artifacts,
-        web_artifact,
+        web_artifacts,
         cargo_lock_hash,
-        npm_lock_hash,
-        elm_json_hash,
+        js_runtime_hash,
         target_lock,
         manifest,
     })
 }
 
+/// The `[[bin]]` names of a generated `Cargo.toml`, in order.
+fn binaries(cargo_toml: &str) -> Vec<String> {
+    cargo_toml
+        .split("[[bin]]\n")
+        .skip(1)
+        .filter_map(|section| {
+            let line = section.lines().next()?;
+            let name = line.strip_prefix("name = \"")?.strip_suffix('"')?;
+            Some(name.to_string())
+        })
+        .collect()
+}
+
+/// Every file of the generated `web/`, sorted by path.
+fn web_artifacts(web: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut files = Vec::new();
+    for entry in
+        fs::read_dir(web).map_err(|error| format!("Cannot read {}: {error}", web.display()))?
+    {
+        let path = entry
+            .map_err(|error| format!("Cannot read {}: {error}", web.display()))?
+            .path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 fn stage_rust_artifacts(
     generated: &Path,
     cargo_target: &Path,
-    app: &VerifiedApplication,
-    target: &TargetConfig,
+    names: &[String],
 ) -> Result<Vec<PathBuf>, String> {
     let release = cargo_target.join("release");
-    let names = if target.deployment == "aws-lambda" {
-        vec!["bootstrap".to_string()]
-    } else {
-        app.rpc_contracts
-            .iter()
-            .map(|rpc| snake_case(&rpc.name))
-            .collect::<Vec<_>>()
-    };
     if names.is_empty() {
         return Ok(Vec::new());
     }
@@ -275,11 +243,11 @@ fn stage_rust_artifacts(
     fs::create_dir_all(&destination)
         .map_err(|error| format!("Cannot create artifact directory: {error}"))?;
     names
-        .into_iter()
+        .iter()
         .map(|name| {
-            let source = release.join(&name);
+            let source = release.join(name);
             require_non_empty(&source)?;
-            let staged = destination.join(&name);
+            let staged = destination.join(name);
             fs::copy(&source, &staged).map_err(|error| {
                 format!(
                     "Cannot stage Rust artifact {} as {}: {error}",
@@ -348,23 +316,22 @@ fn require_non_empty(path: &Path) -> Result<(), String> {
 fn hash_file(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("Cannot hash {}: {error}", path.display()))?;
-    let digest = Sha256::digest(bytes);
-    Ok(format!("sha256:{digest:x}"))
+    Ok(hash_bytes(&bytes))
 }
 
-fn snake_case(value: &str) -> String {
-    let mut output = String::new();
-    for (index, ch) in value.chars().enumerate() {
-        if ch.is_ascii_uppercase() {
-            if index > 0 {
-                output.push('_');
-            }
-            output.push(ch.to_ascii_lowercase());
-        } else if ch.is_ascii_alphanumeric() || ch == '_' {
-            output.push(ch.to_ascii_lowercase());
-        } else {
-            output.push('_');
-        }
+fn hash_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    format!("sha256:{digest:x}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn binaries_are_read_from_the_generated_manifest() {
+        let manifest = "[package]\nname = \"bind-app\"\n\n[dependencies]\nserde = \"=1\"\n\n[[bin]]\nname = \"get_customer\"\npath = \"api/getCustomer.rs\"\n\n[[bin]]\nname = \"bind-page\"\npath = \"api/bind-page.rs\"\n\n[profile.release]\nstrip = true\n";
+        assert_eq!(binaries(manifest), ["get_customer", "bind-page"]);
+        assert!(binaries("[package]\nname = \"bind-app\"\n").is_empty());
     }
-    output
 }

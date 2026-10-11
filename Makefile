@@ -1,4 +1,4 @@
-.PHONY: build test test-generated test-js-runtime check certify certify-aws certify-vercel clean
+.PHONY: build test test-generated test-js-runtime check certify clean
 
 DATABASE_URL ?= postgresql://bind:bind@localhost/bind
 export DATABASE_URL
@@ -19,17 +19,14 @@ test-generated:
 test-js-runtime:
 	node runtime/bind-runtime-js/tests/run.mjs
 
+# The four targets of examples/commerce: aws-lambda and vercel, each in the ssr and split modes.
+TARGETS := aws-lambda-ssr aws-lambda-split vercel-ssr vercel-split
+
 check:
-	cargo run -- check --target aws-lambda
-	cargo run -- check --target vercel
+	for target in $(TARGETS); do cargo run -- check --target $$target || exit 1; done
 
-certify: certify-aws certify-vercel
-
-certify-aws:
-	cargo run -- certify --target aws-lambda
-
-certify-vercel:
-	cargo run -- certify --target vercel
+certify:
+	for target in $(TARGETS); do cargo run -- certify --target $$target || exit 1; done
 
 clean:
 	cargo clean

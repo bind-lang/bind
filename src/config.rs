@@ -15,7 +15,11 @@ pub struct ProjectConfig {
     pub database_url_env: Option<String>,
     pub database_verification: String,
     pub web_title: String,
+    // Read from `[web]`; the page shell, the same in every runtime, has no description or
+    // language yet.
+    #[allow(dead_code)]
     pub web_description: String,
+    #[allow(dead_code)]
     pub web_language: String,
     pub web_stylesheet: Option<PathBuf>,
     pub targets: BTreeMap<String, TargetConfig>,
@@ -26,9 +30,39 @@ pub struct TargetConfig {
     pub client: String,
     pub server: String,
     pub deployment: String,
+    /// `mode = "ssr"` (the server renders the page) or `"split"` (static frontend calling the
+    /// API); `"split"` when absent.
+    pub mode: Mode,
+    /// Base URL of the RPC routes the frontend calls (`<api_url>/<endpoint>`); `/api` by default.
+    pub api_url: String,
+    /// The only browser origin allowed to call the API (CORS), required when `api_url` is on
+    /// another origin.
+    pub frontend_origin: Option<String>,
     pub certified: bool,
     pub capabilities: Vec<String>,
 }
+
+/// How a web target is deployed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Mode {
+    /// One application: the Rust server renders the page and serves the API.
+    Ssr,
+    /// Two applications: a static frontend (HTML, CSS, JS) calling the Rust API over HTTP.
+    #[default]
+    Split,
+}
+
+impl Mode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Ssr => "ssr",
+            Mode::Split => "split",
+        }
+    }
+}
+
+/// The default base URL of the RPC routes (`api_url`).
+pub const DEFAULT_API_URL: &str = "/api";
 
 impl ProjectConfig {
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -46,6 +80,15 @@ impl ProjectConfig {
         let mut targets = BTreeMap::new();
         for (section, properties) in &values {
             if let Some(name) = section.strip_prefix("target.") {
+                let mode = match properties.get("mode").map(String::as_str) {
+                    None | Some("split") => Mode::Split,
+                    Some("ssr") => Mode::Ssr,
+                    Some(other) => {
+                        return Err(format!(
+                            "Target `{name}`: `mode` must be \"ssr\" or \"split\", found \"{other}\""
+                        ));
+                    }
+                };
                 targets.insert(
                     name.into(),
                     TargetConfig {
@@ -55,6 +98,12 @@ impl ProjectConfig {
                             .get("deployment")
                             .cloned()
                             .unwrap_or_else(|| name.to_string()),
+                        mode,
+                        api_url: properties
+                            .get("api_url")
+                            .cloned()
+                            .unwrap_or_else(|| DEFAULT_API_URL.to_string()),
+                        frontend_origin: properties.get("frontend_origin").cloned(),
                         certified: parse_bool(properties.get("certified").cloned(), false),
                         capabilities: properties
                             .get("capabilities")
@@ -68,9 +117,12 @@ impl ProjectConfig {
             targets.insert(
                 "aws-lambda".into(),
                 TargetConfig {
-                    client: "elm".into(),
+                    client: "web".into(),
                     server: "rust".into(),
                     deployment: "aws-lambda".into(),
+                    mode: Mode::Split,
+                    api_url: DEFAULT_API_URL.to_string(),
+                    frontend_origin: None,
                     certified: true,
                     capabilities: vec![
                         "ui.dom".into(),
@@ -151,10 +203,47 @@ mod tests {
     #[test]
     fn parses_sections() {
         let values = parse_toml_subset(
-            "[project]\nname = \"shop\"\n[target.vercel]\nclient = \"elm\"\ndeployment = \"vercel\"\ncertified = true",
+            "[project]\nname = \"shop\"\n[target.vercel]\nclient = \"web\"\ndeployment = \"vercel\"\ncertified = true",
         )
         .unwrap();
         assert_eq!(values["project"]["name"], "shop");
-        assert_eq!(values["target.vercel"]["client"], "elm");
+        assert_eq!(values["target.vercel"]["client"], "web");
+    }
+
+    fn load(text: &str) -> Result<ProjectConfig, String> {
+        let root = std::env::temp_dir().join(format!(
+            "bindc-config-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("bind.toml"), text).unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml"));
+        fs::remove_dir_all(&root).unwrap();
+        config
+    }
+
+    #[test]
+    fn web_targets_have_a_mode_an_api_url_and_an_optional_frontend_origin() {
+        let config = load(
+            "[target.a]\nclient = \"web\"\nmode = \"ssr\"\n[target.b]\nclient = \"web\"\nmode = \"split\"\napi_url = \"https://api.example.com/api\"\nfrontend_origin = \"https://app.example.com\"\n[target.c]\nclient = \"web\"\n",
+        )
+        .unwrap();
+        let a = &config.targets["a"];
+        assert_eq!((a.mode, a.api_url.as_str()), (Mode::Ssr, "/api"));
+        assert_eq!(a.frontend_origin, None);
+        let b = &config.targets["b"];
+        assert_eq!(b.mode, Mode::Split);
+        assert_eq!(b.api_url, "https://api.example.com/api");
+        assert_eq!(
+            b.frontend_origin.as_deref(),
+            Some("https://app.example.com")
+        );
+        assert_eq!(config.targets["c"].mode, Mode::Split);
+        let error = load("[target.a]\nmode = \"spa\"\n").unwrap_err();
+        assert!(
+            error.contains("`mode` must be \"ssr\" or \"split\""),
+            "{error}"
+        );
     }
 }

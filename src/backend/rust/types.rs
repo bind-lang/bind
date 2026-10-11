@@ -515,7 +515,7 @@ impl<'p> Layout<'p> {
                     output.push_str(&format!("pub enum {ident}{generics} {{\n"));
                     for (variant, fields) in variants {
                         if serde {
-                            // The `bind-json` name of a variant (as in the Elm codecs).
+                            // The `bind-json` name of a variant (`certified::lower_camel`, as in the JS codecs).
                             output.push_str(&format!(
                                 "#[serde(rename = \"{}\")]\n",
                                 crate::certified::lower_camel(variant)
