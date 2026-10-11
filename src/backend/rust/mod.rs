@@ -10,6 +10,9 @@ pub mod endpoints;
 pub mod expr;
 pub mod types;
 
+#[cfg(test)]
+mod transactions;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compiler::VerifiedApplication;

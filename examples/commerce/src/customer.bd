@@ -19,6 +19,21 @@ server fun getCustomer(id: CustomerId): Customer
     return db.customers.require(id)
 }
 
+fun normalizar(nome: String) = when (nome) {
+    "" -> "sem nome"
+    outro -> outro
+}
+
+server fun cadastrar(nome: String, email: Email, saldo: Money): Customer
+    effects [db.read, db.write] {
+    val novo = db.customers.insert {
+        name = normalizar(nome)
+        email = email
+        balance = saldo
+    }
+    return db.customers.require(novo.id)
+}
+
 client component CustomerPage(id: CustomerId) {
     val customer = server.getCustomer(id)
 
