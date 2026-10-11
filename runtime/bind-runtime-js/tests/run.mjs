@@ -369,6 +369,11 @@ test("pageHtml and errorBody match pages.json", () => {
   for (const c of cases) {
     if (c.kind === "page") {
       eq(rt.pageHtml(c.title, c.stylesheet, c.body), c.html, c.title);
+    } else if (c.kind === "bad_parameter") {
+      // The boot code shows BindError("BadParameter", name) as errorBody(kind, message).
+      const { status, tree } = rt.errorBody("BadParameter", c.name);
+      eq(status, c.status, c.name);
+      eq(renderToHtml(tree, document), c.html, c.name);
     } else {
       const { status, tree } = rt.errorBody(c.error, c.message);
       eq(status, c.status, c.error);
@@ -601,6 +606,45 @@ test("readParams: percent-decoding and + (Review Focus 1); absent, repeated or i
   eq(tricky.constructor.toString(), "-0.50");
   eq(rt.readParams("b=true", [["b", rt.textBool]]).b, true);
   throwsKind(() => rt.readParams("b=True", [["b", rt.textBool]]), "BadParameter", "bool");
+});
+
+test("readParams and the text decoders match params.json (shared with the SSR)", () => {
+  const decoders = {
+    String: rt.textString,
+    Int: rt.textInt,
+    UUID: rt.textUuid,
+    Date: rt.textDate,
+    DateTime: rt.textDateTime,
+    Instant: rt.textInstant,
+  };
+  const shown = (value) => (typeof value === "bigint" ? value.toString() : value);
+  const cases = readJson("../../vectors/params.json");
+  assert(cases.length >= 40, "param vectors");
+  for (const c of cases) {
+    const label = JSON.stringify(c);
+    if (c.kind === "text") {
+      let value;
+      let valid = true;
+      try {
+        value = decoders[c.type](c.text);
+      } catch (error) {
+        assert(error instanceof rt.DecodeError, `${label}: ${error}`);
+        valid = false;
+      }
+      eq(valid, c.valid, label);
+      if (valid) eq(shown(value), c.text, label);
+    } else {
+      const specs = c.params.map(([name, type]) => [name, decoders[type]]);
+      if (c.error !== undefined) {
+        const error = throwsKind(() => rt.readParams(c.query, specs), "BadParameter", label);
+        eq(error.message, c.error, label);
+      } else {
+        const params = rt.readParams(c.query, specs);
+        eq(Object.keys(params).length, Object.keys(c.values).length, label);
+        for (const [name, value] of Object.entries(c.values)) eq(shown(params[name]), value, label);
+      }
+    }
+  }
 });
 
 // ---- Runner ----

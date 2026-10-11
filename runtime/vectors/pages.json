@@ -8,5 +8,7 @@
   {"kind":"error_body","error":"Overflow","message":"x","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>numeric overflow</p></main>"},
   {"kind":"error_body","error":"RecursionLimit","message":"","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>recursion limit exceeded</p></main>"},
   {"kind":"error_body","error":"Database","message":"connection refused","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>database error</p></main>"},
-  {"kind":"error_body","error":"Serialization","message":"bad json","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>serialization error</p></main>"}
+  {"kind":"error_body","error":"Serialization","message":"bad json","status":500,"html":"<main class=\"bind-error\"><h1>Something went wrong</h1><p>serialization error</p></main>"},
+  {"kind":"bad_parameter","name":"id","status":400,"html":"<main class=\"bind-error\"><h1>Bad request</h1><p>invalid parameter: id</p></main>"},
+  {"kind":"bad_parameter","name":"nome","status":400,"html":"<main class=\"bind-error\"><h1>Bad request</h1><p>invalid parameter: nome</p></main>"}
 ]

@@ -86,13 +86,41 @@ clippy::unreachable
 /// The `src/lib.rs` of the generated server crate for `app`. Its runtime is the module
 /// `bind_runtime` (`src/bind_runtime.rs`, the runtime source copied verbatim).
 pub fn server_library(app: &VerifiedApplication) -> Result<String, String> {
-    library(&app.core, &app.database)
+    server_library_with(app, None)
+}
+
+/// [`server_library`], serving the page `ssr` at `GET /` when given (the `ssr` mode).
+pub fn server_library_with(
+    app: &VerifiedApplication,
+    ssr: Option<&SsrPage>,
+) -> Result<String, String> {
+    library_with(&app.core, &app.database, ssr)
+}
+
+/// The page the server renders in the `ssr` mode: the application's client component, and the
+/// title and stylesheet URL of the page shell (`page_html`), as in the `split` mode's page.
+#[derive(Clone, Copy, Debug)]
+pub struct SsrPage<'a> {
+    pub component: &'a str,
+    pub title: &'a str,
+    pub stylesheet: &'a str,
 }
 
 /// The server library of `program`: its types, the endpoints and every program function
 /// reachable from them (by name), the database functions they use, the request types, the
-/// router and the crate's tests.
+/// router and the crate's tests (no page: the `split` mode's server).
+#[cfg(test)]
 pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<String, String> {
+    library_with(program, database, None)
+}
+
+/// [`library`]; with `ssr`, also the component and the client functions it reaches, the page
+/// handler (`handle_page`) and the request router (`serve`: `GET /` is the page).
+pub fn library_with(
+    program: &CoreProgram,
+    database: &DatabaseSchema,
+    ssr: Option<&SsrPage>,
+) -> Result<String, String> {
     let layout = types::Layout::new(program);
     let mut endpoints: Vec<&CoreFunction> = program
         .functions
@@ -104,7 +132,16 @@ pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<Strin
     if let Some(problem) = server_problems(program, database).first() {
         return Err(problem.message());
     }
-    let functions = reachable(program, &endpoints);
+    let mut functions = reachable(program, &endpoints);
+    let page = match ssr {
+        Some(page) => Some(page_plan(program, page)?),
+        None => None,
+    };
+    if let Some((_, client)) = &page {
+        functions.extend(client.iter().copied());
+        functions.sort_by(|a, b| a.name.cmp(&b.name));
+        functions.dedup_by(|a, b| a.name == b.name);
+    }
     let plan =
         db::DbPlan::new(&db::operations(&functions), program, database).map_err(|errors| {
             errors
@@ -135,8 +172,76 @@ pub fn library(program: &CoreProgram, database: &DatabaseSchema) -> Result<Strin
     output.push_str(&plan.render(&outside, database)?);
     output.push_str(&endpoints::inputs(&endpoints, &names, &outside));
     output.push_str(&endpoints::router(&endpoints, &names));
-    output.push_str(&endpoints::tests(&endpoints, &names));
+    let mut page_tests = String::new();
+    if let (Some(ssr), Some((component, client))) = (ssr, &page) {
+        let uses_server = client.iter().any(|function| {
+            contains(&function.body, &|expr| {
+                matches!(expr.kind, ExprKind::ServerCall { .. })
+            })
+        });
+        output.push_str(&endpoints::page(
+            component,
+            ssr,
+            uses_server,
+            program,
+            &outside,
+        )?);
+        page_tests = endpoints::page_tests(component);
+    }
+    output.push_str(&endpoints::tests(&endpoints, &names, &page_tests));
     Ok(indent(&output))
+}
+
+/// The component of `page` and the client functions it reaches (the component included), or
+/// why the server cannot render it.
+fn page_plan<'p>(
+    program: &'p CoreProgram,
+    page: &SsrPage,
+) -> Result<(&'p CoreFunction, Vec<&'p CoreFunction>), String> {
+    let profile = crate::certified::profile_version();
+    let component = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == page.component && function.domain == crate::core::ir::Domain::Client
+        })
+        .ok_or_else(|| {
+            format!(
+                "Internal compiler error: no client component `{}`. This is a bug in bindc.",
+                page.component
+            )
+        })?;
+    let names = crate::core::lower::client_functions(program, page.component);
+    let client: Vec<&CoreFunction> = program
+        .functions
+        .iter()
+        .filter(|function| names.contains(&function.name))
+        .collect();
+    for function in &client {
+        if function.bodiless {
+            return Err(format!(
+                "Function `{}` is reachable from component `{}` but has no body, so the generated server cannot render the page in profile {profile}.",
+                function.name, component.name
+            ));
+        }
+        if contains(&function.body, &|expr| {
+            matches!(expr.kind, ExprKind::Environment(_))
+        }) {
+            return Err(format!(
+                "Function `{}` is reachable from component `{}` but uses an `environment` value, which the generated server does not support in profile {profile}.",
+                function.name, component.name
+            ));
+        }
+    }
+    Ok((component, client))
+}
+
+/// Whether `expr` or one of its subexpressions satisfies `test`.
+fn contains(expr: &Expr, test: &dyn Fn(&Expr) -> bool) -> bool {
+    test(expr)
+        || children(expr)
+            .into_iter()
+            .any(|child| contains(child, test))
 }
 
 /// The module of the generated crate holding the program's types and functions. Its name is
@@ -439,12 +544,54 @@ pub(crate) mod tests {
         schema_path(case).exists()
     }
 
+    /// A server case named `ssr*` also renders the page of its component (SSR).
+    fn is_ssr(case: &Path) -> bool {
+        case.file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("ssr"))
+    }
+
+    /// The component of `program`: the client function no other function refers to.
+    pub(crate) fn component(program: &CoreProgram) -> String {
+        let mut referenced = Vec::new();
+        for function in &program.functions {
+            let mut pending = vec![&function.body];
+            while let Some(expr) = pending.pop() {
+                if let ExprKind::Global { name, .. } = &expr.kind {
+                    referenced.push(name.clone());
+                }
+                pending.extend(children(expr));
+            }
+        }
+        let components: Vec<String> = program
+            .functions
+            .iter()
+            .filter(|function| function.domain == crate::core::ir::Domain::Client)
+            .filter(|function| !referenced.contains(&function.name))
+            .map(|function| function.name.clone())
+            .collect();
+        assert_eq!(
+            components.len(),
+            1,
+            "expected one component: {components:?}"
+        );
+        components.into_iter().next().unwrap()
+    }
+
     fn render(case: &Path) -> String {
         let source = fs::read_to_string(case).unwrap();
         if is_server(case) {
             let csv = fs::read_to_string(schema_path(case)).unwrap();
             let schema = crate::core::lower::tests::schema(&csv);
             let program = crate::core::lower::tests::compile_with(&source, &schema);
+            if is_ssr(case) {
+                let component = component(&program);
+                let page = SsrPage {
+                    component: &component,
+                    title: "Bind & SSR",
+                    stylesheet: "/styles.css",
+                };
+                return library_with(&program, &schema, Some(&page)).unwrap();
+            }
             return library(&program, &schema).unwrap();
         }
         let program = crate::core::lower::tests::compile(&source);
@@ -615,9 +762,15 @@ pub(crate) mod tests {
             assert_eq!(snapshot, render(&case), "{stem}: stale snapshot");
             let crate_dir = test_crate(&format!("bind-server-{stem}"));
             fs::write(crate_dir.join("src/lib.rs"), snapshot).unwrap();
-            if stem == "endpoint" {
+            let test = match stem.as_str() {
+                "endpoint" => Some(ENDPOINT_DATABASE_TEST),
+                "ssr" => Some(SSR_TEST),
+                "ssr_text" => Some(SSR_TEXT_TEST),
+                _ => None,
+            };
+            if let Some(test) = test {
                 fs::create_dir_all(crate_dir.join("tests")).unwrap();
-                fs::write(crate_dir.join("tests/database.rs"), ENDPOINT_DATABASE_TEST).unwrap();
+                fs::write(crate_dir.join("tests/integration.rs"), test).unwrap();
             }
             cargo(
                 &crate_dir,
@@ -727,6 +880,132 @@ fn endpoint_against_postgres() {
         pool.close().await;
         sqlx::query(sql(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
     });
+}
+"##;
+
+    /// Runs inside the `ssr` server crate (no database): parameters are decoded before the
+    /// transaction opens, so an absent, repeated or invalid `id` is a 400 error page naming it.
+    const SSR_TEST: &str = r##"#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use bind_server_ssr::bind_runtime::bad_parameter_message;
+
+fn page(query: &str) -> bind_server_ssr::HttpResult {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://bind-test.invalid/none")
+            .unwrap();
+        bind_server_ssr::handle_page(query, &pool).await
+    })
+}
+
+#[test]
+fn bad_parameters_are_400_pages_naming_the_parameter() {
+    let message = bad_parameter_message("id");
+    for query in [
+        "",
+        "?",
+        "?id=not-a-uuid",
+        "?id=123E4567-E89B-42D3-A456-426614174000",
+        "?id=123e4567-e89b-42d3-a456-426614174000&id=123e4567-e89b-42d3-a456-426614174000",
+        "?id=a&id=b",
+        "?id=%zz",
+        "?ID=123e4567-e89b-42d3-a456-426614174000",
+    ] {
+        let result = page(query);
+        assert_eq!(result.status, 400, "{query}: {}", result.body);
+        assert!(result.body.starts_with("<!DOCTYPE html>"), "{query}");
+        assert!(result.body.contains("<title>Bind &amp; SSR</title>"), "{query}");
+        assert!(result.body.contains("<h1>Bad request</h1>"), "{query}");
+        assert!(result.body.contains(&format!("<p>{message}</p>")), "{query}: {}", result.body);
+    }
+    assert_eq!(bind_server_ssr::PAGE_CONTENT_TYPE, "text/html; charset=utf-8");
+}
+
+/// A valid query reaches the transaction: without a database it is a 500 page with the public
+/// message only.
+#[test]
+fn a_database_failure_is_a_500_page() {
+    let result = page("?id=123e4567-e89b-42d3-a456-426614174000");
+    assert_eq!(result.status, 500, "{}", result.body);
+    assert!(result.body.contains("<h1>Something went wrong</h1><p>database error</p>"));
+    assert!(!result.body.contains("bind-test.invalid"));
+}
+
+#[test]
+fn get_slash_is_the_page_and_everything_else_an_rpc() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://bind-test.invalid/none")
+            .unwrap();
+        let page = bind_server_ssr::serve("GET", "/".into(), "id=x".into(), Vec::new(), pool.clone()).await;
+        assert_eq!((page.status, page.content_type), (400, "text/html; charset=utf-8"));
+        assert!(page.body.contains("invalid parameter: id"));
+        let rpc = bind_server_ssr::serve("POST", "/api/getCustomer".into(), String::new(), b"{}".to_vec(), pool.clone()).await;
+        assert_eq!((rpc.status, rpc.content_type), (400, "application/json; charset=utf-8"));
+        let missing = bind_server_ssr::serve("GET", "/other".into(), String::new(), Vec::new(), pool).await;
+        assert_eq!((missing.status, missing.content_type), (404, "application/json; charset=utf-8"));
+    });
+}
+"##;
+
+    /// Runs inside the `ssr_text` server crate: a component without server calls renders with
+    /// no database. Review Focus 1 (`?nome=Jo%C3%A3o+Silva`, repeated parameters) and the text
+    /// of every displayable type, escaped.
+    const SSR_TEXT_TEST: &str = r##"#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+fn page(query: &str) -> bind_server_ssr_text::HttpResult {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgresql://bind-test.invalid/none")
+            .unwrap();
+        bind_server_ssr_text::handle_page(query, &pool).await
+    })
+}
+
+const BASE: &str = "codigo=C-1&email=a%40b.c&site=https%3A%2F%2Fx.y%2F%3Fa%3D1%26b%3D2&n=12345678901234567890&id=123e4567-e89b-42d3-a456-426614174000&dia=2024-02-29&hora=2024-01-01T10%3A00%3A00.500&quando=2024-01-01T10:00:00Z";
+
+#[test]
+fn percent_encoded_and_plus_parameters_are_decoded() {
+    let result = page(&format!("?nome=Jo%C3%A3o+Silva&{BASE}"));
+    assert_eq!(result.status, 200, "{}", result.body);
+    let expected = concat!(
+        r#"<div class="bind-site"><section class="ficha" id="top">"#,
+        r#"<h2 class="title">Oi João Silva</h2>"#,
+        r#"C-1a@b.chttps://x.y/?a=1&amp;b=2"#,
+        r#"1234567890123456789012345678901234567891"#,
+        r#"123e4567-e89b-42d3-a456-4266141740002024-02-292024-01-01T10:00:00.5002024-01-01T10:00:00Z"#,
+        r#"true0.300000000000000040.20000000298023224Infinity"#,
+        r#"&lt;script&gt;alert(1)&lt;/script&gt;<strong>positivo</strong>"#,
+        r#"<a href="https://x.y/?a=1&amp;b=2" class="c" target="_blank" rel="noopener noreferrer">10000000000000000000000</a>"#,
+        r#"</section></div>"#
+    );
+    assert!(result.body.contains(expected), "{}", result.body);
+    assert!(result.body.contains("<title>Bind &amp; SSR</title>"));
+    assert!(!result.body.contains("<script"));
+}
+
+#[test]
+fn repeated_absent_or_invalid_parameters_are_400() {
+    for (query, name) in [
+        (format!("?nome=a&nome=b&{BASE}"), "nome"),
+        (format!("?nome=%C3&{BASE}"), "nome"),
+        (BASE.to_string(), "nome"),
+        (format!("?nome=x&{BASE}&id=123e4567-e89b-42d3-a456-426614174000"), "id"),
+        (format!("?nome=x&{}", BASE.replace("n=1234", "n=01234")), "n"),
+        (format!("?nome=x&{}", BASE.replace("2024-02-29", "2023-02-29")), "dia"),
+        (format!("?nome=x&{}", BASE.replace("10:00:00Z", "10:00:00+00:00")), "quando"),
+    ] {
+        let result = page(&query);
+        assert_eq!(result.status, 400, "{query}: {}", result.body);
+        assert!(result.body.contains(&format!("<p>invalid parameter: {name}</p>")), "{query}: {}", result.body);
+    }
 }
 "##;
 

@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::ir::{Arm, CoreFunction, DbOp, Expr, ExprKind, Literal, LocalId, Prim};
+use crate::core::ir::{Arm, CoreFunction, DbOp, Expr, ExprKind, Literal, LocalId, Prim, UiNode};
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 
@@ -543,13 +543,21 @@ impl Generator<'_, '_> {
             )),
             ExprKind::Builtin { name, instance } => self.builtin_value(name, instance, &expr.ty),
             ExprKind::Db { op, table, args } => self.db(op, table, args),
-            ExprKind::Environment(_) | ExprKind::ServerCall { .. } => atom(
-                "::std::compile_error!(\"bindc: environment values and server calls are not server code\")",
-            ),
-            // Rejected by `server_problems` (E8310) before generation; never panics.
-            ExprKind::Ui { .. } => {
-                atom("::std::compile_error!(\"bindc: UI trees are not server code\")")
+            ExprKind::Environment(_) => {
+                atom("::std::compile_error!(\"bindc: environment values are not server code\")")
             }
+            // Only in the component's code (SSR; `server_problems` rejects them in endpoint
+            // code, E8310): a direct call, as the separate RPC of the JS frontend (depth 0).
+            ExprKind::ServerCall { function, args } => {
+                let mut values = vec!["ctx.server_call()".to_string()];
+                values.extend(self.owned_args(args));
+                atom(format!("bind_{function}({}).await?", values.join(", ")))
+            }
+            ExprKind::Ui {
+                node,
+                args,
+                children,
+            } => self.ui(*node, args, children),
             ExprKind::Ctor {
                 type_name,
                 ctor,
@@ -574,6 +582,35 @@ impl Generator<'_, '_> {
             ExprKind::Return(value) => {
                 let value = self.expr(value);
                 complex(format!("return {}", ok(&value)))
+            }
+        }
+    }
+
+    /// A UI node as a runtime `Node` (SSR): arguments, then children, in order.
+    fn ui(&mut self, node: UiNode, args: &[Expr], children: &Expr) -> Code {
+        match node {
+            UiNode::Text => {
+                let text = args
+                    .first()
+                    .map_or_else(|| format!("{STRING}::new()"), |arg| self.expr(arg).text);
+                atom(format!("{RUNTIME}::Node::Text({text})"))
+            }
+            UiNode::Empty => atom(format!("{RUNTIME}::Node::Empty")),
+            _ => {
+                let args: Vec<String> = args
+                    .iter()
+                    .map(|arg| {
+                        let value = self.expr(arg).text;
+                        let int = matches!(&arg.ty, Type::Con(name, args) if name == "Int" && args.is_empty());
+                        let kind = if int { "Int" } else { "Str" };
+                        format!("{RUNTIME}::NodeArg::{kind}({value})")
+                    })
+                    .collect();
+                let children = self.expr(children).text;
+                atom(format!(
+                    "{RUNTIME}::Node::Element {{\ntag: {RUNTIME}::NodeTag::{node:?},\nargs: ::std::vec![{}],\nchildren: {ARC}::unwrap_or_clone({children}),\n}}",
+                    args.join(", ")
+                ))
             }
         }
     }
@@ -1006,12 +1043,30 @@ impl Generator<'_, '_> {
                 let a = self.expr(a);
                 complex(format!("!{}", a.wrapped()))
             }
-            // Only inside `Text` nodes, which `server_problems` rejects (E8310).
-            (
-                DisplayString | DisplayInt | DisplayLong | DisplayDouble | DisplayFloat
-                | DisplayBool | DisplayDecimal | DisplayText,
-                _,
-            ) => atom("::std::compile_error!(\"bindc: display primitives are not server code\")"),
+            // Only inside `Text` nodes (SSR): the text the JS frontend shows, byte for byte.
+            (DisplayString, [a]) => self.expr(a),
+            (DisplayInt | DisplayLong | DisplayBool, [a]) => {
+                atom(format!("{}.to_string()", self.operand(a)))
+            }
+            (DisplayDouble, [a]) => atom(format!(
+                "{RUNTIME}::js_number_to_string({})",
+                self.expr(a).text
+            )),
+            (DisplayFloat, [a]) => atom(format!(
+                "{RUNTIME}::js_number_to_string(::std::convert::Into::<::std::primitive::f64>::into({}))",
+                self.expr(a).text
+            )),
+            (DisplayDecimal, [a]) => {
+                atom(format!("{RUNTIME}::display_decimal({})", self.borrowed(a)))
+            }
+            (DisplayText, [a]) => {
+                if matches!(&a.ty, Type::Con(name, args) if name == "Duration" && args.is_empty()) {
+                    atom(format!("{RUNTIME}::display_duration({})", self.borrowed(a)))
+                } else {
+                    // UUID, Date, DateTime, Instant: the wire string.
+                    atom(format!("{RUNTIME}::display_text({})?", self.borrowed(a)))
+                }
+            }
             _ => atom("::std::compile_error!(\"bindc: malformed primitive\")"),
         }
     }

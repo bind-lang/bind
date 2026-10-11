@@ -1,0 +1,32 @@
+// SSR (`ssr*` cases render the server with the page of their component): the component's
+// parameter comes from the URL, `server.getCustomer` is a direct call in the page's transaction.
+package app.customers
+
+distinct type CustomerId = UUID
+
+entity Customer(
+    val id: CustomerId,
+    val name: String,
+    val email: Email,
+    val balance: Money
+)
+
+server fun getCustomer(id: CustomerId): Customer
+    effects [db.read] {
+    return db.customers.require(id)
+}
+
+fun saudacao(nome: String) = "Olá, " + nome
+
+client component CustomerPage(id: CustomerId) {
+    val customer = server.getCustomer(id)
+
+    UI {
+        Main("customer") {
+            Heading(1) { Text(saudacao(customer.name)) }
+            Paragraph { Text(customer.email) }
+            Paragraph("balance") { Text(customer.balance) }
+            Small { Text(customer.id) }
+        }
+    }
+}

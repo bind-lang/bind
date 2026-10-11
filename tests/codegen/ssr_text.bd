@@ -1,0 +1,37 @@
+// SSR without server calls (no transaction): every page parameter type, distinct included, and
+// `Text` of every displayable type, as the JS frontend shows them.
+package app.text
+
+distinct type Nome = String
+distinct type Codigo = Nome
+
+server fun ping(): Int {
+    return 1
+}
+
+fun dobro(x: Float): Float = x * 2.0f
+
+client component Ficha(nome: String, codigo: Codigo, email: Email, site: Url, n: Int, id: UUID, dia: Date, hora: DateTime, quando: Instant) {
+    UI {
+        Section("ficha", "top") {
+            val oi = "Oi " + nome
+            Heading(2, "title") { Text(oi) }
+            Text(codigo)
+            Text(email)
+            Text(site)
+            Text(n)
+            Text(n + 1)
+            Text(id)
+            Text(dia)
+            Text(hora)
+            Text(quando)
+            Text(n > 0)
+            Text(0.1 + 0.2)
+            Text(dobro(0.1f))
+            Text(1.5e300 * 1.0e10)
+            Text("<script>alert(1)</script>")
+            if (n > 0) Strong { Text("positivo") } else Rule("sep")
+            Link("https://x.y/?a=1&b=2", "c", "_blank") { Text(10000000000000000000000) }
+        }
+    }
+}

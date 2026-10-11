@@ -624,18 +624,89 @@ export function textBool(text) {
   return fail("true or false");
 }
 
+// The texts of UUID, Date, DateTime and Instant parameters are the canonical wire strings the
+// server (serde with uuid/chrono) writes, kept as is; the Rust runtime's FromParam accepts the
+// same texts (runtime/vectors/params.json).
+
+const UUID_TEXT = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const DATE_TEXT = /^(\d{4})-(\d{2})-(\d{2})$/;
+const DATE_TIME_TEXT = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{3}|\d{6}|\d{9}))?$/;
+
+/** UUID: lowercase, hyphenated. */
+export function textUuid(text) {
+  return UUID_TEXT.test(text) ? text : fail("a lowercase hyphenated UUID");
+}
+
+function validDate(year, month, day) {
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const days = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1];
+  return days !== undefined && day >= 1 && day <= days;
+}
+
+/** The fields of a canonical DateTime text (no leap second, shortest 3/6/9-digit fraction). */
+function dateTimeText(text) {
+  const match = DATE_TIME_TEXT.exec(text);
+  if (match === null) return false;
+  const [, year, month, day, hour, minute, second, fraction] = match;
+  return (
+    validDate(Number(year), Number(month), Number(day)) &&
+    Number(hour) <= 23 &&
+    Number(minute) <= 59 &&
+    Number(second) <= 59 &&
+    (fraction === undefined || !fraction.endsWith("000"))
+  );
+}
+
+/** Date: YYYY-MM-DD, a valid date of the years 0000 to 9999. */
+export function textDate(text) {
+  const match = DATE_TEXT.exec(text);
+  return match !== null && validDate(Number(match[1]), Number(match[2]), Number(match[3]))
+    ? text
+    : fail("a date YYYY-MM-DD");
+}
+
+/** DateTime: YYYY-MM-DDTHH:MM:SS, then a fraction of 3, 6 or 9 digits when not zero (the shortest). */
+export function textDateTime(text) {
+  return dateTimeText(text) ? text : fail("a date-time YYYY-MM-DDTHH:MM:SS");
+}
+
+/** Instant: a DateTime text followed by "Z". */
+export function textInstant(text) {
+  return text.endsWith("Z") && dateTimeText(text.slice(0, -1)) ? text : fail("an instant YYYY-MM-DDTHH:MM:SSZ");
+}
+
+/** "+" as a space, then percent-decoding; null on a malformed escape or invalid UTF-8. */
+function formDecode(text) {
+  try {
+    return decodeURIComponent(text.replaceAll("+", " "));
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Reads the parameters `specs` ([name, textDecoder] pairs) from a query string with
- * URLSearchParams semantics (percent-decoding, "+" is a space). A parameter that is absent,
- * repeated or rejected by its decoder gives BindError("BadParameter", name); unknown
- * parameters are ignored. Gives record(...) with the parameters in the given order.
+ * Reads the parameters `specs` ([name, textDecoder] pairs) from a query string (an optional
+ * leading "?"): split on "&" (empty pieces skipped), then on the first "="; "+" is a space and
+ * "%XX" a byte, and the bytes must be UTF-8. Decoding is strict, as in the SSR (the Rust
+ * runtime's QueryParams): a malformed escape or invalid UTF-8 makes a value invalid and a name
+ * undecodable (that pair is ignored). A parameter that is absent, repeated, invalid or rejected
+ * by its decoder gives BindError("BadParameter", name); unknown parameters are ignored. Gives
+ * record(...) with the parameters in the given order.
  */
 export function readParams(search, specs) {
-  const params = new URLSearchParams(search);
+  const query = search.startsWith("?") ? search.slice(1) : search;
+  const pairs = [];
+  for (const piece of query.split("&")) {
+    if (piece === "") continue;
+    const at = piece.indexOf("=");
+    const name = formDecode(at === -1 ? piece : piece.slice(0, at));
+    if (name === null) continue;
+    pairs.push([name, formDecode(at === -1 ? "" : piece.slice(at + 1))]);
+  }
   const entries = [];
   for (const [name, decoder] of specs) {
-    const values = params.getAll(name);
-    if (values.length !== 1) throw new BindError("BadParameter", name);
+    const values = pairs.filter(([key]) => key === name).map(([, value]) => value);
+    if (values.length !== 1 || values[0] === null) throw new BindError("BadParameter", name);
     try {
       entries.push([name, decoder(values[0])]);
     } catch {
@@ -777,6 +848,11 @@ function escapeHtml(s) {
   return s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }
 
+/** The public message of a bad page parameter (the Rust runtime's bad_parameter_message). */
+export function badParameterMessage(name) {
+  return `invalid parameter: ${name}`;
+}
+
 /** Rust's page_html: the full document; title and stylesheet escaped, `body` (HTML) as is. */
 export function pageHtml(title, stylesheet, body) {
   return (
@@ -790,7 +866,8 @@ export function pageHtml(title, stylesheet, body) {
 /**
  * Rust's error_body as a UI tree: { status, tree } where tree renders to
  * `<main class="bind-error"><h1>title</h1><p>public message</p></main>`. `kind` is an
- * AppError kind: "BadRequest" (message shown), "NotFound", "Database", "Serialization",
+ * AppError kind: "BadRequest" (message shown), "BadParameter" (message is the parameter name:
+ * shown as the SSR's bad_parameter(name), status 400), "NotFound", "Database", "Serialization",
  * "Overflow", "RecursionLimit", "Internal" (fixed public messages, as AppError's
  * public_message; the given message is never shown). Any other kind is shown as "Internal".
  */
@@ -801,6 +878,10 @@ export function errorBody(kind, message) {
     case "BadRequest":
       status = 400;
       publicMessage = message;
+      break;
+    case "BadParameter":
+      status = 400;
+      publicMessage = badParameterMessage(message);
       break;
     case "NotFound":
       status = 404;

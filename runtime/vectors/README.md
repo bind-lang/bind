@@ -44,6 +44,22 @@ specification of the page shell and the error screen:
   `BadRequest`, `NotFound`, `Internal`, `Overflow`, `RecursionLimit` with its `message`;
   `error_body(error)` must give `status` and `html` (`<main class="bind-error">` with the
   title of the status class and the public message, both escaped).
+- `{ "kind": "bad_parameter", "name", "status", "html" }`: the error screen of a page
+  parameter that is absent, repeated or invalid: the Rust runtime's
+  `error_body(&bad_parameter(name))` and the JS runtime's `errorBody("BadParameter", name)`.
+
+## `params.json`
+
+Page parameters (Review Focus 1), checked by the Rust runtime (`QueryParams`, `param`,
+`FromParam`, used by the SSR) and the JS runtime (`readParams` and its text decoders):
+
+- `{ "kind": "text", "type", "text", "valid" }`: the text decoder of the Bind type `type`
+  (`String`, `Int`, `UUID`, `Date`, `DateTime`, `Instant`) accepts `text` exactly when `valid`;
+  an accepted text is canonical (the value shows and serializes as `text`).
+- `{ "kind": "query", "query", "params": [[name, type]...], "values" | "error" }`: reading the
+  parameters in order from the query string gives `values` (name to canonical text), or fails
+  with `BadParameter` for the parameter `error` (absent, repeated, malformed `%` escape or
+  invalid UTF-8 in its value, or rejected by its decoder).
 
 ## Links
 

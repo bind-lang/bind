@@ -1,11 +1,13 @@
 //! Endpoints of the generated server: request types, the RPC router and the per-call
-//! transaction (commit on `Ok`, rollback on `Err`).
+//! transaction (commit on `Ok`, rollback on `Err`); in the `ssr` mode, the page at `GET /`
+//! (`handle_page`, same transaction discipline) and the request router `serve`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::ir::CoreFunction;
+use crate::core::ir::{CoreFunction, CoreProgram, CoreType};
+use crate::types::ty::Type;
 
-use super::types::{Layout, RUNTIME, field_ident, field_line};
+use super::types::{DISTINCT_FIELD, Layout, RUNTIME, field_ident, field_line};
 
 /// The request type of each endpoint: `<Name>Input`, unique among them and distinct from the
 /// other items at the crate root (user types live in the program module).
@@ -142,8 +144,237 @@ match ::tokio::spawn(async move {{ handle_rpc(&path, &body, &pool).await }}).awa
     output
 }
 
-/// Tests compiled into the generated crate: request decoding and routing (no database).
-pub fn tests(endpoints: &[&CoreFunction], names: &BTreeMap<String, String>) -> String {
+/// The Rust type a page parameter of type `ty` is decoded as (`FromParam` in the runtime) and
+/// the distinct types wrapping it, outermost first; `None` when a URL cannot carry it.
+fn param_type(ty: &Type, program: &CoreProgram) -> Option<(Type, Vec<String>)> {
+    let Type::Con(name, args) = ty else {
+        return None;
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let distinct = program
+        .types
+        .iter()
+        .find_map(|declaration| match declaration {
+            CoreType::Distinct {
+                name: declared,
+                underlying,
+            } if declared == name => Some(underlying),
+            _ => None,
+        });
+    if let Some(underlying) = distinct {
+        let (base, mut wrappers) = param_type(underlying, program)?;
+        wrappers.insert(0, name.clone());
+        return Some((base, wrappers));
+    }
+    let user = program.types.iter().any(|declaration| match declaration {
+        CoreType::Record { name: declared, .. } | CoreType::Sum { name: declared, .. } => {
+            declared == name
+        }
+        CoreType::Distinct { .. } => false,
+    });
+    let allowed = [
+        "String", "Email", "Url", "Int", "UUID", "Date", "DateTime", "Instant",
+    ];
+    (!user && allowed.contains(&name.as_str())).then(|| (ty.clone(), Vec::new()))
+}
+
+/// The page of the `ssr` mode: content types, the shell's title and stylesheet, `handle_page`
+/// (`GET /`: the component rendered in one transaction), `serve_page` and the request router
+/// `serve`. Without server calls the component runs without a transaction.
+pub fn page(
+    component: &CoreFunction,
+    ssr: &super::SsrPage,
+    uses_server: bool,
+    program: &CoreProgram,
+    layout: &Layout,
+) -> Result<String, String> {
+    let none = BTreeMap::new();
+    let mut decode = String::new();
+    let mut arguments = Vec::new();
+    for (index, (_, name, ty)) in component.params.iter().enumerate() {
+        let Some((base, wrappers)) = param_type(ty, program) else {
+            return Err(format!(
+                "Component `{}` has parameter `{name}` of type `{}`, which a page URL cannot carry in profile {}.",
+                component.name,
+                crate::types::ty::display(ty),
+                crate::certified::profile_version()
+            ));
+        };
+        let mut value = "value".to_string();
+        for wrapper in wrappers.iter().rev() {
+            value = format!(
+                "{} {{ {DISTINCT_FIELD}: {value} }}",
+                layout.type_path(wrapper)
+            );
+        }
+        let argument = format!("a{index}");
+        decode.push_str(&format!(
+            "let {argument} = match {RUNTIME}::param::<{}>(&params, {name:?}) {{
+::std::result::Result::Ok(value) => {value},
+::std::result::Result::Err(error) => return page_error(&error),
+}};
+",
+            layout.ty(&base, &none)
+        ));
+        arguments.push(argument);
+    }
+    if !decode.is_empty() {
+        decode.insert_str(
+            0,
+            &format!(
+                "let params = {RUNTIME}::QueryParams::parse(query);
+"
+            ),
+        );
+    }
+    let call = |ctx: &str| {
+        let mut values = vec![ctx.to_string()];
+        values.extend(arguments.iter().cloned());
+        format!(
+            "{}::bind_{}({}).await",
+            super::PROGRAM_MODULE,
+            component.name,
+            values.join(", ")
+        )
+    };
+    let run = if uses_server {
+        format!(
+            "let transaction = match pool.begin().await {{
+::std::result::Result::Ok(transaction) => transaction,
+::std::result::Result::Err(error) => return page_error(&{RUNTIME}::AppError::from(error)),
+}};
+let ctx = {RUNTIME}::Ctx::with_transaction(transaction);
+let result = {};
+let transaction = match ctx.take_transaction().await {{
+::std::result::Result::Ok(transaction) => transaction,
+::std::result::Result::Err(error) => return page_error(&error),
+}};
+::std::mem::drop(ctx);
+match result {{
+::std::result::Result::Ok(node) => match transaction.commit().await {{
+::std::result::Result::Ok(()) => page_result(&node),
+::std::result::Result::Err(error) => page_error(&{RUNTIME}::AppError::from(error)),
+}},
+::std::result::Result::Err(error) => {{
+// The error is the page; a failed rollback leaves nothing committed either.
+let _ = transaction.rollback().await;
+page_error(&error)
+}}
+}}",
+            call("ctx.clone()")
+        )
+    } else {
+        format!(
+            "// The component makes no server call: no transaction.
+match {} {{
+::std::result::Result::Ok(node) => page_result(&node),
+::std::result::Result::Err(error) => page_error(&error),
+}}",
+            call(&format!("{RUNTIME}::Ctx::pure()"))
+        )
+    };
+    Ok(format!(
+        "/// Content type of the page responses (`handle_page`).
+pub const PAGE_CONTENT_TYPE: &str = \"text/html; charset=utf-8\";
+
+/// Content type of the RPC responses (`handle_rpc`).
+pub const RPC_CONTENT_TYPE: &str = \"application/json; charset=utf-8\";
+
+/// Title of the page shell.
+const PAGE_TITLE: &str = {title:?};
+
+/// Stylesheet URL of the page shell.
+const PAGE_STYLESHEET: &str = {stylesheet:?};
+
+/// The error page of `error`, with its status; the message never exposes internals.
+fn page_error(error: &{RUNTIME}::AppError) -> HttpResult {{
+let (status, body) = {RUNTIME}::error_page(error, PAGE_TITLE, PAGE_STYLESHEET);
+HttpResult {{ status, body }}
+}}
+
+/// The page of a rendered component.
+fn page_result(node: &{RUNTIME}::Node) -> HttpResult {{
+let body = {RUNTIME}::page_html(PAGE_TITLE, PAGE_STYLESHEET, &{RUNTIME}::render_html(node));
+HttpResult {{ status: 200, body }}
+}}
+
+/// `GET /`: the page of component `{name}` (HTML, `PAGE_CONTENT_TYPE`). Its parameters come
+/// from the query string `query` (absent, repeated or invalid: a 400 page naming the
+/// parameter); server calls run in one transaction, committed when the page renders and rolled
+/// back on an error, whose page has the error's status.
+pub async fn handle_page(query: &str, pool: &::sqlx::PgPool) -> HttpResult {{
+{decode}{run}
+}}
+
+/// `handle_page` on a runtime worker thread (see `serve_rpc`).
+pub async fn serve_page(query: ::std::string::String, pool: ::sqlx::PgPool) -> HttpResult {{
+match ::tokio::spawn(async move {{ handle_page(&query, &pool).await }}).await {{
+::std::result::Result::Ok(result) => result,
+::std::result::Result::Err(_) => page_error(&{RUNTIME}::AppError::Internal(::std::string::String::from(\"the request task failed\"))),
+}}
+}}
+
+/// An HTTP response: status, content type and body.
+#[derive(Debug)]
+pub struct HttpResponse {{
+pub status: u16,
+pub content_type: &'static str,
+pub body: ::std::string::String,
+}}
+
+/// Routes one request: `GET /` is the page (`query` is its query string, with or without the
+/// leading `?`), every other request an RPC call (`serve_rpc`).
+pub async fn serve(
+method: &str,
+path: ::std::string::String,
+query: ::std::string::String,
+body: ::std::vec::Vec<u8>,
+pool: ::sqlx::PgPool,
+) -> HttpResponse {{
+if method == \"GET\" && (path.is_empty() || path == \"/\") {{
+let result = serve_page(query, pool).await;
+HttpResponse {{ status: result.status, content_type: PAGE_CONTENT_TYPE, body: result.body }}
+}} else {{
+let result = serve_rpc(path, body, pool).await;
+HttpResponse {{ status: result.status, content_type: RPC_CONTENT_TYPE, body: result.body }}
+}}
+}}
+
+",
+        title = ssr.title,
+        stylesheet = ssr.stylesheet,
+        name = component.name,
+    ))
+}
+
+/// The page tests of the generated crate: a missing parameter is a 400 page naming it.
+pub fn page_tests(component: &CoreFunction) -> String {
+    let Some((_, name, _)) = component.params.first() else {
+        return String::new();
+    };
+    format!(
+        "
+#[test]
+fn pages_with_a_missing_parameter_are_400() -> ::std::result::Result<(), ::std::boxed::Box<dyn ::std::error::Error>> {{
+let runtime = ::tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+runtime.block_on(async {{
+let pool = ::sqlx::postgres::PgPoolOptions::new()
+.connect_lazy(\"postgresql://bind-test.invalid/none\")?;
+let page = super::handle_page(\"\", &pool).await;
+assert_eq!(page.status, 400);
+assert!(page.body.contains(&crate::bind_runtime::bad_parameter_message({name:?})));
+::std::result::Result::Ok(())
+}})
+}}
+"
+    )
+}
+
+/// Tests compiled into the generated crate: request decoding and routing (no database), then
+/// `extra` (the page tests in the `ssr` mode).
+pub fn tests(endpoints: &[&CoreFunction], names: &BTreeMap<String, String>, extra: &str) -> String {
     let mut checks = String::new();
     for endpoint in endpoints {
         checks.push_str(&format!(
@@ -176,7 +407,7 @@ assert_eq!(malformed.status, 400);
 ::std::result::Result::Ok(())
 }})
 }}
-}}
+{extra}}}
 "
     )
 }

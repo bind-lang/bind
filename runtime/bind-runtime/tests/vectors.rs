@@ -3,7 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bind_runtime::{
-    AppError, Int, Node, NodeArg, NodeTag, error_body, js_number_to_string, page_html, render_html,
+    AppError, FromParam, Int, Node, NodeArg, NodeTag, QueryParams, bad_parameter, display_text,
+    error_body, js_number_to_string, page_html, param, render_html,
 };
 use serde_json::Value;
 
@@ -95,14 +96,105 @@ fn page_vectors() {
                     "RecursionLimit" => AppError::RecursionLimit,
                     // The message of these kinds is never shown: any inner error will do.
                     "Database" => AppError::Database(sqlx::Error::RowNotFound),
-                    "Serialization" => AppError::Serialization(
-                        serde_json::from_str::<i32>(&message).unwrap_err(),
-                    ),
+                    "Serialization" => {
+                        AppError::Serialization(serde_json::from_str::<i32>(&message).unwrap_err())
+                    }
                     other => panic!("unknown error {other}"),
                 };
                 let (status, html) = error_body(&error);
                 assert_eq!(status, case["status"].as_u64().unwrap() as u16);
                 assert_eq!(html, expected);
+            }
+            "bad_parameter" => {
+                let (status, html) = error_body(&bad_parameter(text("name")));
+                assert_eq!(status, case["status"].as_u64().unwrap() as u16);
+                assert_eq!(html, expected);
+            }
+            other => panic!("unknown kind {other}"),
+        }
+    }
+}
+
+/// The canonical text of a decoded parameter (its wire form): what `Text` shows for it.
+fn canonical<T: FromParam + serde::Serialize>(text: &str) -> Option<String> {
+    T::from_param(text).map(|value| display_text(&value).unwrap())
+}
+
+/// Decodes `text` as a parameter of the Bind type `ty`; `Some(canonical text)` when valid.
+fn decode(ty: &str, text: &str) -> Option<String> {
+    match ty {
+        "String" => String::from_param(text),
+        "Int" => Int::from_param(text).map(|value| value.to_string()),
+        "UUID" => canonical::<uuid::Uuid>(text),
+        "Date" => canonical::<chrono::NaiveDate>(text),
+        "DateTime" => canonical::<chrono::NaiveDateTime>(text),
+        "Instant" => canonical::<chrono::DateTime<chrono::Utc>>(text),
+        other => panic!("unknown parameter type {other}"),
+    }
+}
+
+/// The value of parameter `name` of type `ty` in `params`, as its canonical text.
+fn read(params: &QueryParams, name: &str, ty: &str) -> Result<String, AppError> {
+    match ty {
+        "String" => param::<String>(params, name),
+        "Int" => param::<Int>(params, name).map(|value| value.to_string()),
+        "UUID" => param::<uuid::Uuid>(params, name).map(|value| value.to_string()),
+        "Instant" => param::<chrono::DateTime<chrono::Utc>>(params, name)
+            .map(|value| display_text(&value).unwrap()),
+        other => panic!("unknown parameter type {other}"),
+    }
+}
+
+/// Review Focus 1: the strict URL parameter decoding shared with the JS runtime's `readParams`.
+#[test]
+fn param_vectors() {
+    let cases = vectors("params.json");
+    assert!(cases.len() >= 40);
+    for case in &cases {
+        let text = |key: &str| case[key].as_str().unwrap();
+        match text("kind") {
+            "text" => {
+                let decoded = decode(text("type"), text("text"));
+                let valid = case["valid"].as_bool().unwrap();
+                assert_eq!(decoded.is_some(), valid, "{case}");
+                if let Some(canonical) = decoded {
+                    // A valid text is canonical: the value shows (and serializes) as the text.
+                    assert_eq!(canonical, text("text"), "{case}");
+                }
+            }
+            "query" => {
+                let params = QueryParams::parse(text("query"));
+                let specs = case["params"].as_array().unwrap();
+                let mut result = Ok(Vec::new());
+                for spec in specs {
+                    let (name, ty) = (spec[0].as_str().unwrap(), spec[1].as_str().unwrap());
+                    match read(&params, name, ty) {
+                        Ok(value) => {
+                            if let Ok(values) = &mut result {
+                                values.push((name.to_string(), value));
+                            }
+                        }
+                        Err(error) => {
+                            result = Err(error);
+                            break;
+                        }
+                    }
+                }
+                match (result, case.get("error")) {
+                    (Ok(values), None) => {
+                        let expected = case["values"].as_object().unwrap();
+                        assert_eq!(values.len(), expected.len(), "{case}");
+                        for (name, value) in values {
+                            assert_eq!(expected[&name].as_str().unwrap(), value, "{case}");
+                        }
+                    }
+                    (Err(error), Some(name)) => {
+                        let expected = bad_parameter(name.as_str().unwrap());
+                        assert_eq!(error.public_message(), expected.public_message(), "{case}");
+                        assert_eq!(error.status(), 400, "{case}");
+                    }
+                    (result, _) => panic!("{case}: got {result:?}"),
+                }
             }
             other => panic!("unknown kind {other}"),
         }

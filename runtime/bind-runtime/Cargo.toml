@@ -15,5 +15,5 @@ num-bigint = "=0.4.6"
 bigdecimal = "=0.4.8"
 rust_decimal = { version = "=1.37.2", features = ["serde-str"] }
 chrono = { version = "=0.4.41", features = ["serde"] }
-# Not used by the runtime itself: pins the version generated crates use for `Uuid`.
+# `Uuid`: page parameters, and the version generated crates use.
 uuid = { version = "=1.28.0", features = ["serde"] }

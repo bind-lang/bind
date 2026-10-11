@@ -122,6 +122,15 @@ impl Ctx {
         }
     }
 
+    /// Context of a server function called by the SSR: the same transaction, depth 0, as the
+    /// separate RPC the JS frontend makes.
+    pub fn server_call(&self) -> Ctx {
+        Ctx {
+            transaction: self.transaction.clone(),
+            depth: 0,
+        }
+    }
+
     /// Context for a nested call: depth + 1, or `RecursionLimit` past `MAX_DEPTH`.
     pub fn enter(&self) -> Result<Ctx, AppError> {
         if self.depth >= MAX_DEPTH {
@@ -841,6 +850,157 @@ pub fn display_duration(value: &chrono::TimeDelta) -> String {
     value.to_string()
 }
 
+/// The text of a value of a type whose wire form is a JSON string (`UUID`, `Date`,
+/// `DateTime`, `Instant`): that string, which is what the JS frontend holds and shows.
+pub fn display_text<T: serde::Serialize>(value: &T) -> Result<String, AppError> {
+    match serde_json::to_value(value)? {
+        serde_json::Value::String(text) => Ok(text),
+        other => Ok(other.to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page parameters (SSR): the query string of `GET /`, decoded like the JS runtime's `readParams`.
+// ---------------------------------------------------------------------------------------------
+
+/// The public message of a page parameter that is absent, repeated or invalid; the JS runtime's
+/// `errorBody("BadParameter", name)` shows the same text.
+pub fn bad_parameter_message(name: &str) -> String {
+    format!("invalid parameter: {name}")
+}
+
+/// The error of a page parameter that is absent, repeated or invalid (status 400).
+pub fn bad_parameter(name: &str) -> AppError {
+    AppError::BadRequest(bad_parameter_message(name))
+}
+
+/// The pairs of a query string (`application/x-www-form-urlencoded`, an optional leading `?`):
+/// split on `&` (empty pieces skipped), then on the first `=` (a piece without one has an
+/// empty value); `+` is a space and `%XX` a byte, and the bytes must be UTF-8. Unlike
+/// `URLSearchParams`, decoding is strict: a malformed `%` escape or invalid UTF-8 makes a value
+/// invalid (the parameter is then rejected) and a name undecodable (the pair is ignored).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct QueryParams {
+    pairs: Vec<(String, Option<String>)>,
+}
+
+impl QueryParams {
+    pub fn parse(query: &str) -> QueryParams {
+        let query = query.strip_prefix('?').unwrap_or(query);
+        let pairs = query
+            .split('&')
+            .filter(|piece| !piece.is_empty())
+            .filter_map(|piece| {
+                let (name, value) = piece.split_once('=').unwrap_or((piece, ""));
+                Some((form_decode(name)?, form_decode(value)))
+            })
+            .collect();
+        QueryParams { pairs }
+    }
+
+    /// The decoded values of every pair named `name`, in order (`None` for an invalid one).
+    fn values(&self, name: &str) -> Vec<Option<&str>> {
+        self.pairs
+            .iter()
+            .filter(|(key, _)| key == name)
+            .map(|(_, value)| value.as_deref())
+            .collect()
+    }
+}
+
+/// `+` as a space, then percent-decoding; `None` on a malformed escape or invalid UTF-8.
+fn form_decode(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut input = text.bytes();
+    while let Some(byte) = input.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let high = (input.next()? as char).to_digit(16)?;
+                let low = (input.next()? as char).to_digit(16)?;
+                bytes.push((high * 16 + low) as u8);
+            }
+            other => bytes.push(other),
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// A page parameter type: decoded from its text, which must be canonical (the text the value
+/// shows and serializes as), so the SSR and the JS frontend accept the same texts.
+pub trait FromParam: Sized {
+    fn from_param(text: &str) -> Option<Self>;
+}
+
+/// `String`, `Email`, `Url`: the text as is.
+impl FromParam for String {
+    fn from_param(text: &str) -> Option<Self> {
+        Some(text.to_string())
+    }
+}
+
+/// `Int`: canonical decimal digits (at most `MAX_INT_DIGITS`), as on the wire.
+impl FromParam for Int {
+    fn from_param(text: &str) -> Option<Self> {
+        parse_canonical_int(text).map(Int)
+    }
+}
+
+/// Decodes `text` as the JSON string of a `T`, accepted only when `T` serializes back to the
+/// same text.
+fn canonical_wire<T: serde::Serialize + serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    let value: T = serde_json::from_value(serde_json::Value::String(text.to_string())).ok()?;
+    let back = display_text(&value).ok()?;
+    (back == text).then_some(value)
+}
+
+/// Whether the second of a `YYYY-MM-DDTHH:MM:SS…` text is below 60 (chrono reads a leap
+/// second `:60`, which the JS frontend does not).
+fn no_leap_second(text: &str) -> bool {
+    text.get(17..19).is_some_and(|second| second < "60")
+}
+
+/// `UUID`: lowercase, hyphenated.
+impl FromParam for uuid::Uuid {
+    fn from_param(text: &str) -> Option<Self> {
+        canonical_wire(text)
+    }
+}
+
+/// `Date`: `YYYY-MM-DD`, a valid date of the years 0000 to 9999.
+impl FromParam for chrono::NaiveDate {
+    fn from_param(text: &str) -> Option<Self> {
+        let unsigned = text.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        canonical_wire(text).filter(|_| unsigned)
+    }
+}
+
+/// `DateTime`: `YYYY-MM-DDTHH:MM:SS`, then `.` and 3, 6 or 9 fraction digits when the
+/// fraction is not zero (the shortest of those), years 0000 to 9999, no leap second.
+impl FromParam for chrono::NaiveDateTime {
+    fn from_param(text: &str) -> Option<Self> {
+        let unsigned = text.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        canonical_wire(text).filter(|_| unsigned && no_leap_second(text))
+    }
+}
+
+/// `Instant`: a `DateTime` text followed by `Z`.
+impl FromParam for chrono::DateTime<chrono::Utc> {
+    fn from_param(text: &str) -> Option<Self> {
+        let unsigned = text.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        canonical_wire(text).filter(|_| unsigned && no_leap_second(text))
+    }
+}
+
+/// The page parameter `name`: exactly one pair with that name, whose value decodes as a `T`;
+/// otherwise `bad_parameter(name)`. Other pairs are ignored.
+pub fn param<T: FromParam>(params: &QueryParams, name: &str) -> Result<T, AppError> {
+    match params.values(name).as_slice() {
+        [Some(text)] => T::from_param(text).ok_or_else(|| bad_parameter(name)),
+        _ => Err(bad_parameter(name)),
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1095,6 +1255,16 @@ mod tests {
                 Err(AppError::Internal(_))
             ));
         });
+    }
+
+    #[test]
+    fn server_calls_start_at_depth_zero() {
+        let mut ctx = Ctx::pure();
+        for _ in 0..MAX_DEPTH {
+            ctx = ctx.enter().unwrap();
+        }
+        assert!(ctx.enter().is_err());
+        assert!(ctx.server_call().enter().is_ok());
     }
 
     #[test]
