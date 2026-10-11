@@ -13,6 +13,9 @@
 //! 5. Every `Match` is exhaustive.
 //! 6. A `Db` outside lambdas needs its label in the function's `effects`; inside a lambda, in
 //!    the row of the innermost lambda's function type.
+//! 7. A `Ui` node has type `Ui`, children of type `List<Ui>` and arguments as the checker's
+//!    `infer_ui` allows (`Text`: exactly one `String`, already displayed, and `emptyList()`
+//!    children); a `Display*` primitive takes its operand type and gives `String`.
 //!
 //! Types are compared ignoring effect rows (rule 6 is the only one that reads rows): rows of
 //! function types are the checker's and are not specialized by lowering.
@@ -291,6 +294,8 @@ enum Outcome {
     /// The operand type wrapped in `Option` (checked division).
     Checked,
     Boolean,
+    /// `String` (display primitives).
+    Text,
 }
 
 fn prim_signature(op: Prim) -> (usize, Operands, Outcome) {
@@ -298,6 +303,8 @@ fn prim_signature(op: Prim) -> (usize, Operands, Outcome) {
     use Outcome::*;
     use Prim::*;
     const DECIMAL: &[&str] = &["Decimal", "Money"];
+    const STRINGS: &[&str] = &["String", "Email", "Url"];
+    const TEXTS: &[&str] = &["UUID", "Date", "DateTime", "Instant", "Duration"];
     match op {
         IntAdd | IntSub | IntMul => (2, Exactly("Int"), Same),
         IntNeg => (1, Exactly("Int"), Same),
@@ -314,6 +321,14 @@ fn prim_signature(op: Prim) -> (usize, Operands, Outcome) {
         StringConcat => (2, Exactly("String"), Same),
         Eq | NotEq | Lt | LtEq | Gt | GtEq => (2, Any, Boolean),
         Not => (1, Exactly("Boolean"), Same),
+        DisplayString => (1, OneOf(STRINGS), Text),
+        DisplayInt => (1, Exactly("Int"), Text),
+        DisplayLong => (1, Exactly("Long"), Text),
+        DisplayDouble => (1, Exactly("Double"), Text),
+        DisplayFloat => (1, Exactly("Float"), Text),
+        DisplayBool => (1, Exactly("Boolean"), Text),
+        DisplayDecimal => (1, OneOf(DECIMAL), Text),
+        DisplayText => (1, OneOf(TEXTS), Text),
     }
 }
 
@@ -466,7 +481,18 @@ impl<'p> Validator<'p> {
                 self.instances(instance);
                 self.builtin(name, instance, &expr.ty);
             }
-            ExprKind::Environment(_) | ExprKind::Ui => {}
+            ExprKind::Environment(_) => {}
+            ExprKind::Ui {
+                node,
+                args,
+                children,
+            } => {
+                for arg in args {
+                    self.expr(arg, scope, lambdas, function);
+                }
+                self.expr(children, scope, lambdas, function);
+                self.ui(*node, args, children, &expr.ty);
+            }
             ExprKind::Ctor {
                 type_name,
                 ctor,
@@ -843,6 +869,60 @@ impl<'p> Validator<'p> {
         }
     }
 
+    /// A UI node: typed `Ui`, children `List<Ui>`, arguments as `infer_ui` allows them (`Text`:
+    /// one `String`, already displayed, and no children; `Empty`: nothing; others: `String`
+    /// or `Int`).
+    fn ui(&mut self, node: UiNode, args: &[Expr], children: &Expr, ty: &Type) {
+        let name = node.name();
+        let ui = Type::con("Ui");
+        if !same(ty, &ui) {
+            self.mismatch(&format!("the `{name}` node"), &ui, ty);
+        }
+        let list = Type::list(ui);
+        if !same(&children.ty, &list) && !diverges(children) {
+            self.problem(format!(
+                "the children of `{name}` have type {}, expected {}",
+                display(&children.ty),
+                display(&list)
+            ));
+        }
+        let arity = match node {
+            UiNode::Text => Some(1),
+            UiNode::Empty => Some(0),
+            _ => None,
+        };
+        if let Some(arity) = arity
+            && args.len() != arity
+        {
+            self.problem(format!(
+                "`{name}` has arity {arity} but has {} arguments",
+                args.len()
+            ));
+        }
+        if matches!(node, UiNode::Text | UiNode::Empty) && !is_empty_list(children) {
+            self.problem(format!("`{name}` cannot have children"));
+        }
+        for (index, arg) in args.iter().enumerate() {
+            if diverges(arg) {
+                continue;
+            }
+            let allowed: &[&str] = if node == UiNode::Text {
+                &["String"]
+            } else {
+                &["String", "Int"]
+            };
+            let fits = matches!(&arg.ty, Type::Con(type_name, type_args)
+                if type_args.is_empty() && allowed.contains(&type_name.as_str()));
+            if !fits && arg.ty != Type::Error {
+                self.problem(format!(
+                    "argument {index} of `{name}` has type {}, expected {}",
+                    display(&arg.ty),
+                    allowed.join(" or ")
+                ));
+            }
+        }
+    }
+
     fn prim(&mut self, op: Prim, args: &[Expr], ty: &Type) {
         let (arity, operands, outcome) = prim_signature(op);
         if args.len() != arity {
@@ -880,11 +960,19 @@ impl<'p> Validator<'p> {
             Outcome::Same => operand,
             Outcome::Checked => Type::option(operand),
             Outcome::Boolean => Type::con("Boolean"),
+            Outcome::Text => Type::con("String"),
         };
         if !same(&expected, ty) {
             self.mismatch(&format!("the result of `{op:?}`"), &expected, ty);
         }
     }
+}
+
+/// `emptyList()`: a call of the builtin `emptyList` without arguments.
+fn is_empty_list(expr: &Expr) -> bool {
+    matches!(&expr.kind, ExprKind::Call { callee, args }
+        if args.is_empty()
+            && matches!(&callee.kind, ExprKind::Builtin { name, .. } if name == "emptyList"))
 }
 
 fn kind_name(kind: &ExprKind) -> &'static str {
@@ -908,7 +996,7 @@ fn kind_name(kind: &ExprKind) -> &'static str {
         ExprKind::Prim { .. } => "Prim",
         ExprKind::Db { .. } => "Db",
         ExprKind::Return(_) => "Return",
-        ExprKind::Ui => "Ui",
+        ExprKind::Ui { .. } => "Ui",
     }
 }
 
@@ -1092,6 +1180,119 @@ mod tests {
         );
         let result = Type::Fun(Vec::new(), Box::new(t("Int")), Row::empty());
         rejects(function("f", Vec::new(), result, body), "unknown function");
+    }
+
+    fn string(value: &str) -> Expr {
+        e(t("String"), ExprKind::Lit(Literal::Str(value.into())))
+    }
+
+    /// `listOf(items)` or, without items, `emptyList()`, at element type `element`.
+    fn list(element: Type, items: Vec<Expr>) -> Expr {
+        let ty = Type::list(element.clone());
+        let (name, params) = if items.is_empty() {
+            ("emptyList", Vec::new())
+        } else {
+            ("listOf", items.iter().map(|item| item.ty.clone()).collect())
+        };
+        let callee = e(
+            Type::Fun(params, Box::new(ty.clone()), Row::empty()),
+            ExprKind::Builtin {
+                name: name.into(),
+                instance: vec![element],
+            },
+        );
+        e(
+            ty,
+            ExprKind::Call {
+                callee: Box::new(callee),
+                args: items,
+            },
+        )
+    }
+
+    fn ui(node: UiNode, args: Vec<Expr>, children: Expr) -> Expr {
+        e(
+            t("Ui"),
+            ExprKind::Ui {
+                node,
+                args,
+                children: Box::new(children),
+            },
+        )
+    }
+
+    fn display(op: Prim, operand: Expr) -> Expr {
+        e(
+            t("String"),
+            ExprKind::Prim {
+                op,
+                args: vec![operand],
+            },
+        )
+    }
+
+    #[test]
+    fn a_well_formed_ui_tree_is_valid() {
+        let text = ui(
+            UiNode::Text,
+            vec![display(Prim::DisplayInt, int("1"))],
+            list(t("Ui"), Vec::new()),
+        );
+        let section = ui(
+            UiNode::Section,
+            vec![string("a"), int("2")],
+            list(
+                t("Ui"),
+                vec![
+                    text,
+                    ui(UiNode::Empty, Vec::new(), list(t("Ui"), Vec::new())),
+                ],
+            ),
+        );
+        let f = function("f", Vec::new(), t("Ui"), section);
+        assert_eq!(validate(&program(vec![f])), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rejects_malformed_ui_trees() {
+        let empty = || list(t("Ui"), Vec::new());
+        let two = ui(UiNode::Text, vec![string("a"), string("b")], empty());
+        rejects(function("f", Vec::new(), t("Ui"), two), "arity");
+        let unconverted = ui(UiNode::Text, vec![int("1")], empty());
+        rejects(function("f", Vec::new(), t("Ui"), unconverted), "argument");
+        let with_children = ui(
+            UiNode::Text,
+            vec![string("a")],
+            list(t("Ui"), vec![ui(UiNode::Rule, Vec::new(), empty())]),
+        );
+        rejects(
+            function("f", Vec::new(), t("Ui"), with_children),
+            "children",
+        );
+        let ints = ui(UiNode::Section, Vec::new(), list(t("Int"), vec![int("1")]));
+        rejects(function("f", Vec::new(), t("Ui"), ints), "children");
+        let boolean = e(t("Boolean"), ExprKind::Lit(Literal::Bool(true)));
+        let bad_arg = ui(UiNode::Div, vec![boolean], empty());
+        rejects(function("f", Vec::new(), t("Ui"), bad_arg), "argument");
+        let mut mistyped = ui(UiNode::Div, Vec::new(), empty());
+        mistyped.ty = t("String");
+        rejects(function("f", Vec::new(), t("String"), mistyped), "Ui");
+    }
+
+    #[test]
+    fn rejects_a_display_primitive_over_the_wrong_type() {
+        let body = display(Prim::DisplayInt, string("a"));
+        rejects(function("f", Vec::new(), t("String"), body), "operand");
+        let mut body = display(
+            Prim::DisplayBool,
+            e(t("Boolean"), ExprKind::Lit(Literal::Bool(true))),
+        );
+        body.ty = t("Int");
+        rejects(function("f", Vec::new(), t("Int"), body), "result");
+        let money = e(t("Money"), ExprKind::Local(0));
+        let ok = display(Prim::DisplayDecimal, money);
+        let f = function("f", vec![(0, "m", t("Money"))], t("String"), ok);
+        assert_eq!(validate(&program(vec![f])), Vec::<String>::new());
     }
 
     #[test]

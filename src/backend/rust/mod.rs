@@ -297,7 +297,7 @@ fn outside_server(expr: &Expr) -> Option<Outside> {
     match &expr.kind {
         ExprKind::Environment(_) => Some(Outside::Environment),
         ExprKind::ServerCall { .. } => Some(Outside::ServerCall),
-        ExprKind::Ui => Some(Outside::Ui),
+        ExprKind::Ui { .. } => Some(Outside::Ui),
         _ => children(expr).into_iter().find_map(outside_server),
     }
 }
@@ -310,14 +310,16 @@ pub(super) fn children(expr: &Expr) -> Vec<&Expr> {
         | ExprKind::Global { .. }
         | ExprKind::Builtin { .. }
         | ExprKind::Environment(_)
-        | ExprKind::None
-        | ExprKind::Ui => Vec::new(),
+        | ExprKind::None => Vec::new(),
         ExprKind::Ctor { args, .. }
         | ExprKind::ServerCall { args, .. }
         | ExprKind::Prim { args, .. }
         | ExprKind::Db { args, .. } => args.iter().collect(),
         ExprKind::Some(inner) | ExprKind::Return(inner) => vec![inner],
         ExprKind::Field { target, .. } => vec![target],
+        ExprKind::Ui { args, children, .. } => {
+            args.iter().chain(std::iter::once(&**children)).collect()
+        }
         ExprKind::Call { callee, args } => std::iter::once(&**callee).chain(args).collect(),
         ExprKind::Lambda { body, .. } => vec![body],
         ExprKind::Let { value, body, .. } | ExprKind::Seq { value, body } => vec![value, body],

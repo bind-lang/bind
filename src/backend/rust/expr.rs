@@ -138,12 +138,15 @@ fn locals(expr: &Expr) -> (BTreeSet<LocalId>, BTreeMap<LocalId, String>) {
             | ExprKind::Global { .. }
             | ExprKind::Builtin { .. }
             | ExprKind::Environment(_)
-            | ExprKind::None
-            | ExprKind::Ui => {}
+            | ExprKind::None => {}
             ExprKind::Ctor { args, .. }
             | ExprKind::ServerCall { args, .. }
             | ExprKind::Prim { args, .. }
             | ExprKind::Db { args, .. } => all(args, uses, defs),
+            ExprKind::Ui { args, children, .. } => {
+                all(args, uses, defs);
+                walk(children, uses, defs);
+            }
             ExprKind::Some(inner) | ExprKind::Return(inner) => walk(inner, uses, defs),
             ExprKind::Field { target, .. } => walk(target, uses, defs),
             ExprKind::Call { callee, args } => {
@@ -207,12 +210,14 @@ fn local_type(expr: &Expr, local: LocalId) -> Option<Type> {
         | ExprKind::Global { .. }
         | ExprKind::Builtin { .. }
         | ExprKind::Environment(_)
-        | ExprKind::None
-        | ExprKind::Ui => Vec::new(),
+        | ExprKind::None => Vec::new(),
         ExprKind::Ctor { args, .. }
         | ExprKind::ServerCall { args, .. }
         | ExprKind::Prim { args, .. }
         | ExprKind::Db { args, .. } => args.iter().collect(),
+        ExprKind::Ui { args, children, .. } => {
+            args.iter().chain(std::iter::once(&**children)).collect()
+        }
         ExprKind::Some(inner) | ExprKind::Return(inner) => vec![inner],
         ExprKind::Field { target, .. } => vec![target],
         ExprKind::Call { callee, args } => std::iter::once(&**callee).chain(args).collect(),
@@ -541,7 +546,10 @@ impl Generator<'_, '_> {
             ExprKind::Environment(_) | ExprKind::ServerCall { .. } => atom(
                 "::std::compile_error!(\"bindc: environment values and server calls are not server code\")",
             ),
-            ExprKind::Ui => atom("::std::compile_error!(\"bindc: UI trees are not server code\")"),
+            // Rejected by `server_problems` (E8310) before generation; never panics.
+            ExprKind::Ui { .. } => {
+                atom("::std::compile_error!(\"bindc: UI trees are not server code\")")
+            }
             ExprKind::Ctor {
                 type_name,
                 ctor,
@@ -998,6 +1006,12 @@ impl Generator<'_, '_> {
                 let a = self.expr(a);
                 complex(format!("!{}", a.wrapped()))
             }
+            // Only inside `Text` nodes, which `server_problems` rejects (E8310).
+            (
+                DisplayString | DisplayInt | DisplayLong | DisplayDouble | DisplayFloat
+                | DisplayBool | DisplayDecimal | DisplayText,
+                _,
+            ) => atom("::std::compile_error!(\"bindc: display primitives are not server code\")"),
             _ => atom("::std::compile_error!(\"bindc: malformed primitive\")"),
         }
     }

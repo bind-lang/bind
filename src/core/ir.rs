@@ -110,6 +110,123 @@ pub enum Prim {
     Gt,
     GtEq,
     Not,
+    /// Display primitives: the text `Text(e)` shows for a value, by operand type (`String`).
+    /// `DisplayString` takes `String`, `Email` or `Url`; `DisplayDecimal` takes `Decimal` or
+    /// `Money`; `DisplayText` takes `UUID`, `Date`, `DateTime`, `Instant` or `Duration` (their
+    /// canonical wire form). A distinct value is unwrapped before (see `UiNode::Text`).
+    DisplayString,
+    DisplayInt,
+    DisplayLong,
+    DisplayDouble,
+    DisplayFloat,
+    DisplayBool,
+    DisplayDecimal,
+    DisplayText,
+}
+
+/// The closed set of UI nodes. `Ui` is the root written `UI { ... }`; `Empty` renders nothing
+/// and has no source name (lowering never produces it today: the parser requires `else`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UiNode {
+    Ui,
+    Page,
+    Container,
+    Div,
+    Grid,
+    Stack,
+    Header,
+    Nav,
+    Main,
+    Section,
+    Article,
+    Aside,
+    Footer,
+    Paragraph,
+    Span,
+    Strong,
+    Emphasis,
+    Small,
+    List,
+    Item,
+    Pre,
+    Code,
+    Heading,
+    Link,
+    Rule,
+    Text,
+    Empty,
+}
+
+impl UiNode {
+    const ALL: [UiNode; 27] = [
+        UiNode::Ui,
+        UiNode::Page,
+        UiNode::Container,
+        UiNode::Div,
+        UiNode::Grid,
+        UiNode::Stack,
+        UiNode::Header,
+        UiNode::Nav,
+        UiNode::Main,
+        UiNode::Section,
+        UiNode::Article,
+        UiNode::Aside,
+        UiNode::Footer,
+        UiNode::Paragraph,
+        UiNode::Span,
+        UiNode::Strong,
+        UiNode::Emphasis,
+        UiNode::Small,
+        UiNode::List,
+        UiNode::Item,
+        UiNode::Pre,
+        UiNode::Code,
+        UiNode::Heading,
+        UiNode::Link,
+        UiNode::Rule,
+        UiNode::Text,
+        UiNode::Empty,
+    ];
+
+    /// The node a source name (an entry of `UI_NODES`) stands for; `Empty` has none.
+    pub fn from_name(name: &str) -> Option<UiNode> {
+        Self::ALL
+            .into_iter()
+            .find(|node| *node != UiNode::Empty && node.name() == name)
+    }
+
+    /// The source name (`"UI"` for the root), or `"Empty"`.
+    pub fn name(&self) -> &'static str {
+        match self {
+            UiNode::Ui => "UI",
+            UiNode::Page => "Page",
+            UiNode::Container => "Container",
+            UiNode::Div => "Div",
+            UiNode::Grid => "Grid",
+            UiNode::Stack => "Stack",
+            UiNode::Header => "Header",
+            UiNode::Nav => "Nav",
+            UiNode::Main => "Main",
+            UiNode::Section => "Section",
+            UiNode::Article => "Article",
+            UiNode::Aside => "Aside",
+            UiNode::Footer => "Footer",
+            UiNode::Paragraph => "Paragraph",
+            UiNode::Span => "Span",
+            UiNode::Strong => "Strong",
+            UiNode::Emphasis => "Emphasis",
+            UiNode::Small => "Small",
+            UiNode::List => "List",
+            UiNode::Item => "Item",
+            UiNode::Pre => "Pre",
+            UiNode::Code => "Code",
+            UiNode::Heading => "Heading",
+            UiNode::Link => "Link",
+            UiNode::Rule => "Rule",
+            UiNode::Text => "Text",
+            UiNode::Empty => "Empty",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -190,8 +307,16 @@ pub enum ExprKind {
     /// Leaves the enclosing function with the value. A `Return` node diverges: its `ty` carries
     /// no meaning, and validators and backends must accept it wherever any type is expected.
     Return(Box<Expr>),
-    /// A UI tree: never part of server code; carried so client lowering (3c) can reuse the IR.
-    Ui,
+    /// A UI node (typed `Ui`): never part of server code (E8310), rendered by the frontends.
+    /// `args` follow the checker's rules: `Text` has exactly one `String` argument, already
+    /// converted by a `Display*` primitive, and no children; other nodes take `String` or
+    /// `Int` arguments. `children` is an expression of type `List<Ui>`: the child block as
+    /// `listOf` elements under the block's `Let`s and `Seq`s, or `emptyList()` without a block.
+    Ui {
+        node: UiNode,
+        args: Vec<Expr>,
+        children: Box<Expr>,
+    },
 }
 
 /// Constructor names in `Arm::pattern` and `Arm::binding_paths` are bare (`"B"`, not `"C.B"`),

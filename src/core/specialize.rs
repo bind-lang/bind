@@ -87,7 +87,7 @@ impl Specializer<'_> {
                     name,
                     value,
                     mut body,
-                } = std::mem::replace(&mut expr.kind, ExprKind::Ui)
+                } = std::mem::replace(&mut expr.kind, ExprKind::None)
                 else {
                     return;
                 };
@@ -322,21 +322,23 @@ pub(super) fn map_types(expr: &mut Expr, f: &dyn Fn(&Type) -> Type) {
     }
 }
 
-fn children(expr: &Expr) -> Vec<&Expr> {
+pub(crate) fn children(expr: &Expr) -> Vec<&Expr> {
     match &expr.kind {
         ExprKind::Lit(_)
         | ExprKind::Local(_)
         | ExprKind::Global { .. }
         | ExprKind::Builtin { .. }
         | ExprKind::Environment(_)
-        | ExprKind::None
-        | ExprKind::Ui => Vec::new(),
+        | ExprKind::None => Vec::new(),
         ExprKind::Ctor { args, .. }
         | ExprKind::ServerCall { args, .. }
         | ExprKind::Prim { args, .. }
         | ExprKind::Db { args, .. } => args.iter().collect(),
         ExprKind::Some(inner) | ExprKind::Return(inner) => vec![inner],
         ExprKind::Field { target, .. } => vec![target],
+        ExprKind::Ui { args, children, .. } => {
+            args.iter().chain(std::iter::once(&**children)).collect()
+        }
         ExprKind::Lambda { body, .. } => vec![body],
         ExprKind::Call { callee, args } => std::iter::once(&**callee).chain(args).collect(),
         ExprKind::Let { value, body, .. } | ExprKind::Seq { value, body } => vec![value, body],
@@ -358,14 +360,17 @@ fn children_mut(expr: &mut Expr) -> Vec<&mut Expr> {
         | ExprKind::Global { .. }
         | ExprKind::Builtin { .. }
         | ExprKind::Environment(_)
-        | ExprKind::None
-        | ExprKind::Ui => Vec::new(),
+        | ExprKind::None => Vec::new(),
         ExprKind::Ctor { args, .. }
         | ExprKind::ServerCall { args, .. }
         | ExprKind::Prim { args, .. }
         | ExprKind::Db { args, .. } => args.iter_mut().collect(),
         ExprKind::Some(inner) | ExprKind::Return(inner) => vec![inner],
         ExprKind::Field { target, .. } => vec![target],
+        ExprKind::Ui { args, children, .. } => args
+            .iter_mut()
+            .chain(std::iter::once(&mut **children))
+            .collect(),
         ExprKind::Lambda { body, .. } => vec![body],
         ExprKind::Call { callee, args } => std::iter::once(&mut **callee)
             .chain(args.iter_mut())

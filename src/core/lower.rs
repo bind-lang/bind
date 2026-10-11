@@ -15,7 +15,7 @@ use crate::syntax::expr::{
     self as syntax, BinaryOp, Block, FieldInit, NodeId, Pattern, Stmt, TypeExpr, UnaryOp,
 };
 use crate::types::effects::{Label, Row, RowVarId};
-use crate::types::env::{UI_NODES, builtin_scheme};
+use crate::types::env::builtin_scheme;
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 use crate::types::{Resolution, TypedProgram};
@@ -137,6 +137,8 @@ struct CtorDef {
     type_name: String,
     params: Vec<String>,
     fields: Vec<(String, Type)>,
+    /// The constructor of a distinct type (its single field is the underlying value).
+    distinct: bool,
 }
 
 fn constructors(types: &[CoreType]) -> BTreeMap<String, CtorDef> {
@@ -154,6 +156,7 @@ fn constructors(types: &[CoreType]) -> BTreeMap<String, CtorDef> {
                         type_name: name.clone(),
                         params: params.clone(),
                         fields: fields.clone(),
+                        distinct: false,
                     },
                 );
             }
@@ -169,6 +172,7 @@ fn constructors(types: &[CoreType]) -> BTreeMap<String, CtorDef> {
                             type_name: name.clone(),
                             params: params.clone(),
                             fields: fields.clone(),
+                            distinct: false,
                         },
                     );
                 }
@@ -180,6 +184,7 @@ fn constructors(types: &[CoreType]) -> BTreeMap<String, CtorDef> {
                         type_name: name.clone(),
                         params: Vec::new(),
                         fields: vec![("value".into(), underlying.clone())],
+                        distinct: true,
                     },
                 );
             }
@@ -502,6 +507,9 @@ fn hoist_return(node: Expr) -> Expr {
         ExprKind::Field { target, .. } => vec![target],
         ExprKind::If { condition, .. } => vec![condition],
         ExprKind::Match { scrutinee, .. } => vec![scrutinee],
+        ExprKind::Ui { args, children, .. } => {
+            args.iter().chain(std::iter::once(&**children)).collect()
+        }
         _ => Vec::new(),
     };
     let Some(position) = operands.iter().position(|operand| diverges(operand)) else {
@@ -517,6 +525,9 @@ fn hoist_return(node: Expr) -> Expr {
         ExprKind::Field { target, .. } => vec![*target],
         ExprKind::If { condition, .. } => vec![*condition],
         ExprKind::Match { scrutinee, .. } => vec![*scrutinee],
+        ExprKind::Ui { args, children, .. } => {
+            args.into_iter().chain(std::iter::once(*children)).collect()
+        }
         _ => Vec::new(),
     };
     operands.truncate(position + 1);
@@ -780,8 +791,8 @@ impl Lowerer<'_> {
             K::Call {
                 callee,
                 args,
-                children: _,
-            } => return self.call(callee, args, ty),
+                children,
+            } => return self.call(callee, args, children.as_ref(), ty),
             K::Field { target, name } => match self.resolution(node.id).cloned() {
                 Some(Resolution::Variant(ctor)) => return self.ctor_value(&ctor, ty),
                 Some(Resolution::ServerCall(function)) => {
@@ -970,10 +981,18 @@ impl Lowerer<'_> {
         expr(ty, ExprKind::Lambda { params, body })
     }
 
-    fn call(&mut self, callee: &syntax::Expr, args: &[syntax::Expr], ty: Type) -> Expr {
+    fn call(
+        &mut self,
+        callee: &syntax::Expr,
+        args: &[syntax::Expr],
+        children: Option<&Block>,
+        ty: Type,
+    ) -> Expr {
         if let syntax::ExprKind::Name(name) = &callee.kind {
             match self.resolution(callee.id).cloned() {
-                None if UI_NODES.contains(&name.as_str()) => return expr(ty, ExprKind::Ui),
+                None if let Some(node) = UiNode::from_name(name) => {
+                    return self.ui(node, args, children, ty);
+                }
                 Some(Resolution::Builtin(builtin)) if builtin == "listOf" => {
                     let args = self.exprs(args);
                     let element = list_element(&ty);
@@ -1033,6 +1052,145 @@ impl Lowerer<'_> {
         let callee = Box::new(self.expr(callee));
         let args = self.exprs(args);
         expr(ty, ExprKind::Call { callee, args })
+    }
+
+    /// A UI node: `Text(e)` gets the display primitive of `e`'s type; the child block becomes
+    /// a `List<Ui>` expression.
+    fn ui(
+        &mut self,
+        node: UiNode,
+        args: &[syntax::Expr],
+        children: Option<&Block>,
+        ty: Type,
+    ) -> Expr {
+        let mut args = self.exprs(args);
+        if node == UiNode::Text {
+            args = args.into_iter().map(|arg| self.display(arg, 0)).collect();
+        }
+        let children = match children {
+            Some(block) => {
+                let mark = self.scope.len();
+                let lowered = self.ui_children(&block.stmts, Vec::new());
+                self.scope.truncate(mark);
+                lowered
+            }
+            None => ui_list(Vec::new()),
+        };
+        hoist_return(expr(
+            ty,
+            ExprKind::Ui {
+                node,
+                args,
+                children: Box::new(children),
+            },
+        ))
+    }
+
+    /// The text shown for `value`: the display primitive of its type, after unwrapping
+    /// distinct values with a single-arm `Match`. A type `Text` cannot display (which the
+    /// checker rejects) becomes an error-typed marker for the validator.
+    fn display(&mut self, value: Expr, depth: usize) -> Expr {
+        let string = Type::con("String");
+        let op = match scalar_name(&value.ty) {
+            Some("String" | "Email" | "Url") => Some(Prim::DisplayString),
+            Some("Int") => Some(Prim::DisplayInt),
+            Some("Long") => Some(Prim::DisplayLong),
+            Some("Double") => Some(Prim::DisplayDouble),
+            Some("Float") => Some(Prim::DisplayFloat),
+            Some("Boolean") => Some(Prim::DisplayBool),
+            Some("Decimal" | "Money") => Some(Prim::DisplayDecimal),
+            Some("UUID" | "Date" | "DateTime" | "Instant" | "Duration") => Some(Prim::DisplayText),
+            _ => None,
+        };
+        if let Some(op) = op {
+            return expr(
+                string,
+                ExprKind::Prim {
+                    op,
+                    args: vec![value],
+                },
+            );
+        }
+        let distinct = scalar_name(&value.ty).and_then(|name| {
+            self.ctors
+                .get(name)
+                .filter(|def| def.distinct && def.type_name == name)
+                .and_then(|def| def.fields.first())
+                .map(|(_, underlying)| (name.to_string(), underlying.clone()))
+        });
+        let Some((ctor, underlying)) = distinct.filter(|_| depth < 16) else {
+            return expr(Type::Error, ExprKind::Lit(Literal::Unit));
+        };
+        let local = self.fresh();
+        let inner = self.display(expr(underlying.clone(), ExprKind::Local(local)), depth + 1);
+        let arm = Arm {
+            pattern: Pat::Ctor(ctor.clone(), vec![Pat::Wild]),
+            bindings: vec![(local, "value".into(), underlying)],
+            binding_paths: vec![vec![(ctor, 0)]],
+            body: inner,
+        };
+        expr(
+            string,
+            ExprKind::Match {
+                scrutinee: Box::new(value),
+                arms: vec![arm],
+            },
+        )
+    }
+
+    /// A child block as a `List<Ui>`: each `Ui` statement is an element of `listOf`; a `val`
+    /// becomes a `Let` around the rest and any other statement a `Seq`. Elements before such a
+    /// statement (`done`) are bound to fresh locals first, so evaluation keeps source order.
+    fn ui_children(&mut self, stmts: &[Stmt], mut done: Vec<Expr>) -> Expr {
+        let Some((first, rest)) = stmts.split_first() else {
+            return ui_list(done);
+        };
+        let ui = Type::con("Ui");
+        match first {
+            Stmt::Expr(value) => {
+                let value = self.expr(value);
+                if value.ty == ui {
+                    done.push(value);
+                    return self.ui_children(rest, done);
+                }
+                let (bound, done) = self.bind_children(done);
+                let body = self.ui_children(rest, done);
+                wrap_lets(bound, sequence(value, body))
+            }
+            Stmt::Val { name, value, .. } => {
+                let (bound, done) = self.bind_children(done);
+                let value = self.expr(value);
+                let body = if name == "_" {
+                    let body = self.ui_children(rest, done);
+                    sequence(value, body)
+                } else {
+                    let local = self.bind(name);
+                    let body = self.ui_children(rest, done);
+                    expr(
+                        body.ty.clone(),
+                        ExprKind::Let {
+                            local,
+                            name: name.clone(),
+                            value: Box::new(value),
+                            body: Box::new(body),
+                        },
+                    )
+                };
+                wrap_lets(bound, body)
+            }
+        }
+    }
+
+    /// Binds each child to a fresh local `child`: the bindings, and the locals as children.
+    fn bind_children(&mut self, done: Vec<Expr>) -> (Vec<(LocalId, Expr)>, Vec<Expr>) {
+        let mut bound = Vec::new();
+        let mut locals = Vec::new();
+        for child in done {
+            let local = self.fresh();
+            locals.push(expr(child.ty.clone(), ExprKind::Local(local)));
+            bound.push((local, child));
+        }
+        (bound, locals)
     }
 
     /// The node's type; the table's model if the checker recorded none.
@@ -1260,6 +1418,83 @@ fn null_arm(body: Expr) -> Arm {
     }
 }
 
+/// `listOf(items)` at element type `Ui`, or `emptyList()` without items.
+fn ui_list(items: Vec<Expr>) -> Expr {
+    let ui = Type::con("Ui");
+    let ty = Type::list(ui.clone());
+    let (name, params) = if items.is_empty() {
+        ("emptyList", Vec::new())
+    } else {
+        ("listOf", items.iter().map(|item| item.ty.clone()).collect())
+    };
+    let callee = boxed(
+        Type::Fun(params, Box::new(ty.clone()), Row::empty()),
+        ExprKind::Builtin {
+            name: name.into(),
+            instance: vec![ui],
+        },
+    );
+    hoist_return(expr(
+        ty,
+        ExprKind::Call {
+            callee,
+            args: items,
+        },
+    ))
+}
+
+fn sequence(value: Expr, body: Expr) -> Expr {
+    expr(
+        body.ty.clone(),
+        ExprKind::Seq {
+            value: Box::new(value),
+            body: Box::new(body),
+        },
+    )
+}
+
+/// `Let(local = value; ...)` for each binding, outermost first, around `body`.
+fn wrap_lets(bound: Vec<(LocalId, Expr)>, body: Expr) -> Expr {
+    bound.into_iter().rev().fold(body, |body, (local, value)| {
+        expr(
+            body.ty.clone(),
+            ExprKind::Let {
+                local,
+                name: "child".into(),
+                value: Box::new(value),
+                body: Box::new(body),
+            },
+        )
+    })
+}
+
+/// The component and the functions it reaches through `Global` references, sorted by name.
+/// Empty when `component` is not a function of the program.
+// Consumed by the JavaScript frontend generator (a later task of subproject 3c).
+#[cfg_attr(not(test), expect(dead_code))]
+pub fn client_functions(program: &CoreProgram, component: &str) -> Vec<String> {
+    fn globals(expr: &Expr, output: &mut Vec<String>) {
+        if let ExprKind::Global { name, .. } = &expr.kind {
+            output.push(name.clone());
+        }
+        for child in super::specialize::children(expr) {
+            globals(child, output);
+        }
+    }
+    let find = |name: &str| program.functions.iter().find(|item| item.name == name);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut pending: Vec<&CoreFunction> = find(component).into_iter().collect();
+    while let Some(function) = pending.pop() {
+        if !seen.insert(function.name.clone()) {
+            continue;
+        }
+        let mut called = Vec::new();
+        globals(&function.body, &mut called);
+        pending.extend(called.iter().filter_map(|name| find(name)));
+    }
+    seen.into_iter().collect()
+}
+
 /// The element type of `List<T>`.
 fn list_element(ty: &Type) -> Type {
     match ty {
@@ -1272,6 +1507,7 @@ fn list_element(ty: &Type) -> Type {
 pub(crate) mod tests {
     use super::*;
     use crate::diagnostic::has_errors;
+    use crate::types::env::UI_NODES;
     use crate::types::exhaustive::Pat;
     use crate::types::ty::{Type, display};
 
@@ -1411,7 +1647,11 @@ pub(crate) mod tests {
             ExprKind::Prim { op, args } => format!("{op:?}:{}({})", display(&expr.ty), all(args)),
             ExprKind::Db { op, table, args } => format!("Db({op:?}, {table}, [{}])", all(args)),
             ExprKind::Return(value) => format!("Return({})", render(value)),
-            ExprKind::Ui => "Ui".into(),
+            ExprKind::Ui {
+                node,
+                args,
+                children,
+            } => format!("Ui({node:?}, [{}], {})", all(args), render(children)),
         }
     }
 
@@ -1678,8 +1918,177 @@ pub(crate) mod tests {
             "If(Local(1), Field(Local(0), n), Lit(0))"
         );
         let program = compile("client component Home() {\n UI {\n Text(\"oi\")\n }\n}");
-        assert_eq!(render(&function(&program, "Home").body), "Ui");
+        assert_eq!(
+            render(&function(&program, "Home").body),
+            format!(
+                "Ui(Ui, [], Call(Builtin(listOf[Ui]), [Ui(Text, [DisplayString:String(Lit(\"oi\"))], {EMPTY})]))"
+            )
+        );
         assert!(!function(&program, "Home").endpoint);
+    }
+
+    const EMPTY: &str = "Call(Builtin(emptyList[Ui]), [])";
+
+    #[test]
+    fn ui_trees_keep_nodes_arguments_and_children() {
+        let program = compile(
+            "client component C() {\n UI {\n Section(\"a\", \"b\") {\n val x = \"t\"\n Text(x)\n Text(1)\n }\n }\n}",
+        );
+        let c = function(&program, "C");
+        assert_eq!(
+            render(&c.body),
+            format!(
+                "Ui(Ui, [], Call(Builtin(listOf[Ui]), [Ui(Section, [Lit(\"a\"), Lit(\"b\")], Let(0 x = Lit(\"t\"); Call(Builtin(listOf[Ui]), [Ui(Text, [DisplayString:String(Local(0))], {EMPTY}), Ui(Text, [DisplayInt:String(Lit(1))], {EMPTY})])))]))"
+            )
+        );
+        assert_eq!(c.body.ty, Type::con("Ui"));
+        assert_eq!(
+            super::super::validate::validate(&program),
+            Vec::<String>::new()
+        );
+        assert_consistent(c);
+        // A node without a block has no children.
+        assert_eq!(
+            body("client component D() {\n UI {\n Rule()\n }\n}", "D"),
+            format!("Ui(Ui, [], Call(Builtin(listOf[Ui]), [Ui(Rule, [], {EMPTY})]))")
+        );
+    }
+
+    #[test]
+    fn children_before_a_val_keep_their_order() {
+        let program =
+            compile("client component C() {\n UI {\n Text(\"a\")\n val y = 2\n Text(y)\n }\n}");
+        let c = function(&program, "C");
+        assert_eq!(
+            render(&c.body),
+            format!(
+                "Ui(Ui, [], Let(0 child = Ui(Text, [DisplayString:String(Lit(\"a\"))], {EMPTY}); Let(1 y = Lit(2); Call(Builtin(listOf[Ui]), [Local(0), Ui(Text, [DisplayInt:String(Local(1))], {EMPTY})]))))"
+            )
+        );
+        assert_eq!(
+            super::super::validate::validate(&program),
+            Vec::<String>::new()
+        );
+        assert_consistent(c);
+        // A block ending with a `val` (or `val _`) still has a list of children.
+        let program = compile("client component E() {\n UI {\n Text(\"a\")\n val _ = 1\n }\n}");
+        assert_eq!(
+            render(&function(&program, "E").body),
+            format!(
+                "Ui(Ui, [], Let(0 child = Ui(Text, [DisplayString:String(Lit(\"a\"))], {EMPTY}); Seq(Lit(1); Call(Builtin(listOf[Ui]), [Local(0)]))))"
+            )
+        );
+        assert_eq!(
+            super::super::validate::validate(&program),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn if_in_ui_keeps_both_branches_and_requires_else() {
+        assert_eq!(
+            body(
+                "client component C(b: Boolean) {\n UI {\n if (b) Text(\"s\") else Rule()\n }\n}",
+                "C"
+            ),
+            format!(
+                "Ui(Ui, [], Call(Builtin(listOf[Ui]), [If(Local(0), Ui(Text, [DisplayString:String(Lit(\"s\"))], {EMPTY}), Ui(Rule, [], {EMPTY}))]))"
+            )
+        );
+        // `if` without `else` never reaches the checker: the parser rejects it (E7005), so
+        // lowering never needs the `Empty` node for it.
+        let (tokens, _) = crate::lexer::lex(
+            "test.bd",
+            "client component C(b: Boolean) {\n UI {\n if (b) Text(\"s\")\n }\n}",
+        );
+        let (_, diagnostics) = crate::parser::parse(tokens);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E7005"),
+            "{diagnostics:?}"
+        );
+    }
+
+    /// The rendered arguments of every `Text` node, in tree order.
+    fn texts(expr: &Expr, output: &mut Vec<String>) {
+        if let ExprKind::Ui {
+            node: UiNode::Text,
+            args,
+            ..
+        } = &expr.kind
+        {
+            output.push(all(args));
+        }
+        for child in super::super::specialize::children(expr) {
+            texts(child, output);
+        }
+    }
+
+    #[test]
+    fn text_picks_the_display_primitive_of_its_type() {
+        let source = "distinct type Age = Int\ndistinct type Nome = Email\nclient component C(b: Boolean, d: Double, f: Float, m: Money, u: UUID, a: Age, n: Nome, l: Long, dt: Date) {\n UI {\n Text(b)\n Text(d)\n Text(f)\n Text(m)\n Text(u)\n Text(a)\n Text(n)\n Text(l)\n Text(dt)\n }\n}";
+        let program = compile(source);
+        let mut found = Vec::new();
+        texts(&function(&program, "C").body, &mut found);
+        assert_eq!(
+            found,
+            vec![
+                "DisplayBool:String(Local(0))",
+                "DisplayDouble:String(Local(1))",
+                "DisplayFloat:String(Local(2))",
+                "DisplayDecimal:String(Local(3))",
+                "DisplayText:String(Local(4))",
+                "Match:String(Local(5), [Age(_) 9 value: Int => DisplayInt:String(Local(9))])",
+                "Match:String(Local(6), [Nome(_) 10 value: Email => DisplayString:String(Local(10))])",
+                "DisplayLong:String(Local(7))",
+                "DisplayText:String(Local(8))",
+            ]
+        );
+        assert_eq!(
+            super::super::validate::validate(&program),
+            Vec::<String>::new()
+        );
+        assert_consistent(function(&program, "C"));
+    }
+
+    #[test]
+    fn server_calls_keep_their_written_arguments() {
+        let program = compile(
+            "distinct type CustomerId = UUID\nserver fun getCustomer(id: CustomerId): String = \"x\"\nclient fun c(id: CustomerId) = server.getCustomer(id)",
+        );
+        assert_eq!(
+            render(&function(&program, "c").body),
+            "Server(getCustomer, [Local(0)])"
+        );
+    }
+
+    #[test]
+    fn client_functions_are_the_component_and_what_it_reaches() {
+        let program = compile(
+            "fun shared(s: String): String = s\nfun unused(): Int = 1\nfun helper(): String = shared(\"a\")\nclient component C() {\n UI {\n Text(helper())\n }\n}\nclient component Other() {\n UI {\n Rule()\n }\n}",
+        );
+        assert_eq!(
+            client_functions(&program, "C"),
+            vec!["C".to_string(), "helper".into(), "shared".into()]
+        );
+        assert_eq!(
+            client_functions(&program, "Other"),
+            vec!["Other".to_string()]
+        );
+        assert!(client_functions(&program, "Missing").is_empty());
+    }
+
+    #[test]
+    fn ui_node_names_round_trip() {
+        for name in UI_NODES {
+            let node = UiNode::from_name(name).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!(node.name(), *name);
+        }
+        assert_eq!(UiNode::from_name("UI"), Some(UiNode::Ui));
+        assert_eq!(UiNode::from_name("Empty"), None);
+        assert_eq!(UiNode::Empty.name(), "Empty");
+        assert_eq!(UiNode::from_name("Bogus"), None);
     }
 
     #[test]
@@ -1964,6 +2373,10 @@ pub(crate) mod tests {
                 | ExprKind::Db { args, .. } => args.iter().for_each(|arg| walk(arg, scope)),
                 ExprKind::Some(inner) | ExprKind::Return(inner) => walk(inner, scope),
                 ExprKind::Field { target, .. } => walk(target, scope),
+                ExprKind::Ui { args, children, .. } => {
+                    args.iter().for_each(|arg| walk(arg, scope));
+                    walk(children, scope);
+                }
                 ExprKind::Seq { value, body } => {
                     walk(value, scope);
                     walk(body, scope);

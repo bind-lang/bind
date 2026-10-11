@@ -279,7 +279,7 @@ impl Interp<'_> {
             }
             ExprKind::Db { .. } => Err(unsupported("database access").into()),
             ExprKind::Return(value) => Err(Signal::Return(self.eval(value, env)?)),
-            ExprKind::Ui => Err(unsupported("UI tree").into()),
+            ExprKind::Ui { .. } => Err(unsupported("UI tree").into()),
         }
     }
 
@@ -491,7 +491,15 @@ fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
             | Prim::DecimalNeg
             | Prim::DurationAdd
             | Prim::DurationSub
-            | Prim::DurationNeg,
+            | Prim::DurationNeg
+            | Prim::DisplayString
+            | Prim::DisplayInt
+            | Prim::DisplayLong
+            | Prim::DisplayDouble
+            | Prim::DisplayFloat
+            | Prim::DisplayBool
+            | Prim::DisplayDecimal
+            | Prim::DisplayText,
             _,
             _,
         ) => return Err(unsupported(&format!("{op:?}"))),
