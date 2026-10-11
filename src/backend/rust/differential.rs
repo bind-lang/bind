@@ -292,6 +292,10 @@ const HREFS: &[&str] = &[
     "java\\tscript:x",
     "data:text/html,<b>",
     "ftp://x",
+    "HTTPS://x.y/",
+    "MailTo:a@b.c",
+    "hTtP://x",
+    "TEL:1",
     "",
 ];
 
@@ -1012,6 +1016,13 @@ impl Gen {
     }
 
     fn double_literal(&mut self) -> String {
+        if self.rng.chance(15) {
+            self.count("Double non-finite");
+            return self
+                .rng
+                .pick(&["(0.0 / 0.0)", "(1e308 * 10.0)", "(-(1e308 * 10.0))"])
+                .to_string();
+        }
         self.count("Double literal");
         let literal = *self.rng.pick(DOUBLE_LITERALS);
         if self.rng.chance(20) {
@@ -1022,6 +1033,13 @@ impl Gen {
     }
 
     fn float_literal(&mut self) -> String {
+        if self.rng.chance(15) {
+            self.count("Float non-finite");
+            return self
+                .rng
+                .pick(&["(0.0f / 0.0f)", "(3.4e38f * 10.0f)", "(-(3.4e38f * 10.0f))"])
+                .to_string();
+        }
         self.count("Float literal");
         let literal = *self.rng.pick(FLOAT_LITERALS);
         if self.rng.chance(20) {
@@ -1031,8 +1049,9 @@ impl Gen {
         }
     }
 
-    /// `Double`/`Float` arithmetic (`+ - * /`, negation) over finite literals: overflow gives
-    /// `Infinity`, `0.0 / 0.0` and `Infinity - Infinity` give `NaN`.
+    /// `Double`/`Float` arithmetic (`+ - * /`, negation) over finite literals and non-finite
+    /// leaves (`0.0 / 0.0`, an overflowing product and its negation), so `NaN` and `Infinity`
+    /// flow through arithmetic, comparisons, `if`, `when`, `fold`, `Text` and `Float` rounding.
     fn number(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
         let double = ty == Ty::Double;
         match self.rng.below(12) {
@@ -1156,7 +1175,7 @@ impl Gen {
 
     fn ui_child(&mut self, d: u32, scope: &Scope) -> String {
         let small = d.min(2);
-        match self.rng.below(13) {
+        match self.rng.below(15) {
             0 => {
                 self.count("Text of String");
                 format!("Text({})", self.expr(Ty::Str, small, scope))
@@ -1228,6 +1247,23 @@ impl Gen {
                     format!("Rule({})", self.ui_arg(d, scope))
                 } else {
                     "Rule()".into()
+                }
+            }
+            11 if d > 0 => {
+                self.count("UI if/when child");
+                format!(
+                    "if ({}) {} else {}",
+                    self.expr(Ty::Bool, d - 1, scope),
+                    self.ui_child(d - 1, scope),
+                    self.ui_child(d - 1, scope)
+                )
+            }
+            12 if d > 0 => {
+                self.count("UI if/when child");
+                if self.rng.chance(50) {
+                    self.when_forma(Ty::Ui, d - 1, scope)
+                } else {
+                    self.when_opt_int(Ty::Ui, d - 1, scope)
                 }
             }
             _ => self.expr(Ty::Ui, d, scope),
@@ -1917,6 +1953,21 @@ fn web_generator_is_deterministic_and_well_typed() {
         lines[PROGRAMS + 3],
         format!("p{}=!RecursionLimit", PROGRAMS + 3)
     );
+    // NaN and Infinity are frequent random results, not only fixed ones.
+    let numbers: Vec<&String> = lines[..PROGRAMS]
+        .iter()
+        .zip(&first[..PROGRAMS])
+        .filter(|(_, p)| matches!(p.1, Ty::Double | Ty::Float))
+        .map(|(line, _)| line)
+        .collect();
+    let nan = numbers.iter().filter(|line| line.ends_with("=NaN")).count();
+    let infinite = numbers
+        .iter()
+        .filter(|line| line.ends_with("=Infinity") || line.ends_with("=-Infinity"))
+        .count();
+    eprintln!("random Double/Float results: {nan} NaN, {infinite} ±Infinity");
+    assert!(nan >= 20, "{nan} NaN results");
+    assert!(infinite >= 20, "{infinite} Infinity results");
 }
 
 /// Constructs every three-way run must contain.
@@ -1935,6 +1986,9 @@ pub(crate) const WEB_CONSTRUCTS: &[&str] = &[
     "Text of Double",
     "Text of Float",
     "Text of distinct",
+    "UI if/when child",
+    "Double non-finite",
+    "Float non-finite",
     "Double +",
     "Double -",
     "Double *",
