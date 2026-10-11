@@ -30,6 +30,9 @@ pub enum FrontendProblem {
     CrossOriginApi { api_url: String },
     /// `frontend_origin` is not a canonical origin.
     InvalidFrontendOrigin { origin: String },
+    /// `frontend_origin` without an API on another origin (the `ssr` mode, or `api_url` on the
+    /// page's own origin): there is no cross-origin call to allow.
+    UnusedFrontendOrigin { target: String, origin: String },
     /// The program has no client component.
     NoComponent { target: String },
     /// A component parameter whose type a URL cannot carry.
@@ -76,6 +79,9 @@ impl FrontendProblem {
             ),
             FrontendProblem::InvalidFrontendOrigin { origin } => format!(
                 "`frontend_origin = \"{origin}\"` must be a canonical origin: `http://` or `https://`, a lowercase host and an optional non-default port, without a path, user info or trailing slash."
+            ),
+            FrontendProblem::UnusedFrontendOrigin { target, origin } => format!(
+                "`frontend_origin = \"{origin}\"` only applies when the API is on another origin (`mode = \"split\"` with `api_url = \"https://host[:port]/api\"`), but target `{target}` serves its API from the page's own origin, so the generated server answers no CORS: remove `frontend_origin`, or set `api_url` to the API's absolute URL."
             ),
             FrontendProblem::NoComponent { target } => format!(
                 "Target `{target}` has no client component: a web target renders exactly one `client component` as its page."
@@ -214,19 +220,47 @@ pub fn target_problems(name: &str, target: &TargetConfig) -> Vec<FrontendProblem
         }
         Some(Mode::Ssr) => {}
     }
-    if let Some(origin) = &target.frontend_origin
-        && !is_canonical_origin(origin)
-    {
-        problems.push(FrontendProblem::InvalidFrontendOrigin {
-            origin: origin.clone(),
-        });
+    if let Some(origin) = &target.frontend_origin {
+        if !is_canonical_origin(origin) {
+            problems.push(FrontendProblem::InvalidFrontendOrigin {
+                origin: origin.clone(),
+            });
+        } else if target.mode == Some(Mode::Ssr)
+            || (target.mode == Some(Mode::Split) && target.api_url == "/api")
+        {
+            // (An invalid `api_url` is reported on its own.)
+            problems.push(FrontendProblem::UnusedFrontendOrigin {
+                target: name.to_string(),
+                origin: origin.clone(),
+            });
+        }
     }
     problems
 }
 
+/// Whether the target's API is on another origin than its page: the `split` mode with an
+/// absolute `api_url` (a canonical origin followed by `/api`).
+fn has_cross_origin_api(target: &TargetConfig) -> bool {
+    target.mode == Some(Mode::Split)
+        && target
+            .api_url
+            .strip_suffix("/api")
+            .is_some_and(|origin| !origin.is_empty() && is_canonical_origin(origin))
+}
+
+/// The origin the generated API answers with CORS: `frontend_origin`, only when the API is on
+/// another origin (`verify` rejects `frontend_origin` otherwise, E8311). `None`: no CORS.
+pub fn cors_origin(target: &TargetConfig) -> Option<&str> {
+    target
+        .frontend_origin
+        .as_deref()
+        .filter(|_| has_cross_origin_api(target))
+}
+
 /// An origin as browsers write it in the `Origin` header: `http://` or `https://`, a lowercase
-/// host (DNS labels of `a-z`, `0-9` and inner `-`, or a bracketed IPv6 address) and an optional
-/// port that is not the scheme's default, with nothing after it.
+/// host (DNS labels of `a-z`, `0-9` and inner `-` whose last label is not a number, a
+/// dotted-decimal IPv4 address of four octets 0..=255 without leading zeros, or a bracketed IPv6
+/// address) and an optional port that is not the scheme's default, with nothing after it.
 fn is_canonical_origin(text: &str) -> bool {
     let (rest, default_port) = if let Some(rest) = text.strip_prefix("https://") {
         (rest, "443")
@@ -275,7 +309,31 @@ fn is_canonical_origin(text: &str) -> bool {
             && port.parse::<u32>().is_ok_and(|value| value <= 65535)
             && port != default_port
     });
-    host.split('.').all(label) && port_ok
+    if !port_ok {
+        return false;
+    }
+    if host == "ipv6" {
+        return true;
+    }
+    let labels: Vec<&str> = host.split('.').collect();
+    // A host whose last label is a number (decimal, or `0x` hex) is an IPv4 address to a
+    // browser's URL parser, which rewrites it in dotted decimal (`http://1` is
+    // `http://0.0.0.1`) or rejects it: only that dotted-decimal form is canonical.
+    let last = labels.last().copied().unwrap_or_default();
+    let numeric = (!last.is_empty() && last.chars().all(|c| c.is_ascii_digit()))
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|hex| hex.chars().all(|c| c.is_ascii_hexdigit()));
+    if numeric {
+        let octet = |label: &&str| {
+            !label.is_empty()
+                && label.chars().all(|c| c.is_ascii_digit())
+                && (label.len() == 1 || !label.starts_with('0'))
+                && label.parse::<u16>().is_ok_and(|value| value <= 255)
+        };
+        return labels.len() == 4 && labels.iter().all(octet);
+    }
+    labels.iter().all(|item| label(item))
 }
 
 fn program_plan(

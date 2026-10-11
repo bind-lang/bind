@@ -149,7 +149,7 @@ fn workspace_files(
     let mut files: Vec<(String, String)> = Vec::new();
     let mut add = |path: &str, content: String| files.push((path.to_string(), content));
     add("Cargo.toml", cargo_toml(app, target_config, &layout));
-    let frontend_origin = target_config.frontend_origin.as_deref();
+    let frontend_origin = crate::backend::js::plan::cors_origin(target_config);
     if layout.server {
         let meta = page_meta(config);
         let page = SsrPage {
@@ -555,10 +555,7 @@ pub fn manifest_api_url(target: &TargetConfig) -> String {
 
 /// The manifest's `frontendOrigin`: the only origin the API answers (CORS), or `null`.
 pub fn manifest_frontend_origin(target: &TargetConfig) -> String {
-    target
-        .frontend_origin
-        .as_deref()
-        .map_or_else(|| "null".to_string(), json)
+    crate::backend::js::plan::cors_origin(target).map_or_else(|| "null".to_string(), json)
 }
 
 fn generated_manifest(app: &VerifiedApplication, target: &TargetConfig) -> String {

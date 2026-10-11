@@ -445,6 +445,21 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             Span::default(),
         ));
     }
+    // The page's stylesheet is read when `generate` writes `web/styles.css`: a missing or
+    // unreadable file is reported here, so `generate` never fails on a verified program.
+    if target_config.client == "web"
+        && let Some(path) = &config.web_stylesheet
+        && let Err(error) = std::fs::read_to_string(path)
+    {
+        diagnostics.push(Diagnostic::error(
+            "E8311",
+            format!(
+                "The web stylesheet `{}` (`[web].stylesheet` in bind.toml) cannot be read ({error}): create the file, fix the path (relative to bind.toml) or remove the setting to use the default stylesheet.",
+                path.display()
+            ),
+            Span::default(),
+        ));
+    }
     let built_in_target = target_config.client == "web"
         && target_config.server == "rust"
         && matches!(target_config.deployment.as_str(), "aws-lambda" | "vercel");
@@ -2410,6 +2425,110 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
                 "{origin}"
             );
         }
+    }
+
+    #[test]
+    fn a_missing_web_stylesheet_is_reported_by_verify() {
+        let (root, _) = web_fixture(PAGE, WEB_SSR);
+        let manifest = fs::read_to_string(root.join("bind.toml")).unwrap();
+        fs::write(
+            root.join("bind.toml"),
+            format!("{manifest}[web]\nstylesheet = \"missing.css\"\n"),
+        )
+        .unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let result = verify(&config, "t");
+        let messages: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == "E8311")
+            .map(|item| item.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 1, "{:?}", result.diagnostics);
+        assert!(
+            messages[0].starts_with("The web stylesheet `"),
+            "{}",
+            messages[0]
+        );
+        assert!(messages[0].contains("missing.css"), "{}", messages[0]);
+        assert!(result.application.is_none());
+        // With the file present the target verifies and generates its stylesheet.
+        fs::write(root.join("missing.css"), "body { color: red; }\n").unwrap();
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let result = verify(&config, "t");
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_frontend_origin_needs_an_api_on_another_origin() {
+        let unused = |mode: &str| {
+            vec![format!(
+                "`frontend_origin = \"https://app.example.com\"` only applies when the API is on another origin (`mode = \"split\"` with `api_url = \"https://host[:port]/api\"`), but target `t` serves its API from the page's own origin, so the generated server answers no CORS: remove `frontend_origin`, or set `api_url` to the API's absolute URL.{mode}"
+            )]
+        };
+        let origin = "frontend_origin = \"https://app.example.com\"\n";
+        // The ssr mode has no cross-origin call; nor has the split mode with the default `/api`.
+        assert_eq!(e8311(PAGE, &format!("{WEB_SSR}{origin}")), unused(""));
+        assert_eq!(e8311(PAGE, &format!("{WEB_SPLIT}{origin}")), unused(""));
+        assert_eq!(
+            e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"/api\"\n{origin}")),
+            unused("")
+        );
+        assert!(
+            e8311(
+                PAGE,
+                &format!("{WEB_SPLIT}api_url = \"https://api.example.com/api\"\n{origin}")
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn numeric_hosts_are_canonical_only_in_dotted_decimal() {
+        let cross = format!("{WEB_SPLIT}api_url = \"https://api.example.com/api\"\n");
+        // A browser rewrites these hosts (`http://1` is `http://0.0.0.1`) or rejects them.
+        for origin in [
+            "http://1",
+            "http://999.1.1.1",
+            "http://1.2.3",
+            "http://1.2.3.4.5",
+            "http://01.2.3.4",
+            "http://0x7f.0.0.1",
+            "http://example.0x1f",
+            "http://app.123",
+            "http://256.0.0.1",
+        ] {
+            assert_eq!(
+                e8311(PAGE, &format!("{cross}frontend_origin = \"{origin}\"\n")).len(),
+                1,
+                "{origin}"
+            );
+        }
+        for origin in [
+            "http://127.0.0.1:8080",
+            "http://10.0.0.255",
+            "http://0.0.0.0",
+            "https://123.example.com",
+            "https://app-1.example.com",
+            "http://localhost:3000",
+        ] {
+            assert!(
+                e8311(PAGE, &format!("{cross}frontend_origin = \"{origin}\"\n")).is_empty(),
+                "{origin}"
+            );
+        }
+        // `api_url` follows the same rule.
+        let messages = e8311(
+            PAGE,
+            &format!(
+                "{WEB_SPLIT}api_url = \"http://1/api\"\nfrontend_origin = \"https://app.example.com\"\n"
+            ),
+        );
+        assert!(
+            messages[0].starts_with("`api_url = \"http://1/api\"` must be `/api` or"),
+            "{messages:?}"
+        );
     }
 
     #[test]
