@@ -2,6 +2,8 @@
 
 Profile identifier: `rust-elm-web-v2`.
 
+> Nota: este perfil foi substituído pelo [v0.3](certified-profile-v0.3.md) (`rust-web-v3`, contrato `bind-json-v3`, frontend HTML/CSS/JS e SSR gerados da IR; o cliente Elm foi removido). Mantido como referência histórica.
+
 Este documento define a superfície finita para a qual `bind certify` emite uma atestação no perfil v2. O v2 substitui o v1 ([v0.1](certified-profile-v0.1.md)) no servidor: o código Rust é gerado a partir de uma IR tipada (`CoreProgram`), não mais de padrões de tokens, e os endpoints aceitam a linguagem inteira. Semântica não suportada continua sendo erro de compilação; o compilador nunca a substitui por um comportamento mais fraco.
 
 ## Execution model
