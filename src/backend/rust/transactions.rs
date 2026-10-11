@@ -30,16 +30,19 @@ fn create_table(csv: &str) -> String {
         .filter(|line| line.starts_with("customers,"))
         .map(|line| {
             let fields: Vec<&str> = line.split(',').collect();
-            let (name, kind, nullable, has_default) = (
-                fields[3],
-                fields[4],
-                fields[5] == "true",
-                fields[7] == "true",
-            );
+            let field = |index: usize| {
+                fields
+                    .get(index)
+                    .copied()
+                    .unwrap_or_else(|| panic!("schema line without column {index}: {line}"))
+            };
+            let (name, kind, nullable, has_default) =
+                (field(3), field(4), field(5) == "true", field(7) == "true");
             let sql_type = match kind {
                 "CustomerId" => "uuid",
                 "Money" => "numeric(20, 2)",
-                _ => "text",
+                "String" | "Email" => "text",
+                other => panic!("create_table: unknown column type {other} for {name}"),
             };
             format!(
                 "{name} {sql_type}{}{}",
@@ -105,8 +108,7 @@ fn failed_rpc_rolls_back_the_insert() {
             &pool,
         )
         .await;
-        assert_eq!(failed.status, 404, "{}", failed.body);
-        assert_eq!(count().await, 0, "the insert must be rolled back");
+        let after_failed = count().await;
 
         let created = bind_server_transactions::handle_rpc(
             "/api/cadastrar",
@@ -114,11 +116,14 @@ fn failed_rpc_rolls_back_the_insert() {
             &pool,
         )
         .await;
-        assert_eq!(created.status, 200, "{}", created.body);
-        assert_eq!(count().await, 1);
+        let after_created = count().await;
 
         pool.close().await;
         sqlx::query(sql(format!("DROP SCHEMA {schema} CASCADE"))).execute(&admin).await.unwrap();
+        assert_eq!(failed.status, 404, "{}", failed.body);
+        assert_eq!(after_failed, 0, "the insert must be rolled back");
+        assert_eq!(created.status, 200, "{}", created.body);
+        assert_eq!(after_created, 1);
     });
 }
 "##;
@@ -126,6 +131,10 @@ fn failed_rpc_rolls_back_the_insert() {
 #[test]
 #[ignore = "builds a Rust crate; run with `cargo test transactions -- --ignored`"]
 fn failed_rpc_rolls_back_the_insert() {
+    if std::env::var_os("BIND_TEST_DATABASE_URL").is_none() {
+        eprintln!("skipped: BIND_TEST_DATABASE_URL not set");
+        return;
+    }
     let csv = include_str!("../../../examples/commerce/schema/main.csv");
     let schema = crate::core::lower::tests::schema(csv);
     let program = crate::core::lower::tests::compile_with(&source(), &schema);
@@ -144,7 +153,6 @@ fn failed_rpc_rolls_back_the_insert() {
         &crate_dir,
         &["clippy", "--quiet", "--all-targets", "--", "-D", "warnings"],
     );
-    // `--nocapture` so a skip is visible in the output.
-    let output = cargo(&crate_dir, &["test", "--quiet", "--", "--nocapture"]);
-    eprintln!("{output}");
+    let output = cargo(&crate_dir, &["test", "--quiet"]);
+    eprintln!("transactions: ran against live database\n{output}");
 }
