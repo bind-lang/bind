@@ -653,6 +653,27 @@ mod tests {
     }
 
     #[test]
+    fn return_as_an_operand_runs_the_earlier_operands_first() {
+        // As tests/codegen/returns.bd, whose generated Rust the snapshot crate runs.
+        let source = include_str!("../../tests/codegen/returns.bd");
+        let call = |name: &str, arg: Value| run(source, name, vec![arg]).map(|v| v.render());
+        assert_eq!(call("esquerda", int("4")), Ok("4".into()));
+        assert_eq!(call("direita", int("4")), Ok("40".into()));
+        assert_eq!(call("nega", int("4")), Ok("4".into()));
+        assert_eq!(call("texto", Value::Str("a".into())), Ok("\"a\"".into()));
+        assert_eq!(call("escolhe", int("4")), Ok("5".into()));
+        assert_eq!(call("ordem", int("1")), Ok("5".into()));
+        assert_eq!(call("ordem", int("20000")), Err(EvalError::RecursionLimit));
+        assert_eq!(call("condicao", int("4")), Ok("true".into()));
+        assert_eq!(call("campo", int("4")), Ok("4".into()));
+        assert_eq!(call("aninhado", int("3")), Ok("3".into()));
+        assert_eq!(
+            call("aninhado", int("20000")),
+            Err(EvalError::RecursionLimit)
+        );
+    }
+
+    #[test]
     fn depth_limit() {
         let source = "fun loop(n: Int): Int = if (n == 0) 0 else loop(n - 1)";
         assert_eq!(

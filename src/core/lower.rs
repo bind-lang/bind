@@ -452,6 +452,82 @@ fn expr(ty: Type, kind: ExprKind) -> Expr {
     Expr { ty, kind }
 }
 
+/// Whether evaluating `expr` always leaves the function: a `return`, or a sequence ending in
+/// one.
+fn diverges(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Return(_) => true,
+        ExprKind::Seq { body, .. } => diverges(body),
+        _ => false,
+    }
+}
+
+/// Evaluating `expr` has no effect and cannot fail.
+fn is_inert(expr: &Expr) -> bool {
+    matches!(
+        expr.kind,
+        ExprKind::Lit(_)
+            | ExprKind::Local(_)
+            | ExprKind::Global { .. }
+            | ExprKind::Builtin { .. }
+            | ExprKind::None
+            | ExprKind::Lambda { .. }
+    )
+}
+
+/// A node whose operand diverges (`(return 1) + 2`, `f(x, return y)`, `when (return z)`)
+/// never completes: it becomes the operands before that one, evaluated left to right for their
+/// effects (inert ones dropped), followed by the diverging operand. Backends then never see a
+/// `return` used as a value, which Rust rejects in most operand positions.
+fn hoist_return(node: Expr) -> Expr {
+    let Expr { ty, kind } = node;
+    // The operands in evaluation order, and how to rebuild the node from them.
+    let operands: Vec<&Expr> = match &kind {
+        ExprKind::Ctor { args, .. }
+        | ExprKind::ServerCall { args, .. }
+        | ExprKind::Prim { args, .. }
+        | ExprKind::Db { args, .. } => args.iter().collect(),
+        ExprKind::Call { callee, args } => std::iter::once(&**callee).chain(args).collect(),
+        ExprKind::Some(inner) | ExprKind::Return(inner) => vec![inner],
+        ExprKind::Field { target, .. } => vec![target],
+        ExprKind::If { condition, .. } => vec![condition],
+        ExprKind::Match { scrutinee, .. } => vec![scrutinee],
+        _ => Vec::new(),
+    };
+    let Some(position) = operands.iter().position(|operand| diverges(operand)) else {
+        return Expr { ty, kind };
+    };
+    let mut operands: Vec<Expr> = match kind {
+        ExprKind::Ctor { args, .. }
+        | ExprKind::ServerCall { args, .. }
+        | ExprKind::Prim { args, .. }
+        | ExprKind::Db { args, .. } => args,
+        ExprKind::Call { callee, args } => std::iter::once(*callee).chain(args).collect(),
+        ExprKind::Some(inner) | ExprKind::Return(inner) => vec![*inner],
+        ExprKind::Field { target, .. } => vec![*target],
+        ExprKind::If { condition, .. } => vec![*condition],
+        ExprKind::Match { scrutinee, .. } => vec![*scrutinee],
+        _ => Vec::new(),
+    };
+    operands.truncate(position + 1);
+    let Some(diverging) = operands.pop() else {
+        return expr(ty, ExprKind::Lit(Literal::Unit));
+    };
+    operands
+        .into_iter()
+        .rev()
+        .filter(|operand| !is_inert(operand))
+        .fold(diverging, |body, value| {
+            expr(
+                ty.clone(),
+                ExprKind::Seq {
+                    value: Box::new(value),
+                    body: Box::new(body),
+                },
+            )
+        })
+}
+
 fn boxed(ty: Type, kind: ExprKind) -> Box<Expr> {
     Box::new(expr(ty, kind))
 }
@@ -673,6 +749,10 @@ impl Lowerer<'_> {
     }
 
     fn expr(&mut self, node: &syntax::Expr) -> Expr {
+        hoist_return(self.expr_node(node))
+    }
+
+    fn expr_node(&mut self, node: &syntax::Expr) -> Expr {
         use syntax::ExprKind as K;
         let ty = self.node_type(node.id);
         let kind = match &node.kind {
@@ -1395,6 +1475,20 @@ pub(crate) mod tests {
         assert_eq!(
             body("data class P(val n: String)\nfun f(p: P?) = p?.n", "f"),
             "Match:String?(Local(0), [null => None:String?; Some(_) 1 value: P => Some(Field(Local(1), n))])"
+        );
+    }
+
+    #[test]
+    fn a_diverging_operand_ends_the_node() {
+        let source = "fun g(x: Int): Int = x\nfun f(x: Int): Int = g(x) + (return x) * g(1)\n";
+        assert_eq!(
+            body(source, "f"),
+            "Seq(Call(Global(g[]), [Local(0)]); Return(Local(0)))"
+        );
+        // Inert operands before the `return` are dropped; nested nodes collapse too.
+        assert_eq!(
+            body("fun f(x: Int): Int = -(x + (return 1))\n", "f"),
+            "Return(Lit(1))"
         );
     }
 

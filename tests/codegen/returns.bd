@@ -1,0 +1,31 @@
+// `return` used directly as an operand: the operands before it are evaluated, then the
+// function returns.
+data class Par(val primeiro: Int, val segundo: String)
+
+fun esquerda(x: Int): Int = (return x) + 2
+
+fun direita(x: Int): Int = x + (return x * 10)
+
+fun nega(x: Int): Int = -(return x)
+
+fun texto(s: String): String = (return s) + "b"
+
+fun dinheiro(m: Money): Money = m + (return m)
+
+fun escolhe(x: Int): Int = when (return x + 1) {
+    1 -> 2
+    _ -> 3
+}
+
+fun fundo(n: Int): Int = if (n <= 0) 0 else fundo(n - 1)
+
+fun soma(a: Int, b: Int): Int = a + b
+
+// `fundo(n)` runs first: past the call-depth limit the call fails before the return.
+fun ordem(n: Int): Int = soma(fundo(n), return 5)
+
+fun condicao(x: Int): Boolean = if (return x > 0) false else true
+
+fun campo(x: Int): Int = Par(return x, "a").primeiro
+
+fun aninhado(n: Int): Int = (fundo(n) + (return n)) * 2

@@ -712,7 +712,7 @@ fn endpoint_against_postgres() {
 use std::sync::Arc;
 
 use bind_codegen_snapshots::bind_runtime::{AppError, Ctx, Int};
-use bind_codegen_snapshots::{adt, arithmetic, control, lambdas, records};
+use bind_codegen_snapshots::{adt, arithmetic, control, lambdas, records, returns};
 
 fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap()
@@ -785,6 +785,27 @@ fn generated_functions_run() {
     assert_eq!(rt.block_on(lambdas::bind_usaIgnora(Ctx::pure())).unwrap(), Int::from_i64(1));
 }
 
+/// `return` as an operand, with the values `core::eval` gives (its test
+/// `return_as_an_operand_runs_the_earlier_operands_first`).
+#[test]
+fn return_operands() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let int = |f: fn(Ctx, Int) -> bind_codegen_snapshots::bind_runtime::BoxFuture<Int>, n: i64| {
+        rt.block_on(f(Ctx::pure(), Int::from_i64(n))).unwrap()
+    };
+    assert_eq!(int(returns::bind_esquerda, 4), Int::from_i64(4));
+    assert_eq!(int(returns::bind_direita, 4), Int::from_i64(40));
+    assert_eq!(int(returns::bind_nega, 4), Int::from_i64(4));
+    assert_eq!(int(returns::bind_escolhe, 4), Int::from_i64(5));
+    assert_eq!(int(returns::bind_ordem, 1), Int::from_i64(5));
+    assert_eq!(int(returns::bind_campo, 4), Int::from_i64(4));
+    assert_eq!(int(returns::bind_aninhado, 3), Int::from_i64(3));
+    assert_eq!(rt.block_on(returns::bind_texto(Ctx::pure(), "a".to_string())).unwrap(), "a");
+    assert!(rt.block_on(returns::bind_condicao(Ctx::pure(), Int::from_i64(4))).unwrap());
+    let two = rust_decimal::Decimal::from(2);
+    assert_eq!(rt.block_on(returns::bind_dinheiro(Ctx::pure(), two)).unwrap(), two);
+}
+
 /// Real recursion through generated code, on the runtime shape the server uses: worker
 /// threads with 64 MiB stacks (debug builds need at least 32 MiB for 10,000 levels).
 #[test]
@@ -803,6 +824,12 @@ fn deep_recursion_reaches_the_limit_without_overflow() {
     assert_eq!(run(9999).unwrap(), Int::from_i64(0));
     assert!(matches!(run(10_000), Err(AppError::RecursionLimit)));
     assert!(matches!(run(100_000), Err(AppError::RecursionLimit)));
+    // The operand before a `return` runs first, and fails past the limit.
+    let returns = |n: i64| {
+        rt.block_on(async move { tokio::spawn(returns::bind_ordem(Ctx::pure(), Int::from_i64(n))).await })
+            .unwrap()
+    };
+    assert!(matches!(returns(20_000), Err(AppError::RecursionLimit)));
 }
 "##;
 }
