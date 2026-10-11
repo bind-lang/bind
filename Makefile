@@ -1,4 +1,4 @@
-.PHONY: build test check certify certify-aws certify-vercel clean
+.PHONY: build test test-generated check certify certify-aws certify-vercel clean
 
 DATABASE_URL ?= postgresql://bind:bind@localhost/bind
 export DATABASE_URL
@@ -9,6 +9,11 @@ build:
 test:
 	cargo test
 	cargo test --manifest-path runtime/bind-runtime/Cargo.toml
+
+# Builds and runs generated Rust crates (snapshots, servers, the differential test). Tests that
+# need PostgreSQL run against BIND_TEST_DATABASE_URL and skip without it.
+test-generated:
+	cargo test -- --ignored
 
 check:
 	cargo run -- check --target aws-lambda

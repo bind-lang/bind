@@ -482,9 +482,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// Runs `cargo args` in `directory` (with a build cache shared by the test crates) and
-    /// fails on an error or any warning.
-    pub(crate) fn cargo(directory: &Path, args: &[&str]) {
+    /// Runs `cargo args` in `directory` (with a build cache shared by the test crates), fails
+    /// on an error or any warning, and returns its standard output.
+    pub(crate) fn cargo(directory: &Path, args: &[&str]) -> String {
         let target =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bind-codegen-tests/target");
         let output = Command::new(env!("CARGO"))
@@ -505,14 +505,21 @@ pub(crate) mod tests {
             !stderr.contains("warning"),
             "cargo {args:?} reported warnings\n{stderr}"
         );
+        String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
     /// A crate at `target/bind-codegen-tests/<name>` with the generated server's pinned
     /// dependencies, the runtime's lock and `src/bind_runtime.rs`; returns its directory.
     fn test_crate(name: &str) -> PathBuf {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        test_crate_in(&root.join("target/bind-codegen-tests"), name)
+    }
+
+    /// Like [`test_crate`], at `parent/<name>`.
+    pub(crate) fn test_crate_in(parent: &Path, name: &str) -> PathBuf {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let runtime = root.join("runtime/bind-runtime");
-        let crate_dir = root.join("target/bind-codegen-tests").join(name);
+        let crate_dir = parent.join(name);
         if crate_dir.exists() {
             fs::remove_dir_all(&crate_dir).unwrap();
         }
@@ -788,3 +795,5 @@ fn deep_recursion_reaches_the_limit_without_overflow() {
 }
 "##;
 }
+#[cfg(test)]
+mod differential;
