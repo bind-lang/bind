@@ -21,7 +21,9 @@ Duration Money Email Url DatabaseUrl Port Secret Ui`. Built-in generics: `List<T
 Option<T>` (written `T?`) and `Result<T, E>` with constructors `Ok(value: T)` and `Err(error: E)`.
 `T??` is written and parsed as `Option<Option<T>>` (for example `Int??`); nested options are never collapsed.
 
-`Int` has arbitrary precision. `Double` and `Float` are IEEE 754. User types (`data class`, `entity`,
+`Int` has arbitrary precision. `Double` and `Float` are IEEE 754. A floating-point literal too large
+to be finite (`1e400`, `3.5e38f`) is rejected (E7006); one too small to be told apart from zero
+(`1e-400`) is the value 0.0, as in Rust. User types (`data class`, `entity`,
 `sealed class`, `enum class`, `distinct type`) are nominal: two types are equal only if they have the
 same name and equal arguments. An `entity` cannot have type parameters, because it maps to a concrete
 database table (E7004).

@@ -1388,8 +1388,27 @@ impl<'a> Checker<'a> {
     fn infer(&mut self, expr: &Expr) -> Type {
         let ty = match &expr.kind {
             ExprKind::Int(_) => Type::con("Int"),
-            ExprKind::Double(_) => Type::con("Double"),
-            ExprKind::Float(_) => Type::con("Float"),
+            ExprKind::Double(text) => {
+                // Too large to be finite (`1e400`); too small rounds to zero (`1e-400` is 0.0).
+                if text.parse::<f64>().is_ok_and(f64::is_infinite) {
+                    self.error(
+                        "E7006",
+                        format!("Double literal `{text}` is out of range: the largest Double is about 1.8e308."),
+                        &expr.span,
+                    );
+                }
+                Type::con("Double")
+            }
+            ExprKind::Float(text) => {
+                if text.parse::<f32>().is_ok_and(f32::is_infinite) {
+                    self.error(
+                        "E7006",
+                        format!("Float literal `{text}f` is out of range: the largest Float is about 3.4e38."),
+                        &expr.span,
+                    );
+                }
+                Type::con("Float")
+            }
             ExprKind::Str(_) => Type::con("String"),
             ExprKind::Bool(_) => Type::con("Boolean"),
             ExprKind::Null => {
@@ -3276,6 +3295,16 @@ mod tests {
     #[test]
     fn duplicate_parameters_are_errors() {
         assert_eq!(errors("fun f(x, x) = x"), vec!["E7113"]);
+        assert_eq!(errors("fun f() = 1e400"), vec!["E7006"]);
+        assert_eq!(errors("fun f() = -1.8e308 * 1e309"), vec!["E7006"]);
+        assert_eq!(errors("fun f() = 3.5e38f"), vec!["E7006"]);
+        assert_eq!(
+            scheme("fun f() = 1.7976931348623157e308", "f"),
+            "() -> Double"
+        );
+        assert_eq!(scheme("fun f() = 3.4e38f", "f"), "() -> Float");
+        // Too small to be distinguished from zero: 0.0, as in Rust.
+        assert_eq!(scheme("fun f() = 1e-400", "f"), "() -> Double");
     }
 
     #[test]
