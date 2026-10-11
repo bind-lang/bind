@@ -633,6 +633,7 @@ impl Lowerer<'_> {
                 .cloned()
                 .unwrap_or_default(),
             body,
+            bodiless: function.expr.is_none(),
             generics,
         }
     }

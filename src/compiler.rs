@@ -871,7 +871,8 @@ fn rust_server_diagnostics(
         .into_iter()
         .map(|problem| {
             let span = match &problem {
-                ServerProblem::Unsupported { function, .. } => program
+                ServerProblem::Unsupported { function, .. }
+                | ServerProblem::Bodiless { function, .. } => program
                     .functions
                     .iter()
                     .find(|item| item.name == *function)
@@ -2082,6 +2083,19 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         }
         fs::remove_dir_all(root).unwrap();
         found
+    }
+
+    #[test]
+    fn endpoints_reaching_bodiless_functions_are_rejected() {
+        // `solta` has no body either, but no endpoint reaches it.
+        let source = "fun registra(x: Int): Unit\nfun solta(x: Int): Unit\nfun usa(x: Int): Int {\n    registra(x)\n    return x\n}\nserver fun a(x: Int): Int = usa(x)\nserver fun b(x: Int): Unit\n";
+        assert_eq!(
+            e8310(source, EMPTY_SCHEMA),
+            vec![
+                "Endpoint `b` has no body, so the generated server cannot run it in profile rust-elm-web-v2.",
+                "Function `registra` is reachable from endpoint `a` but has no body, so the generated server cannot run it in profile rust-elm-web-v2.",
+            ]
+        );
     }
 
     #[test]

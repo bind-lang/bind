@@ -52,6 +52,9 @@ pub struct CoreFunction {
     /// Resolved effect labels, e.g. `["db.read"]`.
     pub effects: Vec<String>,
     pub body: Expr,
+    /// Declared without a body (its result is `Unit`): lowered with a `Lit(Unit)` body. The
+    /// generated server rejects one reachable from an endpoint (E8310).
+    pub bodiless: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]

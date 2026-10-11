@@ -189,6 +189,8 @@ pub enum ServerProblem {
         endpoint: String,
         what: &'static str,
     },
+    /// A function reachable from `endpoint` (or the endpoint itself) has no body (E8310).
+    Bodiless { function: String, endpoint: String },
     /// The database layer cannot be generated (E8310): the same check as the backend's.
     Database(db::DbError),
     /// An inconsistency the checker should have rejected (E9001).
@@ -213,6 +215,12 @@ impl ServerProblem {
             } => format!(
                 "Function `{function}` is reachable from endpoint `{endpoint}` but uses {what}, which the generated server does not support in profile {profile}."
             ),
+            ServerProblem::Bodiless { function, endpoint } if function == endpoint => format!(
+                "Endpoint `{endpoint}` has no body, so the generated server cannot run it in profile {profile}."
+            ),
+            ServerProblem::Bodiless { function, endpoint } => format!(
+                "Function `{function}` is reachable from endpoint `{endpoint}` but has no body, so the generated server cannot run it in profile {profile}."
+            ),
             ServerProblem::Database(error) => error.message.clone(),
             ServerProblem::Internal(message) => {
                 format!("Internal compiler error: {message}. This is a bug in bindc.")
@@ -221,9 +229,10 @@ impl ServerProblem {
     }
 }
 
-/// What prevents generating the server of `program`: unsupported nodes in functions
-/// reachable from an endpoint (attributed to the first endpoint, by name, that reaches them)
-/// and model fields without a column mapping in the tables those functions use.
+/// What prevents generating the server of `program`: body-less functions and unsupported
+/// nodes in functions reachable from an endpoint (attributed to the first endpoint, by name,
+/// that reaches them) and model fields without a column mapping in the tables those functions
+/// use.
 pub fn server_problems(program: &CoreProgram, database: &DatabaseSchema) -> Vec<ServerProblem> {
     let mut endpoints: Vec<&CoreFunction> = program
         .functions
@@ -244,6 +253,13 @@ pub fn server_problems(program: &CoreProgram, database: &DatabaseSchema) -> Vec<
             .get(function.name.as_str())
             .copied()
             .unwrap_or_default();
+        if function.bodiless {
+            problems.push(ServerProblem::Bodiless {
+                function: function.name.clone(),
+                endpoint: endpoint.to_string(),
+            });
+            continue;
+        }
         let what = match outside_server(&function.body) {
             None => continue,
             Some(Outside::Environment) => "an `environment` value",

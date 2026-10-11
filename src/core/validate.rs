@@ -969,6 +969,7 @@ mod tests {
             result,
             effects: Vec::new(),
             body,
+            bodiless: false,
         }
     }
 
