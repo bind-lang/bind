@@ -586,4 +586,380 @@ mod tests {
             "<div class=\"a&quot;b&lt;c&gt;\" id=\"7\"></div>"
         );
     }
+
+    // ---- Shared cross-runtime vectors (`runtime/vectors/`, see its README) ----
+
+    fn vector_path(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("runtime/vectors")
+            .join(name)
+    }
+
+    fn bless() -> bool {
+        std::env::var_os("BIND_BLESS").is_some()
+    }
+
+    /// A minimal JSON value: just what the vector files use (no numbers, `null` or booleans).
+    #[derive(Debug)]
+    enum Json {
+        Str(String),
+        Array(Vec<Json>),
+        Object(Vec<(String, Json)>),
+    }
+
+    impl Json {
+        fn get(&self, key: &str) -> &Json {
+            match self {
+                Json::Object(fields) => fields
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value)
+                    .unwrap_or_else(|| panic!("missing key {key}")),
+                other => panic!("not an object: {other:?}"),
+            }
+        }
+
+        fn str(&self) -> &str {
+            match self {
+                Json::Str(text) => text,
+                other => panic!("not a string: {other:?}"),
+            }
+        }
+
+        fn array(&self) -> &[Json] {
+            match self {
+                Json::Array(items) => items,
+                other => panic!("not an array: {other:?}"),
+            }
+        }
+    }
+
+    fn parse_json(text: &str) -> Json {
+        fn skip(chars: &mut std::iter::Peekable<std::str::Chars>) {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+        }
+        fn string(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
+            assert_eq!(chars.next(), Some('"'));
+            let mut out = String::new();
+            loop {
+                match chars.next().expect("unterminated string") {
+                    '"' => return out,
+                    '\\' => match chars.next().expect("bad escape") {
+                        'n' => out.push('\n'),
+                        't' => out.push('\t'),
+                        'r' => out.push('\r'),
+                        'u' => {
+                            let hex: String = chars.by_ref().take(4).collect();
+                            let unit = u32::from_str_radix(&hex, 16).expect("bad \\u");
+                            out.push(char::from_u32(unit).expect("lone surrogate"));
+                        }
+                        c => out.push(c),
+                    },
+                    c => out.push(c),
+                }
+            }
+        }
+        fn value(chars: &mut std::iter::Peekable<std::str::Chars>) -> Json {
+            skip(chars);
+            match chars.peek().copied() {
+                Some('"') => Json::Str(string(chars)),
+                Some('[') => {
+                    chars.next();
+                    let mut items = Vec::new();
+                    loop {
+                        skip(chars);
+                        if chars.peek() == Some(&']') {
+                            chars.next();
+                            return Json::Array(items);
+                        }
+                        items.push(value(chars));
+                        skip(chars);
+                        if chars.peek() == Some(&',') {
+                            chars.next();
+                        }
+                    }
+                }
+                Some('{') => {
+                    chars.next();
+                    let mut fields = Vec::new();
+                    loop {
+                        skip(chars);
+                        if chars.peek() == Some(&'}') {
+                            chars.next();
+                            return Json::Object(fields);
+                        }
+                        let key = string(chars);
+                        skip(chars);
+                        assert_eq!(chars.next(), Some(':'));
+                        fields.push((key, value(chars)));
+                        skip(chars);
+                        if chars.peek() == Some(&',') {
+                            chars.next();
+                        }
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        value(&mut text.chars().peekable())
+    }
+
+    fn json_string(text: &str) -> String {
+        let mut out = String::from("\"");
+        for c in text.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\n' => out.push_str("\\n"),
+                '\t' => out.push_str("\\t"),
+                '\r' => out.push_str("\\r"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out.push('"');
+        out
+    }
+
+    fn tree_json(tree: &UiTree) -> String {
+        let args: Vec<String> = tree
+            .args
+            .iter()
+            .map(|arg| match arg {
+                UiArg::Str(text) => json_string(text),
+                UiArg::Int(digits) => format!("{{\"int\":{}}}", json_string(digits)),
+            })
+            .collect();
+        let children: Vec<String> = tree.children.iter().map(tree_json).collect();
+        format!(
+            "{{\"node\":{},\"args\":[{}],\"children\":[{}]}}",
+            json_string(tree.node.name()),
+            args.join(","),
+            children.join(",")
+        )
+    }
+
+    fn tree_from_json(json: &Json) -> UiTree {
+        let name = json.get("node").str();
+        let node = if name == "Empty" {
+            UiNode::Empty
+        } else {
+            UiNode::from_name(name).expect("known node")
+        };
+        let args = json
+            .get("args")
+            .array()
+            .iter()
+            .map(|arg| match arg {
+                Json::Str(text) => UiArg::Str(text.clone()),
+                other => UiArg::Int(other.get("int").str().to_string()),
+            })
+            .collect();
+        let children = json
+            .get("children")
+            .array()
+            .iter()
+            .map(tree_from_json)
+            .collect();
+        UiTree {
+            node,
+            args,
+            children,
+        }
+    }
+
+    fn vector_trees() -> Vec<UiTree> {
+        let int = |digits: &str| UiArg::Int(digits.into());
+        let link = |args: Vec<UiArg>| n(UiNode::Link, args, vec![text("go")]);
+        let heading = |level: UiArg, extra: Vec<UiArg>| {
+            let mut args = vec![level];
+            args.extend(extra);
+            n(UiNode::Heading, args, vec![text("t")])
+        };
+        let mut trees = vec![
+            n(UiNode::Empty, vec![], vec![]),
+            text("plain"),
+            text("<script>alert('x' & \"y\")</script>"),
+            text("line\nbreak ● é"),
+            n(UiNode::Ui, vec![], vec![]),
+            n(
+                UiNode::Ui,
+                vec![],
+                vec![
+                    n(UiNode::Ui, vec![], vec![text("a"), text("b")]),
+                    n(UiNode::Empty, vec![], vec![]),
+                    n(UiNode::Div, vec![], vec![text("c")]),
+                ],
+            ),
+            n(
+                UiNode::Page,
+                vec![s("page")],
+                vec![
+                    n(UiNode::Section, vec![s("hero wrap"), s("top")], vec![]),
+                    n(UiNode::Main, vec![], vec![text("a")]),
+                    n(
+                        UiNode::Paragraph,
+                        vec![s("eyebrow")],
+                        vec![
+                            n(UiNode::Span, vec![s("dot")], vec![text("●")]),
+                            text("WHOLE\nAPP"),
+                        ],
+                    ),
+                ],
+            ),
+            n(
+                UiNode::Div,
+                vec![s("a\"b<c>'&"), int("7"), s("extra")],
+                vec![],
+            ),
+            heading(int("1"), vec![s("hero")]),
+            heading(int("3"), vec![]),
+            heading(int("6"), vec![]),
+            heading(int("0"), vec![]),
+            heading(int("-5"), vec![]),
+            heading(int("99999999999999999999"), vec![]),
+            heading(int("-99999999999999999999"), vec![]),
+            heading(s("2"), vec![]),
+            n(UiNode::Heading, vec![], vec![text("t")]),
+            link(vec![s("#top")]),
+            link(vec![s("#top"), s("brand")]),
+            link(vec![
+                s("https://x/?a=1&b=\"2\""),
+                s("c"),
+                s("_blank"),
+                s("Label"),
+            ]),
+            link(vec![s("/a"), s("c"), s("_self")]),
+            link(vec![s(" Java\tScript:alert(1)")]),
+            link(vec![s("\u{feff}javascript\u{3000}:x")]),
+            link(vec![s("javascripts:x")]),
+            link(vec![]),
+            n(UiNode::Rule, vec![], vec![]),
+            n(UiNode::Rule, vec![s("sep")], vec![text("ignored")]),
+            n(
+                UiNode::List,
+                vec![s("l")],
+                vec![
+                    n(UiNode::Item, vec![], vec![text("one")]),
+                    n(UiNode::Item, vec![int("5")], vec![text("two")]),
+                ],
+            ),
+        ];
+        // Every container-like node once, with a class, an id and a child.
+        for node in [
+            UiNode::Container,
+            UiNode::Grid,
+            UiNode::Stack,
+            UiNode::Header,
+            UiNode::Nav,
+            UiNode::Article,
+            UiNode::Aside,
+            UiNode::Footer,
+            UiNode::Strong,
+            UiNode::Emphasis,
+            UiNode::Small,
+            UiNode::Pre,
+            UiNode::Code,
+        ] {
+            trees.push(n(node, vec![s("k"), s("i")], vec![text("x")]));
+        }
+        trees
+    }
+
+    #[test]
+    fn html_vectors_file() {
+        let path = vector_path("html-trees.json");
+        if bless() {
+            let entries: Vec<String> = vector_trees()
+                .iter()
+                .map(|tree| {
+                    format!(
+                        "  {{\"tree\":{},\"html\":{}}}",
+                        tree_json(tree),
+                        json_string(&render_html_value(tree))
+                    )
+                })
+                .collect();
+            std::fs::write(&path, format!("[\n{}\n]\n", entries.join(",\n"))).expect("write");
+        }
+        let file = parse_json(&std::fs::read_to_string(&path).expect("vectors file"));
+        let cases = file.array();
+        assert!(cases.len() >= 20);
+        assert_eq!(
+            cases.len(),
+            vector_trees().len(),
+            "stale file: BIND_BLESS=1"
+        );
+        for case in cases {
+            let tree = tree_from_json(case.get("tree"));
+            assert_eq!(render_html_value(&tree), case.get("html").str(), "{tree:?}");
+        }
+        for (case, tree) in cases.iter().zip(vector_trees()) {
+            assert_eq!(tree_from_json(case.get("tree")), tree, "stale file");
+        }
+    }
+
+    #[test]
+    fn number_vectors_file() {
+        let path = vector_path("numbers.json");
+        if bless() {
+            let values: Vec<f64> = vec![
+                0.1 + 0.2,
+                1e21,
+                1e-7,
+                123456789012345680000.0,
+                -0.0,
+                0.0,
+                5e-324,
+                f64::NAN,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                1.5e300,
+                0.000001,
+                0.0000012,
+                1.2e-7,
+                1.0,
+                -1.5,
+                100.0,
+                123.456,
+                1e20,
+                1.5e21,
+                -1e-7,
+                f64::MAX,
+                f64::MIN_POSITIVE,
+                0.1f32 as f64,
+                1010.0 + 14362.0 / 32768.0,
+                -87.76602172851562,
+                9007199254740993.0,
+                4.35,
+                1e100,
+                123456789.125,
+                0.5,
+            ];
+            let entries: Vec<String> = values
+                .iter()
+                .map(|v| {
+                    format!(
+                        "  {{\"bits\":\"{:016x}\",\"text\":{}}}",
+                        v.to_bits(),
+                        json_string(&js_number_to_string(*v))
+                    )
+                })
+                .collect();
+            std::fs::write(&path, format!("[\n{}\n]\n", entries.join(",\n"))).expect("write");
+        }
+        let file = parse_json(&std::fs::read_to_string(&path).expect("vectors file"));
+        assert!(file.array().len() >= 20);
+        for case in file.array() {
+            let bits = u64::from_str_radix(case.get("bits").str(), 16).expect("hex bits");
+            assert_eq!(
+                js_number_to_string(f64::from_bits(bits)),
+                case.get("text").str(),
+                "{}",
+                case.get("bits").str()
+            );
+        }
+    }
 }

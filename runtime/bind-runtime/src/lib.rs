@@ -446,6 +446,394 @@ pub async fn fold<A: Clone + Send + Sync + 'static, B: Send + 'static>(
     Ok(acc)
 }
 
+// ---------------------------------------------------------------------------------------------
+// UI nodes, HTML rendering, screens and display functions. `core::display` in `bindc` is the
+// canonical definition; these functions give the same bytes (checked against the shared vectors
+// in `runtime/vectors/`).
+// ---------------------------------------------------------------------------------------------
+
+/// Text of the loading screen (the JS runtime uses the same value).
+pub const TEXT_LOADING: &str = "Loading…";
+/// Text shown when a request to the server fails (the JS runtime uses the same value).
+pub const TEXT_REQUEST_FAILED: &str = "Request failed";
+/// Title and heading of the error screen for a 400 response.
+pub const TITLE_BAD_REQUEST: &str = "Bad request";
+/// Title and heading of the error screen for a 404 response.
+pub const TITLE_NOT_FOUND: &str = "Page not found";
+/// Title and heading of the error screen for any other error.
+pub const TITLE_ERROR: &str = "Something went wrong";
+/// Stylesheet linked by the error screens rendered with `error_page`.
+pub const ERROR_STYLESHEET: &str = "/styles.css";
+
+/// The element kinds of a UI value. `Text` and `Empty` are separate `Node` variants.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeTag {
+    Ui,
+    Page,
+    Container,
+    Div,
+    Grid,
+    Stack,
+    Header,
+    Nav,
+    Main,
+    Section,
+    Article,
+    Aside,
+    Footer,
+    Paragraph,
+    Span,
+    Strong,
+    Emphasis,
+    Small,
+    List,
+    Item,
+    Pre,
+    Code,
+    Heading,
+    Link,
+    Rule,
+}
+
+impl NodeTag {
+    /// The node for its Bind name (`"UI"` for the root); `Text` and `Empty` are not tags.
+    pub fn from_name(name: &str) -> Option<NodeTag> {
+        Some(match name {
+            "UI" => NodeTag::Ui,
+            "Page" => NodeTag::Page,
+            "Container" => NodeTag::Container,
+            "Div" => NodeTag::Div,
+            "Grid" => NodeTag::Grid,
+            "Stack" => NodeTag::Stack,
+            "Header" => NodeTag::Header,
+            "Nav" => NodeTag::Nav,
+            "Main" => NodeTag::Main,
+            "Section" => NodeTag::Section,
+            "Article" => NodeTag::Article,
+            "Aside" => NodeTag::Aside,
+            "Footer" => NodeTag::Footer,
+            "Paragraph" => NodeTag::Paragraph,
+            "Span" => NodeTag::Span,
+            "Strong" => NodeTag::Strong,
+            "Emphasis" => NodeTag::Emphasis,
+            "Small" => NodeTag::Small,
+            "List" => NodeTag::List,
+            "Item" => NodeTag::Item,
+            "Pre" => NodeTag::Pre,
+            "Code" => NodeTag::Code,
+            "Heading" => NodeTag::Heading,
+            "Link" => NodeTag::Link,
+            "Rule" => NodeTag::Rule,
+            _ => return None,
+        })
+    }
+
+    /// The HTML element of a container tag (`None` for `Ui`, `Heading`, `Link` and `Rule`).
+    fn container_element(self) -> Option<&'static str> {
+        Some(match self {
+            NodeTag::Page | NodeTag::Container | NodeTag::Div | NodeTag::Grid | NodeTag::Stack => {
+                "div"
+            }
+            NodeTag::Header => "header",
+            NodeTag::Nav => "nav",
+            NodeTag::Main => "main",
+            NodeTag::Section => "section",
+            NodeTag::Article => "article",
+            NodeTag::Aside => "aside",
+            NodeTag::Footer => "footer",
+            NodeTag::Paragraph => "p",
+            NodeTag::Span => "span",
+            NodeTag::Strong => "strong",
+            NodeTag::Emphasis => "em",
+            NodeTag::Small => "small",
+            NodeTag::List => "ul",
+            NodeTag::Item => "li",
+            NodeTag::Pre => "pre",
+            NodeTag::Code => "code",
+            NodeTag::Ui | NodeTag::Heading | NodeTag::Link | NodeTag::Rule => return None,
+        })
+    }
+}
+
+/// An argument of a UI element.
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeArg {
+    Str(String),
+    Int(Int),
+}
+
+/// A UI value.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Node {
+    Element {
+        tag: NodeTag,
+        args: Vec<NodeArg>,
+        children: Vec<Node>,
+    },
+    Text(String),
+    Empty,
+}
+
+/// HTML escaping of text and attribute values: `&`, `<`, `>`, `"` and `'`.
+pub fn escape_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The HTML of a UI value, byte for byte that of `render_html_value` in `bindc`: the `UI`
+/// root is a fragment, `Text` an escaped text node, `Empty` nothing; arguments are used
+/// leniently (heading level clamped to 1..=6, `javascript:` hrefs emptied, extra arguments
+/// ignored). The page shell (`page_html`) adds the `bind-site` wrapper.
+pub fn render_html(node: &Node) -> String {
+    let mut out = String::new();
+    render_into(&mut out, node);
+    out
+}
+
+fn arg_text(arg: &NodeArg) -> String {
+    match arg {
+        NodeArg::Str(text) => text.clone(),
+        NodeArg::Int(value) => value.to_string(),
+    }
+}
+
+fn render_into(out: &mut String, node: &Node) {
+    let (tag, args, children) = match node {
+        Node::Empty => return,
+        Node::Text(text) => {
+            out.push_str(&escape_html(text));
+            return;
+        }
+        Node::Element {
+            tag,
+            args,
+            children,
+        } => (*tag, args, children),
+    };
+    let arg = |index: usize| args.get(index).map(arg_text);
+    let mut attributes: Vec<(&str, String)> = Vec::new();
+    let mut push = |name: &'static str, value: Option<String>| {
+        if let Some(value) = value {
+            attributes.push((name, value));
+        }
+    };
+    let element: String = match tag {
+        NodeTag::Ui => {
+            for child in children {
+                render_into(out, child);
+            }
+            return;
+        }
+        NodeTag::Heading => {
+            let level = match args.first() {
+                Some(NodeArg::Int(value)) => heading_level(value),
+                _ => 1,
+            };
+            push("class", arg(1));
+            format!("h{level}")
+        }
+        NodeTag::Link => {
+            let href = arg(0).map(|url| {
+                if is_javascript_uri(&url) {
+                    String::new()
+                } else {
+                    url
+                }
+            });
+            push("href", href);
+            push("class", arg(1));
+            let target = arg(2);
+            let blank = target.as_deref() == Some("_blank");
+            push("target", target);
+            if blank {
+                push("rel", Some("noopener noreferrer".to_string()));
+            }
+            push("aria-label", arg(3));
+            "a".to_string()
+        }
+        NodeTag::Rule => {
+            push("class", arg(0));
+            out.push_str("<hr");
+            write_attributes(out, &attributes);
+            out.push('>');
+            return;
+        }
+        container => {
+            push("class", arg(0));
+            push("id", arg(1));
+            container.container_element().unwrap_or("div").to_string()
+        }
+    };
+    out.push('<');
+    out.push_str(&element);
+    write_attributes(out, &attributes);
+    out.push('>');
+    for child in children {
+        render_into(out, child);
+    }
+    out.push_str("</");
+    out.push_str(&element);
+    out.push('>');
+}
+
+fn write_attributes(out: &mut String, attributes: &[(&str, String)]) {
+    for (name, value) in attributes {
+        out.push(' ');
+        out.push_str(name);
+        out.push_str("=\"");
+        out.push_str(&escape_html(value));
+        out.push('"');
+    }
+}
+
+/// The heading level of an `Int`, clamped to 1..=6.
+fn heading_level(value: &Int) -> u8 {
+    match i64::try_from(&value.0) {
+        Ok(level) => level.clamp(1, 6) as u8,
+        Err(_) if value.0.sign() == num_bigint::Sign::Minus => 1,
+        Err(_) => 6,
+    }
+}
+
+/// Elm's `href` sanitizer `/^\s*j\s*a\s*v\s*a\s*s\s*c\s*r\s*i\s*p\s*t\s*:/i`.
+fn is_javascript_uri(url: &str) -> bool {
+    let mut chars = url.chars().filter(|c| !is_js_whitespace(*c));
+    "javascript:".chars().all(|expected| {
+        chars
+            .next()
+            .is_some_and(|c| c.eq_ignore_ascii_case(&expected))
+    })
+}
+
+/// JavaScript's `\s`: WhiteSpace and LineTerminator.
+fn is_js_whitespace(c: char) -> bool {
+    matches!(
+        c,
+        '\u{9}'..='\u{d}'
+            | ' '
+            | '\u{a0}'
+            | '\u{1680}'
+            | '\u{2000}'..='\u{200a}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{202f}'
+            | '\u{205f}'
+            | '\u{3000}'
+            | '\u{feff}'
+    )
+}
+
+/// The single page shell of both modes: a full HTML document with the title, the stylesheet
+/// link and `body` (already HTML) inside the one `<div class="bind-site">`.
+pub fn page_html(title: &str, stylesheet: &str, body: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head>\
+         <body><div class=\"bind-site\">{body}</div></body></html>",
+        escape_html(title),
+        escape_html(stylesheet)
+    )
+}
+
+/// The status and HTML of the error screen: the title for the status class and the public
+/// message (never internal details).
+pub fn error_page(error: &AppError) -> (u16, String) {
+    let status = error.status();
+    let title = match status {
+        400 => TITLE_BAD_REQUEST,
+        404 => TITLE_NOT_FOUND,
+        _ => TITLE_ERROR,
+    };
+    let body = format!(
+        "<main class=\"bind-error\"><h1>{}</h1><p>{}</p></main>",
+        escape_html(title),
+        escape_html(&error.public_message())
+    );
+    (status, page_html(title, ERROR_STYLESHEET, &body))
+}
+
+/// ECMAScript `Number::toString(10)` of `value` (what `String(x)` gives in JavaScript).
+pub fn js_number_to_string(value: f64) -> String {
+    if value.is_nan() {
+        return "NaN".into();
+    }
+    if value == 0.0 {
+        return "0".into();
+    }
+    if value < 0.0 {
+        return format!("-{}", js_number_to_string(-value));
+    }
+    if value.is_infinite() {
+        return "Infinity".into();
+    }
+    let (digits, exponent) = shortest_digits(value);
+    let k = digits.len() as i64;
+    let n = exponent + 1;
+    if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        let (whole, fraction) = digits.split_at(n as usize);
+        format!("{whole}.{fraction}")
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let sign = if n - 1 < 0 { '-' } else { '+' };
+        let (first, rest) = digits.split_at(1);
+        let rest = if rest.is_empty() {
+            String::new()
+        } else {
+            format!(".{rest}")
+        };
+        format!("{first}{rest}e{sign}{}", (n - 1).abs())
+    }
+}
+
+/// The shortest round-trip digits of a finite positive `value` and the exponent of the first
+/// one, as ECMAScript selects them: `{:e}` gives the fewest digits `k`, but breaks a tie
+/// between two equally near candidates upward where ECMAScript takes the even one, so the
+/// value is rounded exactly to `k` digits (half to even) when that reads back as the value.
+fn shortest_digits(value: f64) -> (String, i64) {
+    let split = |scientific: String| -> (String, i64) {
+        let (mantissa, exponent) = scientific
+            .split_once('e')
+            .unwrap_or((scientific.as_str(), "0"));
+        let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+        (digits, exponent.parse().unwrap_or(0))
+    };
+    let shortest = split(format!("{value:e}"));
+    let precision = shortest.0.len().saturating_sub(1);
+    let rounded = format!("{value:.precision$e}");
+    if rounded.parse::<f64>() == Ok(value) {
+        let (digits, exponent) = split(rounded);
+        let trimmed = digits.trim_end_matches('0');
+        if !trimmed.is_empty() {
+            return (trimmed.to_string(), exponent);
+        }
+    }
+    shortest
+}
+
+/// The text of a `Decimal`: its `Display` (trailing zeros and the sign of a negated zero kept).
+pub fn display_decimal(value: &rust_decimal::Decimal) -> String {
+    value.to_string()
+}
+
+/// The text of a `TimeDelta`: its `Display`, an ISO-8601 duration in seconds.
+pub fn display_duration(value: &chrono::TimeDelta) -> String {
+    value.to_string()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -454,6 +842,91 @@ mod tests {
 
     fn int(text: &str) -> Int {
         serde_json::from_str(&format!("\"{text}\"")).unwrap()
+    }
+
+    #[test]
+    fn script_text_is_escaped() {
+        let html = render_html(&Node::Text("<script>alert(1)</script>".into()));
+        assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn attributes_and_headings() {
+        let link = Node::Element {
+            tag: NodeTag::Link,
+            args: vec![
+                NodeArg::Str(" JavaScript:alert(1)".into()),
+                NodeArg::Str("a\"b".into()),
+                NodeArg::Str("_blank".into()),
+            ],
+            children: vec![Node::Text("x".into())],
+        };
+        assert_eq!(
+            render_html(&link),
+            "<a href=\"\" class=\"a&quot;b\" target=\"_blank\" rel=\"noopener noreferrer\">x</a>"
+        );
+        let heading = |level: Option<NodeArg>| Node::Element {
+            tag: NodeTag::Heading,
+            args: level.into_iter().collect(),
+            children: vec![],
+        };
+        assert_eq!(
+            render_html(&heading(Some(NodeArg::Int(int("0"))))),
+            "<h1></h1>"
+        );
+        assert_eq!(
+            render_html(&heading(Some(NodeArg::Int(int("-9"))))),
+            "<h1></h1>"
+        );
+        assert_eq!(
+            render_html(&heading(Some(NodeArg::Int(int("4"))))),
+            "<h4></h4>"
+        );
+        assert_eq!(
+            render_html(&heading(Some(NodeArg::Int(int("99999999999999999999"))))),
+            "<h6></h6>"
+        );
+        assert_eq!(
+            render_html(&heading(Some(NodeArg::Str("2".into())))),
+            "<h1></h1>"
+        );
+        assert_eq!(render_html(&heading(None)), "<h1></h1>");
+    }
+
+    #[test]
+    fn page_and_error_pages() {
+        let page = page_html("A & B", "/s.css?x=\"1\"", "<p>hi</p>");
+        assert!(page.starts_with("<!DOCTYPE html>"));
+        assert!(page.contains("<title>A &amp; B</title>"));
+        assert!(page.contains("<link rel=\"stylesheet\" href=\"/s.css?x=&quot;1&quot;\">"));
+        assert!(page.contains("<div class=\"bind-site\"><p>hi</p></div>"));
+
+        let (status, html) = error_page(&AppError::NotFound("user 42 secret".into()));
+        assert_eq!(status, 404);
+        assert!(html.contains(TITLE_NOT_FOUND));
+        assert!(html.contains("not found"));
+        assert!(!html.contains("secret"));
+        let (status, html) = error_page(&AppError::BadRequest("bad <id>".into()));
+        assert_eq!(status, 400);
+        assert!(html.contains(TITLE_BAD_REQUEST));
+        assert!(html.contains("bad &lt;id&gt;"));
+        let (status, html) = error_page(&AppError::Internal("db password".into()));
+        assert_eq!(status, 500);
+        assert!(html.contains(TITLE_ERROR));
+        assert!(html.contains("internal error"));
+        assert!(!html.contains("password"));
+    }
+
+    #[test]
+    fn display_of_decimal_and_duration() {
+        assert_eq!(display_decimal(&-Decimal::new(0, 2)), "-0.00");
+        assert_eq!(display_decimal(&Decimal::new(150, 2)), "1.50");
+        assert_eq!(
+            display_duration(&chrono::TimeDelta::milliseconds(-500)),
+            "-PT0.5S"
+        );
+        assert_eq!(display_duration(&chrono::TimeDelta::zero()), "P0D");
     }
 
     #[test]
