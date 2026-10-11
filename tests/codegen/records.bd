@@ -76,3 +76,8 @@ sealed class Rotulo {
 }
 
 fun rotulo(): Rotulo = HTTPError
+
+// Struct and variant literals in an `if` condition need parentheses in Rust.
+fun literalNaCondicao(m: Int): String = if (Config("t", m, null).match > 0) "sim" else "nao"
+
+fun varianteNaCondicao(m: Int): String = if (Cons(1, Vazia) == Cons(m, Vazia)) "sim" else "nao"

@@ -256,3 +256,25 @@ pub fn bind_rotulo(ctx: crate::bind_runtime::Ctx) -> crate::bind_runtime::BoxFut
         ::std::result::Result::Ok(Rotulo::HTTPError)
     })
 }
+
+pub fn bind_literalNaCondicao(ctx: crate::bind_runtime::Ctx, v0_m: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::string::String> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        ::std::result::Result::Ok(if (Config { r#type: ::std::string::String::from("t"), r#match: v0_m.clone(), filho: ::std::boxed::Box::new(::std::option::Option::<Config>::None) }.r#match.clone() > crate::bind_runtime::Int::from_i64(0)) {
+            ::std::string::String::from("sim")
+        } else {
+            ::std::string::String::from("nao")
+        })
+    })
+}
+
+pub fn bind_varianteNaCondicao(ctx: crate::bind_runtime::Ctx, v0_m: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::string::String> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        ::std::result::Result::Ok(if (Lista::<crate::bind_runtime::Int>::Cons { cabeca: crate::bind_runtime::Int::from_i64(1), cauda: ::std::boxed::Box::new(Lista::<crate::bind_runtime::Int>::Vazia) } == Lista::<crate::bind_runtime::Int>::Cons { cabeca: v0_m.clone(), cauda: ::std::boxed::Box::new(Lista::<crate::bind_runtime::Int>::Vazia) }) {
+            ::std::string::String::from("sim")
+        } else {
+            ::std::string::String::from("nao")
+        })
+    })
+}

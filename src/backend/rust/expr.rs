@@ -232,6 +232,34 @@ fn local_type(expr: &Expr, local: LocalId) -> Option<Type> {
         .find_map(|child| local_type(child, local))
 }
 
+/// Whether a single-line rendered expression has a `{` outside every bracket and string
+/// literal: in generated code that is a struct or variant literal (blocks, `if` and `match`
+/// always span lines, and closures sit inside call parentheses).
+fn has_exterior_struct_literal(code: &str) -> bool {
+    let mut depth = 0usize;
+    let mut chars = code.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                while let Some(c) = chars.next() {
+                    match c {
+                        '\\' => {
+                            chars.next();
+                        }
+                        '"' => break,
+                        _ => {}
+                    }
+                }
+            }
+            '(' | '[' => depth += 1,
+            ')' | ']' => depth = depth.saturating_sub(1),
+            '{' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Rendered Rust expression; `atomic` when it can be a method receiver or operand as is.
 struct Code {
     text: String,
@@ -584,9 +612,15 @@ impl Generator<'_, '_> {
                 condition.text
             ));
         }
-        complex(format!(
-            "if {} {{\n{then_branch}\n}} else {else_branch}",
+        // Rust reads a `{` after `if Name` as the block: a struct literal in the condition
+        // (`Par { … }.primeiro > x`) needs parentheses there.
+        let condition = if has_exterior_struct_literal(&condition.text) {
+            format!("({})", condition.text)
+        } else {
             condition.text
+        };
+        complex(format!(
+            "if {condition} {{\n{then_branch}\n}} else {else_branch}"
         ))
     }
 
@@ -1391,6 +1425,17 @@ mod tests {
         limbs.iter().rev().fold(BigInt::from(0), |acc, limb| {
             (acc << 32) + BigInt::from(*limb)
         })
+    }
+
+    #[test]
+    fn exterior_struct_literals() {
+        assert!(has_exterior_struct_literal("P { a: 1 }.a > x"));
+        assert!(has_exterior_struct_literal("x == E::V { a: f(\"(\") }"));
+        assert!(!has_exterior_struct_literal("f(P { a: 1 }) > x"));
+        assert!(!has_exterior_struct_literal(
+            "x == ::std::string::String::from(\"{\")"
+        ));
+        assert!(!has_exterior_struct_literal("v[0] && g(\"\\\"{\")"));
     }
 
     #[test]
