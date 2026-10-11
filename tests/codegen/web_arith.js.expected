@@ -24,14 +24,14 @@ async function u_divide(ctx, u_a_0, u_b_1) {
         if (t1 === null) {
             t2 = -7n;
         } else if (t1 !== null) {
-            const u_value_2 = t1;
+            const u_value_2 = t1.some;
             t2 = u_value_2;
         } else {
             throw new Error("bindc: no `when` arm matched");
         }
         t3 = t2;
     } else if (t0 !== null) {
-        const u_value_3 = t0;
+        const u_value_3 = t0.some;
         t3 = u_value_3;
     } else {
         throw new Error("bindc: no `when` arm matched");

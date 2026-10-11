@@ -63,6 +63,17 @@ const checks = {
     eq(texts(tree), '5|5|5|10|0|true|outro|menos "um"|dezesseis|0', "sum types, Result, distinct, patterns and early return");
   },
 
+  async generic() {
+    serve({
+      "/api/eco": (body, raw) => {
+        eq(raw, '{"x":"1","xs":["1",null]}', "Int? and List<Int?> on the wire");
+        return '["5", null]';
+      },
+    });
+    const tree = await app.Genericos(rt.newCtx(), 4n);
+    eq(texts(tree), "9|7|1|0|4|2|5|9", "uniform options through generic code and the wire");
+  },
+
   async lambdas() {
     const tree = await app.Listas(rt.newCtx(), 3n);
     eq(texts(tree), "16|1|-2|7|6|3", "map, fold, builtins as values, nested options");

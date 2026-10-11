@@ -1,0 +1,38 @@
+// Uniform options: generic code is emitted once, so `Some(None)` must stay distinct from `None`
+// whatever the instance (`T = Int?`), and the wire form of `Int?` / `List<Int?>` is unchanged.
+fun <T> primeiro(xs: List<T>): T? = first(xs)
+
+fun <T> orElse(x: T?, d: T): T = x ?: d
+
+fun nulo(): Int? = get(listOf(1), 5)
+
+fun um(): Int? = get(listOf(1), 0)
+
+fun descreve(x: Int??): Int = when (x) {
+    null -> 0
+    n -> n ?: 9
+}
+
+fun probeNoneDentro(): Int = descreve(primeiro(listOf(nulo())))
+
+fun probeOrElse(): Int = orElse(primeiro(listOf(nulo())), um()) ?: 7
+
+fun probeAninhado(): Int = descreve(primeiro(listOf(um())))
+
+fun probeNulo(): Int = descreve(null)
+
+server fun eco(x: Int?, xs: List<Int?>): List<Int?> = xs
+
+client component Genericos(n: Int) {
+    val r = server.eco(um(), listOf(um(), nulo()))
+    UI {
+        Text(probeNoneDentro())
+        Text(probeOrElse())
+        Text(probeAninhado())
+        Text(probeNulo())
+        Text(orElse(nulo(), n))
+        Text(length(r))
+        Text(descreve(primeiro(r)))
+        Text(descreve(get(r, 1)))
+    }
+}

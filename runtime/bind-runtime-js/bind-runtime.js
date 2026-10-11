@@ -10,8 +10,10 @@
 //
 // Value representation (see the 3c spec, section 2):
 //   Int -> BigInt; Double -> number; Float -> number rounded with f32() after each operation;
-//   Boolean -> boolean; String and other text types -> canonical string; T? -> null or the value
-//   ({some: v} only when T is itself optional); records -> frozen null-prototype objects
+//   Boolean -> boolean; String and other text types -> canonical string; T? -> null (None) or
+//   the frozen {some: v} (Some(v)), uniformly for every T, so generic code needs no type
+//   information and Some(None) stays distinct from None (the wire form is unchanged: JSON
+//   null or the value); records -> frozen null-prototype objects
 //   (record()); sealed/enum -> frozen {tag, ...fields} (variant()); Result -> variant("Ok" |
 //   "Err", [["value", v]]); List<T> -> frozen array; Decimal/Money -> Decimal; functions ->
 //   async (ctx, ...args) => ...; Unit -> undefined; Long -> BigInt; distinct -> the underlying
@@ -93,14 +95,14 @@ export function intToString(n) {
   return n.toString();
 }
 
-/** Division truncating toward zero; null when the divisor is zero. */
+/** Division truncating toward zero, as an Int?: some(quotient), or null when the divisor is zero. */
 export function intDiv(a, b) {
-  return b === 0n ? null : a / b;
+  return b === 0n ? null : some(a / b);
 }
 
-/** Remainder with the sign of the dividend; null when the divisor is zero. */
+/** Remainder with the sign of the dividend, as an Int?: some(remainder), or null for a zero divisor. */
 export function intRem(a, b) {
-  return b === 0n ? null : a % b;
+  return b === 0n ? null : some(a % b);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -344,30 +346,20 @@ export function listFrom(array) {
   return Object.freeze(Array.from(array));
 }
 
-/**
- * `Some(value)` of an optional type whose inner type is itself optional: {some: value}, so
- * `Some(null)` stays distinct from `null`. (Other optional values are the value itself.)
- */
+/** `Some(value)`: the frozen {some: value} (`None` is null), whatever the type of value. */
 export function some(value) {
   return Object.freeze({ some: value });
 }
 
-function optional(value, nested) {
-  return nested ? some(value) : value;
+/** The first element as a T?: some(element), or null for an empty list. */
+export function first(xs) {
+  return xs.length === 0 ? null : some(xs[0]);
 }
 
-/**
- * The first element or null. When the element type is itself optional, pass `nested = true`:
- * the element is wrapped as {some: element} so an empty list (null) stays distinct.
- */
-export function first(xs, nested = false) {
-  return xs.length === 0 ? null : optional(xs[0], nested);
-}
-
-/** The element at BigInt index `i` or null (out of range or negative); `nested` as in `first`. */
-export function get(xs, i, nested = false) {
+/** The element at BigInt index `i` as a T?: some(element), or null (out of range or negative). */
+export function get(xs, i) {
   if (i < 0n || i >= BigInt(xs.length)) return null;
-  return optional(xs[Number(i)], nested);
+  return some(xs[Number(i)]);
 }
 
 export function length(xs) {
@@ -481,9 +473,9 @@ export function decodePair(key, value) {
   };
 }
 
-/** T?: null, or the inner decoder's value. */
+/** T?: JSON null is null (None); any other JSON is some(inner decoder's value). */
 export function decodeOptional(inner) {
-  const decoder = (json) => (json === null ? null : inner(json));
+  const decoder = (json) => (json === null ? null : some(inner(json)));
   decoder.optional = true;
   return decoder;
 }

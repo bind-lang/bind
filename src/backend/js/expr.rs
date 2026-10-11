@@ -12,8 +12,8 @@
 //! later operand's statements run.
 //!
 //! Values (see the runtime's header): `Int`/`Long` are BigInts (`123n`); `Double`/`Float` are
-//! numbers, `Float` results rounded with `rt.f32`; `Unit` is `undefined`; `T?` is `null` or
-//! the value, `rt.some(v)` when `T` is itself optional; records are `rt.record`, variants
+//! numbers, `Float` results rounded with `rt.f32`; `Unit` is `undefined`; `T?` is `null`
+//! (`None`) or `rt.some(v)` (`Some(v)`), uniformly for every `T`; records are `rt.record`, variants
 //! `rt.variant(tag, …)` and `Result` `rt.variant("Ok" | "Err", [["value", v]])`, fields under
 //! their escaped names (`names::js_value`); a distinct value is its underlying value; UI
 //! nodes are `rt.node` / `rt.text` / `rt.EMPTY`.
@@ -26,7 +26,7 @@ use crate::core::ir::{LocalId, UiNode};
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
 
-use super::codecs::{Codecs, is_option, substitute};
+use super::codecs::{Codecs, substitute};
 use super::names::{js_local, js_string, js_value};
 
 /// Longest `listOf` passed as arguments; longer literals use `rt.listFrom([...])`.
@@ -71,20 +71,31 @@ pub(super) fn function_with<'p>(
 }
 
 /// Names every local bound inside `expr` (lets, pattern variables, lambda parameters).
+///
+/// Every local becomes a `const` (or parameter) named after its id, so a `LocalId` bound
+/// twice in one function would be declared twice in one JS scope (a SyntaxError) or shadow
+/// itself. The IR binds each id once per function; the debug assertion makes a lowering that
+/// breaks this fail the tests (every `tests/codegen` case is translated by
+/// `backend::js::tests::every_codegen_case_translates`) instead of emitting invalid JS.
 fn collect_names(expr: &Expr, names: &mut BTreeMap<LocalId, String>) {
+    let mut bind = |local: LocalId, name: &str| {
+        let previous = names.insert(local, js_local(name, local));
+        debug_assert!(
+            previous.is_none(),
+            "bindc: local {local} (`{name}`) is bound twice in one function"
+        );
+    };
     match &expr.kind {
         ExprKind::Lambda { params, .. } => {
             for (local, name, _) in params {
-                names.insert(*local, js_local(name, *local));
+                bind(*local, name);
             }
         }
-        ExprKind::Let { local, name, .. } => {
-            names.insert(*local, js_local(name, *local));
-        }
+        ExprKind::Let { local, name, .. } => bind(*local, name),
         ExprKind::Match { arms, .. } => {
             for arm in arms {
                 for (local, name, _) in &arm.bindings {
-                    names.insert(*local, js_local(name, *local));
+                    bind(*local, name);
                 }
             }
         }
@@ -263,7 +274,7 @@ impl Generator<'_, '_> {
             ExprKind::Lit(literal) => Some(literal_code(literal, &expr.ty)),
             ExprKind::Local(local) => Some(atom(self.local(*local))),
             ExprKind::Global { name, .. } => Some(atom(js_value(name))),
-            ExprKind::Builtin { name, instance } => Some(builtin_value(name, instance, &expr.ty)),
+            ExprKind::Builtin { name, .. } => Some(builtin_value(name, &expr.ty)),
             ExprKind::Environment(name) => {
                 self.unsupported(&format!("the environment value `{name}`"), out)
             }
@@ -278,12 +289,10 @@ impl Generator<'_, '_> {
             }
             ExprKind::None => Some(atom("null")),
             ExprKind::Some(inner) => {
+                // Uniform options: `Some(v)` is always `{some: v}`, whatever `v`'s type (generic
+                // code is emitted once, so the representation cannot depend on it).
                 let value = self.expr(inner, out)?;
-                if is_option(&inner.ty) {
-                    Some(Code::call(format!("rt.some({})", value.text), value.pure))
-                } else {
-                    Some(value)
-                }
+                Some(Code::call(format!("rt.some({})", value.text), value.pure))
             }
             ExprKind::Call { callee, args } => self.call(callee, args, out),
             ExprKind::ServerCall { function, args } => {
@@ -435,10 +444,9 @@ impl Generator<'_, '_> {
                     false,
                 ))
             }
-            ExprKind::Builtin { name, instance } => {
+            ExprKind::Builtin { name, .. } => {
                 let values = self.all(args, out)?;
-                let types: Vec<&Type> = args.iter().map(|arg| &arg.ty).collect();
-                Some(builtin_call(name, instance, &types, values))
+                Some(builtin_call(name, values))
             }
             _ => {
                 let mut operands = vec![callee];
@@ -666,12 +674,7 @@ impl Generator<'_, '_> {
             ("Option", "Some", [sub]) => {
                 plan.conditions.push(format!("{access} !== null"));
                 let inner = type_args.first().cloned().unwrap_or(Type::Error);
-                let next = if is_option(&inner) {
-                    format!("{access}.some")
-                } else {
-                    access.to_string()
-                };
-                self.plan(sub, &next, &inner, child(0), plan);
+                self.plan(sub, &format!("{access}.some"), &inner, child(0), plan);
             }
             _ => {
                 let declaration = self.program.types.iter().find(|item| match item {
@@ -1027,25 +1030,9 @@ fn rust_debug_string(text: &str) -> Option<String> {
     Some(output)
 }
 
-/// The element type of the list a builtin works on: its first instance type, or the
-/// element of its first argument.
-fn element_type(instance: &[Type], first_arg: Option<&Type>) -> Type {
-    if let Some(ty) = instance.first() {
-        return ty.clone();
-    }
-    match first_arg {
-        Some(Type::Con(name, args)) if name == "List" => {
-            args.first().cloned().unwrap_or(Type::Error)
-        }
-        _ => Type::Error,
-    }
-}
-
-fn builtin_call(name: &str, instance: &[Type], types: &[&Type], values: Vec<Code>) -> Code {
-    let nested = is_option(&element_type(instance, types.first().copied()));
+fn builtin_call(name: &str, values: Vec<Code>) -> Code {
     let texts: Vec<String> = values.iter().map(|value| value.text.clone()).collect();
     let pure = values.iter().all(|value| value.pure);
-    let flag = if nested { ", true" } else { "" };
     match (name, texts.as_slice()) {
         ("listOf", items) if items.len() > MAX_SPREAD => {
             Code::call(format!("rt.listFrom([{}])", items.join(", ")), pure)
@@ -1053,8 +1040,8 @@ fn builtin_call(name: &str, instance: &[Type], types: &[&Type], values: Vec<Code
         ("listOf", items) => Code::call(format!("rt.listOf({})", items.join(", ")), pure),
         ("emptyList", []) => atom("rt.emptyList()"),
         ("length", [list]) => Code::call(format!("rt.length({list})"), pure),
-        ("first", [list]) => Code::call(format!("rt.first({list}{flag})"), pure),
-        ("get", [list, index]) => Code::call(format!("rt.get({list}, {index}{flag})"), pure),
+        ("first", [list]) => Code::call(format!("rt.first({list})"), pure),
+        ("get", [list, index]) => Code::call(format!("rt.get({list}, {index})"), pure),
         ("map" | "fold", items) => {
             Code::complex(format!("await rt.{name}(ctx, {})", items.join(", ")), false)
         }
@@ -1069,14 +1056,13 @@ fn builtin_call(name: &str, instance: &[Type], types: &[&Type], values: Vec<Code
 }
 
 /// A builtin used as a value: an async function that applies it (without entering a level).
-fn builtin_value(name: &str, instance: &[Type], ty: &Type) -> Code {
+fn builtin_value(name: &str, ty: &Type) -> Code {
     let Type::Fun(params, _, _) = ty else {
-        return builtin_call(name, instance, &[], Vec::new());
+        return builtin_call(name, Vec::new());
     };
     let names: Vec<String> = (0..params.len()).map(|index| format!("a{index}")).collect();
-    let types: Vec<&Type> = params.iter().collect();
     let values: Vec<Code> = names.iter().map(atom).collect();
-    let call = builtin_call(name, instance, &types, values);
+    let call = builtin_call(name, values);
     let call = call
         .text
         .strip_prefix("await ")
@@ -1090,6 +1076,29 @@ fn builtin_value(name: &str, instance: &[Type], ty: &Type) -> Code {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[should_panic(expected = "is bound twice in one function")]
+    fn a_local_bound_twice_fails_in_debug_builds() {
+        let program =
+            crate::core::lower::tests::compile("fun f(x: Int): Int {\n    val y = x\n    y\n}\n");
+        let mut function = program.functions.first().expect("function").clone();
+        // Rebind the parameter's id with a `Let`, as a faulty lowering could.
+        let (param, _, ty) = function.params.first().cloned().expect("param");
+        function.body = Expr {
+            ty: ty.clone(),
+            kind: ExprKind::Let {
+                local: param,
+                name: "x".into(),
+                value: Box::new(Expr {
+                    ty: ty.clone(),
+                    kind: ExprKind::Local(param),
+                }),
+                body: Box::new(function.body.clone()),
+            },
+        };
+        super::function(&function, &program);
+    }
 
     #[test]
     fn integer_patterns() {

@@ -101,11 +101,7 @@ impl<'p> Codecs<'p> {
             ("Unit", []) => "rt.decodeUnit".into(),
             ("Decimal" | "Money", []) => "rt.decodeDecimal".into(),
             (name, []) if is_text(name) => "rt.decodeString".into(),
-            ("Option", [inner]) if is_option(inner) => {
-                // `Some(v)` of an optional inner type is `{some: v}` in memory.
-                let inner = self.decoder(inner);
-                format!("rt.decodeOptional((json) => rt.some(({inner})(json)))")
-            }
+            // JSON null is `None`; any other value is `Some` (`{some: v}` in memory).
             ("Option", [inner]) => format!("rt.decodeOptional({})", self.decoder(inner)),
             ("List" | "Set", [item]) => format!("rt.decodeList({})", self.decoder(item)),
             ("Map", [key, value]) => {
@@ -143,12 +139,7 @@ impl<'p> Codecs<'p> {
             ("Double" | "Float" | "Boolean", []) => value.to_string(),
             (name, []) if is_text(name) => value.to_string(),
             ("Option", [inner]) => {
-                let present = if is_option(inner) {
-                    format!("{value}.some")
-                } else {
-                    value.to_string()
-                };
-                let inner = self.encode_at(inner, &present, depth);
+                let inner = self.encode_at(inner, &format!("{value}.some"), depth);
                 format!("({value} === null ? null : {inner})")
             }
             ("List" | "Set", [item]) => {
@@ -393,10 +384,6 @@ fn is_text(name: &str) -> bool {
     )
 }
 
-pub(super) fn is_option(ty: &Type) -> bool {
-    matches!(ty, Type::Con(name, args) if name == "Option" && args.len() == 1)
-}
-
 /// A decoder that always fails: the type has no wire form (functions, `Ui`, `Duration`, type
 /// variables). The checker keeps such types out of endpoints; this only keeps the module valid.
 fn no_wire_form(ty: &Type) -> String {
@@ -430,15 +417,15 @@ mod tests {
         );
         assert_eq!(
             decoder(&Type::option(Type::option(ty("Int"))), &program),
-            "rt.decodeOptional((json) => rt.some((rt.decodeOptional(rt.decodeInt))(json)))"
+            "rt.decodeOptional(rt.decodeOptional(rt.decodeInt))"
         );
         assert_eq!(
             encoder(&Type::list(Type::option(ty("Int"))), &program),
-            "(v) => v.map((x0) => (x0 === null ? null : x0.toString()))"
+            "(v) => v.map((x0) => (x0 === null ? null : x0.some.toString()))"
         );
         assert_eq!(
             encoder(&Type::option(Type::option(ty("Decimal"))), &program),
-            "(v) => (v === null ? null : (v.some === null ? null : v.some.toString()))"
+            "(v) => (v === null ? null : (v.some === null ? null : v.some.some.toString()))"
         );
     }
 

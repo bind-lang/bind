@@ -83,8 +83,8 @@ test("intDiv and intRem truncate toward zero; remainder has the dividend's sign"
     [0n, -5n, 0n, 0n],
   ];
   for (const [a, b, q, r] of cases) {
-    eq(rt.intDiv(a, b), q, `${a} / ${b}`);
-    eq(rt.intRem(a, b), r, `${a} % ${b}`);
+    eq(rt.intDiv(a, b).some, q, `${a} / ${b}`);
+    eq(rt.intRem(a, b).some, r, `${a} % ${b}`);
   }
   eq(rt.intDiv(1n, 0n), null, "div by zero");
   eq(rt.intRem(1n, 0n), null, "rem by zero");
@@ -113,10 +113,23 @@ test("Decimal.parse agrees with rust_decimal and is strict", () => {
   eq(rt.Decimal.parse("100000000000000000000000000000"), null, "30 digits");
   eq(rt.Decimal.parse("0.0000000000000000000000000001").toString(), "0.0000000000000000000000000001", "29 digits");
   eq(rt.Decimal.parse("79228162514264337593543950335").toString(), "79228162514264337593543950335", "2^96 - 1");
-  const started = Date.now();
-  eq(rt.Decimal.parse("9".repeat(1000000)), null, "a million digits");
-  eq(rt.Decimal.parse("1." + "0".repeat(1000000)), null, "a million decimals");
-  assert(Date.now() - started < 1000, "long inputs are rejected quickly");
+  // The cap is checked before BigInt: a counting wrapper sees no conversion for long inputs.
+  const realBigInt = globalThis.BigInt;
+  let conversions = 0;
+  globalThis.BigInt = (value) => {
+    conversions += 1;
+    return realBigInt(value);
+  };
+  try {
+    eq(rt.Decimal.parse("9".repeat(1000000)), null, "a million digits");
+    eq(rt.Decimal.parse("1." + "0".repeat(28) + "0"), null, "29 decimals");
+    eq(rt.Decimal.parse("1" + "0".repeat(29)), null, "30 digits");
+    eq(conversions, 0, "no BigInt conversion of an over-long input");
+    rt.Decimal.parse("12.5");
+    eq(conversions, 1, "the wrapper counts conversions");
+  } finally {
+    globalThis.BigInt = realBigInt;
+  }
   eq(rt.Decimal.parse(1), null, "not a string");
   assert(Object.isFrozen(rt.Decimal.parse("1.5")), "frozen");
 });
@@ -262,21 +275,20 @@ test("map / fold over 100000 items finish (Review Focus 3)", async () => {
 test("first / get / length / listOf / emptyList", () => {
   const xs = rt.listOf(1n, 2n, 3n);
   assert(Object.isFrozen(xs), "listOf frozen");
-  eq(rt.first(xs), 1n);
+  eq(rt.first(xs).some, 1n);
   eq(rt.first(rt.emptyList()), null);
-  eq(rt.get(xs, 2n), 3n);
+  eq(rt.get(xs, 2n).some, 3n);
   eq(rt.get(xs, 3n), null);
   eq(rt.get(xs, -1n), null);
   eq(rt.get(xs, 10n ** 30n), null);
   eq(rt.length(xs), 3n);
   eq(rt.length(rt.emptyList()), 0n);
   assert(Object.isFrozen(rt.emptyList()), "emptyList frozen");
-  // Nested optionals: the element itself may be null.
+  // Uniform options: a null element (None) is some(null), distinct from the empty list's null.
   const opts = rt.listOf(null);
-  eq(rt.first(opts), null);
-  eq(rt.first(opts, true).some, null);
-  eq(rt.first(rt.emptyList(), true), null);
-  eq(rt.get(opts, 0n, true).some, null);
+  eq(rt.first(opts).some, null);
+  assert(Object.isFrozen(rt.first(opts)), "some frozen");
+  eq(rt.get(opts, 0n).some, null);
 });
 
 // ---- equals / compare ----
@@ -403,7 +415,7 @@ test("record / decodeRecord: no prototype pollution, frozen, strict", () => {
   assert(Object.isFrozen(value), "frozen");
   eq(value.__proto__, "p");
   eq(value.constructor, 12n);
-  eq(value.toString.toString(), "1.50");
+  eq(value.toString.some.toString(), "1.50");
   eq(value.hasOwnProperty, null, "absent optional field is null");
   eq(Object.prototype.p, undefined, "Object.prototype untouched");
   eq({}.constructor, Object, "Object.prototype untouched");
@@ -437,6 +449,10 @@ test("decoders with property names; Unit, Long, pairs and some", () => {
   eq(value.u_tag, "t");
   eq(value.u_____proto____, 1n);
   eq(value.u_n, null, "missing optional field");
+  eq(decode(JSON.parse('{"tag": "t", "__proto__": "1", "n": "4"}')).u_n.some, 4n, "present optional is some");
+  const nestedOption = rt.decodeOptional(rt.decodeOptional(rt.decodeInt));
+  eq(nestedOption(null), null);
+  eq(nestedOption("3").some.some, 3n);
   eq(Object.keys(value).join(","), "u_tag,u_____proto____,u_n");
   eq(Object.prototype.u_tag, undefined);
   throwsDecode(() => decode({ u_tag: "t", __proto__: "1" }), "property names are not JSON names");
@@ -466,7 +482,10 @@ test("decoders with property names; Unit, Long, pairs and some", () => {
   const nested = rt.some(null);
   eq(nested.some, null);
   assert(Object.isFrozen(nested), "some frozen");
-  assert(rt.equals(rt.some(1n), rt.first([1n], true)), "some equals first(nested)");
+  assert(rt.equals(rt.some(1n), rt.first([1n])), "some equals first");
+  assert(!rt.equals(rt.some(null), null), "Some(None) is not None");
+  eq(rt.compare(null, rt.some(null)), -1, "None sorts first");
+  eq(rt.compare(rt.some(1n), rt.some(2n)), -1, "Some by value");
 });
 
 test("decodeVariant and decodeResult follow serde's externally tagged form", () => {

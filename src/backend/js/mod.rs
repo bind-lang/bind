@@ -100,7 +100,7 @@ mod tests {
             })
             .collect();
         cases.sort();
-        assert!(cases.len() >= 5, "no web codegen cases");
+        assert!(cases.len() >= 6, "no web codegen cases");
         cases
     }
 
@@ -243,20 +243,9 @@ mod tests {
         }
     }
 
-    /// Every function of every `tests/codegen` case (the server cases too, whose database
-    /// nodes become run-time errors) translates to valid JavaScript: a wider net for the
-    /// statement structure (`const` per local, temporaries, `return`) than the web cases.
-    #[test]
-    #[ignore = "needs node; run with `cargo test backend::js -- --ignored`"]
-    fn every_codegen_case_translates_to_valid_javascript() {
-        if !node_available() {
-            eprintln!("skipped: node not found");
-            return;
-        }
-        let folder = std::env::temp_dir().join(format!("bind-js-{}-all", std::process::id()));
-        fs::create_dir_all(&folder).unwrap();
-        fs::write(folder.join("bind-runtime.js"), RUNTIME).unwrap();
-        let mut count = 0;
+    /// Every `tests/codegen` case (server cases with their schema) as a program.
+    fn codegen_programs() -> Vec<(PathBuf, CoreProgram)> {
+        let mut programs = Vec::new();
         for entry in fs::read_dir(directory()).unwrap() {
             let case = entry.unwrap().path();
             if case.extension().is_none_or(|extension| extension != "bd") {
@@ -271,6 +260,42 @@ mod tests {
             } else {
                 crate::core::lower::tests::compile(&source)
             };
+            programs.push((case, program));
+        }
+        programs.sort_by(|a, b| a.0.cmp(&b.0));
+        programs
+    }
+
+    /// Every function of every `tests/codegen` case translates (no node needed): runs the
+    /// generator's debug assertions (one binding per local) over all of them.
+    #[test]
+    fn every_codegen_case_translates() {
+        let mut count = 0;
+        for (_, program) in codegen_programs() {
+            for function in &program.functions {
+                let text = expr::function(function, &program);
+                assert!(text.contains("async function u_"), "{text}");
+                count += 1;
+            }
+        }
+        assert!(count > 50, "{count} functions");
+    }
+
+    /// Every function of every `tests/codegen` case (the server cases too, whose database
+    /// nodes become run-time errors) translates to valid JavaScript: a wider net for the
+    /// statement structure (`const` per local, temporaries, `return`) than the web cases.
+    #[test]
+    #[ignore = "needs node; run with `cargo test backend::js -- --ignored`"]
+    fn every_codegen_case_translates_to_valid_javascript() {
+        if !node_available() {
+            eprintln!("skipped: node not found");
+            return;
+        }
+        let folder = std::env::temp_dir().join(format!("bind-js-{}-all", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("bind-runtime.js"), RUNTIME).unwrap();
+        let mut count = 0;
+        for (case, program) in codegen_programs() {
             let mut module = String::from(
                 "import * as rt from \"./bind-runtime.js\";\nconst API_URL = \"/api\";\n",
             );
@@ -327,6 +352,33 @@ console.log("ok returns");
         fs::write(folder.join("returns-check.mjs"), script).unwrap();
         let output = run_node(&["returns-check.mjs"], &folder);
         assert!(output.contains("ok returns"), "{output}");
+        // Uniform options: the `probe*` functions of web_generic.bd give `core::eval`'s results.
+        let source = fs::read_to_string(directory().join("web_generic.bd")).unwrap();
+        let program = crate::core::lower::tests::compile(&source);
+        let mut checks = String::from(
+            "import * as rt from \"./bind-runtime.js\";\nimport * as m from \"./web_generic.mjs\";\n",
+        );
+        let mut probes = 0;
+        for function in &program.functions {
+            if !function.name.starts_with("probe") {
+                continue;
+            }
+            let expected = crate::core::eval::eval_function(&program, &function.name, Vec::new())
+                .expect("evaluates")
+                .render();
+            checks.push_str(&format!(
+                "{{ const actual = String(await m.{0}(rt.newCtx())); if (actual !== {1}) throw new Error(`{0}: expected {2}, got ${{actual}}`); }}\n",
+                function.name,
+                names::js_string(&expected),
+                expected
+            ));
+            probes += 1;
+        }
+        assert!(probes >= 4, "{probes} probes");
+        checks.push_str("console.log(\"ok probes\");\n");
+        fs::write(folder.join("probes-check.mjs"), checks).unwrap();
+        let output = run_node(&["probes-check.mjs"], &folder);
+        assert!(output.contains("ok probes"), "{output}");
         assert!(count > 50, "{count} functions");
         fs::remove_dir_all(&folder).unwrap();
     }
@@ -349,6 +401,7 @@ console.log("ok returns");
             ("web_lambdas.bd", "lambdas"),
             ("web_arith.bd", "arith"),
             ("web_ui.bd", "ui"),
+            ("web_generic.bd", "generic"),
         ] {
             let folder = web_folder(&directory().join(case), "run");
             fs::write(folder.join("check.mjs"), script).unwrap();

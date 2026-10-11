@@ -15,7 +15,7 @@ function dec0(json) {
 
 // Encoder of Par.
 function enc1(v) {
-    return rt.record([["tag", v.u_tag], ["valor", (v.u_valor === null ? null : v.u_valor.toString())]]);
+    return rt.record([["tag", v.u_tag], ["valor", (v.u_valor === null ? null : v.u_valor.some.toString())]]);
 }
 
 // Encoder of Codigo.
@@ -62,7 +62,7 @@ async function u_aninhado(ctx, u_x_0) {
         if (u_n_1 === null) {
             t0 = 1n;
         } else if (u_n_1 !== null) {
-            const u_value_2 = u_n_1;
+            const u_value_2 = u_n_1.some;
             t0 = u_value_2;
         } else {
             throw new Error("bindc: no `when` arm matched");
@@ -161,7 +161,7 @@ async function u_valor(ctx, u_p_0) {
         if (u_v_2 === null) {
             t0 = 0n;
         } else if (u_v_2 !== null) {
-            const u_value_3 = u_v_2;
+            const u_value_3 = u_v_2.some;
             t0 = u_value_3;
         } else {
             throw new Error("bindc: no `when` arm matched");
