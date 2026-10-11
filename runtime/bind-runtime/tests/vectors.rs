@@ -3,8 +3,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use bind_runtime::{
-    AppError, FromParam, Int, Node, NodeArg, NodeTag, QueryParams, bad_parameter, display_text,
-    error_body, js_number_to_string, page_html, param, render_html,
+    AppError, FromParam, Int, Node, NodeArg, NodeTag, PageMeta, QueryParams, bad_parameter,
+    display_text, error_body, js_number_to_string, page_html, param, render_html,
 };
 use serde_json::Value;
 
@@ -82,10 +82,16 @@ fn page_vectors() {
         let text = |key: &str| case[key].as_str().unwrap();
         let expected = text("html");
         match text("kind") {
-            "page" => assert_eq!(
-                page_html(text("title"), text("stylesheet"), text("body")),
-                expected
-            ),
+            "page" => {
+                let meta = PageMeta {
+                    title: text("title"),
+                    description: case["description"].as_str(),
+                    language: text("language"),
+                    stylesheet: text("stylesheet"),
+                };
+                assert!(case["description"].is_string() || case["description"].is_null());
+                assert_eq!(page_html(&meta, text("body")), expected);
+            }
             "error_body" => {
                 let message = text("message").to_string();
                 let error = match text("error") {

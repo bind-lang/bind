@@ -38,8 +38,10 @@ generated case list (run with `BIND_BLESS=1` after changing the list).
 An array of cases checked by the runtime test (and the JS runtime), hand-written from the
 specification of the page shell and the error screen:
 
-- `{ "kind": "page", "title", "stylesheet", "body", "html" }`: `page_html(title, stylesheet,
-  body)` must give `html` (title and stylesheet are HTML-escaped, `body` is inserted as is).
+- `{ "kind": "page", "title", "description", "language", "stylesheet", "body", "html" }`:
+  `page_html(meta, body)` (`pageHtml(meta, body)` in JS) must give `html`. `description` is a
+  string or `null` (no meta description / og:description lines); every metadata value is
+  HTML-escaped, the icon is written as is and `body` is inserted as is.
 - `{ "kind": "error_body", "error", "message", "status", "html" }`: `error` is one of
   `BadRequest`, `NotFound`, `Internal`, `Overflow`, `RecursionLimit` with its `message`;
   `error_body(error)` must give `status` and `html` (`<main class="bind-error">` with the

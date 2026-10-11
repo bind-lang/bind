@@ -106,11 +106,14 @@ pub fn server_library_with(
 }
 
 /// The page the server renders in the `ssr` mode: the application's client component, and the
-/// title and stylesheet URL of the page shell (`page_html`), as in the `split` mode's page.
+/// metadata of the page shell (`page_html`: title, description, language, stylesheet URL), as
+/// in the `split` mode's page.
 #[derive(Clone, Copy, Debug)]
 pub struct SsrPage<'a> {
     pub component: &'a str,
     pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub language: &'a str,
     pub stylesheet: &'a str,
 }
 
@@ -596,6 +599,8 @@ pub(crate) mod tests {
                 let page = SsrPage {
                     component: &component,
                     title: "Bind & SSR",
+                    description: Some("Páginas \"renderizadas\" no servidor"),
+                    language: "pt-BR",
                     stylesheet: "/styles.css",
                 };
                 return library_with(&program, &schema, Some(&page)).unwrap();
@@ -922,7 +927,8 @@ fn bad_parameters_are_400_pages_naming_the_parameter() {
     ] {
         let result = page(query);
         assert_eq!(result.status, 400, "{query}: {}", result.body);
-        assert!(result.body.starts_with("<!DOCTYPE html>"), "{query}");
+        assert!(result.body.starts_with("<!doctype html>\n<html lang=\"pt-BR\">"), "{query}");
+        assert!(result.body.contains("<meta name=\"description\" content=\"Páginas &quot;renderizadas&quot; no servidor\">"), "{query}");
         assert!(result.body.contains("<title>Bind &amp; SSR</title>"), "{query}");
         assert!(result.body.contains("<h1>Bad request</h1>"), "{query}");
         assert!(result.body.contains(&format!("<p>{message}</p>")), "{query}: {}", result.body);

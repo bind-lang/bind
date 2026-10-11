@@ -12,7 +12,7 @@
 use crate::compiler::VerifiedApplication;
 use crate::config::{Mode, ProjectConfig, TargetConfig};
 use crate::core::display::{UiArg, UiTree, escape_html, render_html_value};
-use crate::core::eval::{Value, eval_function};
+use crate::core::eval::{PRERENDER_BUDGET, Value, eval_function_within};
 use crate::core::ir::{CoreProgram, UiNode};
 
 use super::names::js_string;
@@ -28,17 +28,64 @@ pub const LOADING_TEXT: &str = "Loading…";
 /// component itself has that name (then `_` is appended until they differ).
 pub const PAGE_EXPORT: &str = "bind:page";
 
+/// The metadata of the page shell (the runtimes' `PageMeta` / `pageHtml`'s `meta`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageMeta<'a> {
+    pub title: &'a str,
+    /// No meta description / og:description lines when `None`.
+    pub description: Option<&'a str>,
+    pub language: &'a str,
+    pub stylesheet: &'a str,
+}
+
+/// The page metadata of a project: `[web]` title, description (none when empty) and language,
+/// and [`STYLESHEET`].
+pub fn page_meta(config: &ProjectConfig) -> PageMeta<'_> {
+    PageMeta {
+        title: &config.web_title,
+        description: Some(config.web_description.as_str()).filter(|text| !text.is_empty()),
+        language: &config.web_language,
+        stylesheet: STYLESHEET,
+    }
+}
+
+/// The page icon of the shell (the runtimes' `PAGE_ICON`), written as is.
+pub const PAGE_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2311130f'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='monospace' font-size='40' font-weight='700' fill='%23c8ff36'%3EB%3C/text%3E%3C/svg%3E";
+
 /// The single page shell of both modes (the runtimes' `page_html` / `pageHtml`): a full HTML
-/// document with the title, the stylesheet link and `body` (already HTML) inside the one
-/// `<div class="bind-site">`.
-pub fn page_html(title: &str, stylesheet: &str, body: &str) -> String {
+/// document, line by line the former generator's `index.html`, with the metadata of `meta`
+/// (HTML-escaped; the description lines only when there is one) and `body` (already HTML)
+/// inside the one `<div class="bind-site">`.
+pub fn page_html(meta: &PageMeta, body: &str) -> String {
+    let title = escape_html(meta.title);
+    let description = meta.description.map(escape_html);
+    let mut lines = vec![
+        "<meta charset=\"utf-8\">".to_string(),
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">".to_string(),
+    ];
+    if let Some(description) = &description {
+        lines.push(format!(
+            "<meta name=\"description\" content=\"{description}\">"
+        ));
+    }
+    lines.push("<meta name=\"theme-color\" content=\"#efeee8\">".to_string());
+    lines.push(format!("<meta property=\"og:title\" content=\"{title}\">"));
+    if let Some(description) = &description {
+        lines.push(format!(
+            "<meta property=\"og:description\" content=\"{description}\">"
+        ));
+    }
+    lines.push("<meta property=\"og:type\" content=\"website\">".to_string());
+    lines.push(format!("<title>{title}</title>"));
+    lines.push(format!("<link rel=\"icon\" href=\"{PAGE_ICON}\">"));
+    lines.push(format!(
+        "<link rel=\"stylesheet\" href=\"{}\">",
+        escape_html(meta.stylesheet)
+    ));
+    let head: String = lines.iter().map(|line| format!("    {line}\n")).collect();
     format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head>\
-         <body><div class=\"bind-site\">{body}</div></body></html>",
-        escape_html(title),
-        escape_html(stylesheet)
+        "<!doctype html>\n<html lang=\"{}\">\n  <head>\n{head}  </head>\n  <body>\n    <div class=\"bind-site\">{body}</div>\n  </body>\n</html>\n",
+        escape_html(meta.language)
     )
 }
 
@@ -62,14 +109,15 @@ pub fn loading_html() -> String {
 }
 
 /// The HTML of the page's component evaluated at compile time, when it is static: no
-/// parameters, no server call, and `core::eval` evaluates it to a UI tree. Otherwise (it fails
-/// or uses what the evaluator does not model) `None`: the page is rendered at run time, where a
+/// parameters, no server call, and `core::eval` evaluates it to a UI tree within
+/// `PRERENDER_BUDGET` (so `generate` never hangs). Otherwise (it fails, exceeds the budget or
+/// uses what the evaluator does not model) `None`: the page is rendered at run time, where a
 /// failure shows its error screen with its status.
 pub fn prerender(core: &CoreProgram, plan: &FrontendPlan) -> Option<String> {
     if !plan.may_be_static() {
         return None;
     }
-    match eval_function(core, &plan.component, Vec::new()) {
+    match eval_function_within(core, &plan.component, Vec::new(), PRERENDER_BUDGET) {
         Ok(value @ Value::Ui { .. }) => Some(value.render()),
         _ => None,
     }
@@ -131,13 +179,13 @@ pub fn web_build(
     if let Some(body) = &prerendered {
         files.push((
             "web/index.html".to_string(),
-            page_html(&config.web_title, STYLESHEET, body),
+            page_html(&page_meta(config), body),
         ));
-    } else if target.mode == Mode::Split {
+    } else if target.mode == Some(Mode::Split) {
         let export = page_export(&plan);
         files.push((
             "web/index.html".to_string(),
-            split_index(&config.web_title, &export),
+            split_index(&page_meta(config), &export),
         ));
         files.push((
             "web/app.js".to_string(),
@@ -166,14 +214,14 @@ fn page_export(plan: &FrontendPlan) -> String {
 
 /// The split page before its JS runs: the shell with the loading screen, then the module
 /// script that boots the page into the shell's `div.bind-site`.
-fn split_index(title: &str, export: &str) -> String {
-    let page = page_html(title, STYLESHEET, &loading_html());
+fn split_index(meta: &PageMeta, export: &str) -> String {
+    let page = page_html(meta, &loading_html());
     let script = format!(
-        "<script type=\"module\">import {{ {} as page }} from \"/app.js\"; page.boot(document.querySelector(\"div.bind-site\"), window.location.search, document);</script>",
+        "    <script type=\"module\">import {{ {} as page }} from \"/app.js\"; page.boot(document.querySelector(\"div.bind-site\"), window.location.search, document);</script>\n",
         js_string(export)
     );
-    match page.strip_suffix("</body></html>") {
-        Some(start) => format!("{start}{script}</body></html>"),
+    match page.strip_suffix("  </body>\n</html>\n") {
+        Some(start) => format!("{start}{script}  </body>\n</html>\n"),
         None => page,
     }
 }
@@ -245,15 +293,33 @@ mod tests {
     #[test]
     fn the_shell_matches_the_runtimes_page_vectors() {
         let vectors = include_str!("../../../runtime/vectors/pages.json");
-        let json = |html: &str| html.replace('\\', "\\\\").replace('"', "\\\"");
-        for (title, stylesheet, body) in [
-            ("Home", "/styles.css", "<p>hi</p>"),
-            ("A & B <i>", "/s.css?x=\"1\"&y='2'", "<main>x</main>"),
-            ("", "", ""),
+        let json = |html: &str| {
+            html.replace('\\', "\\\\")
+                .replace('"', "\\\"")
+                .replace('\n', "\\n")
+        };
+        for (title, description, language, stylesheet, body) in [
+            ("Home", None, "en", "/styles.css", "<p>hi</p>"),
+            (
+                "A & B <i>",
+                Some("Uma \"loja\" & <tudo> 'aqui'"),
+                "pt-BR",
+                "/s.css?x=\"1\"&y='2'",
+                "<main>x</main>",
+            ),
+            ("", Some(""), "", "", ""),
         ] {
-            let html = page_html(title, stylesheet, body);
+            let meta = PageMeta {
+                title,
+                description,
+                language,
+                stylesheet,
+            };
+            let html = page_html(&meta, body);
             assert!(vectors.contains(&json(&html)), "{html}");
         }
+        let runtime = include_str!("../../../runtime/bind-runtime/src/lib.rs");
+        assert!(runtime.contains(&format!("pub const PAGE_ICON: &str = \"{PAGE_ICON}\";")));
     }
 
     #[test]
@@ -270,11 +336,25 @@ mod tests {
 
     #[test]
     fn the_split_page_is_the_shell_with_the_loading_screen_and_the_boot_script() {
-        let page = split_index("Shop & co", "bind:page");
+        let meta = PageMeta {
+            title: "Shop & co",
+            description: None,
+            language: "pt-BR",
+            stylesheet: STYLESHEET,
+        };
+        let page = split_index(&meta, "bind:page");
+        let shell = page_html(&meta, &loading_html());
         assert_eq!(
             page,
-            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Shop &amp; co</title><link rel=\"stylesheet\" href=\"/styles.css\"></head><body><div class=\"bind-site\"><main class=\"bind-loading\"><p>Loading…</p></main></div><script type=\"module\">import { \"bind:page\" as page } from \"/app.js\"; page.boot(document.querySelector(\"div.bind-site\"), window.location.search, document);</script></body></html>"
+            shell.replace(
+                "  </body>",
+                "    <script type=\"module\">import { \"bind:page\" as page } from \"/app.js\"; page.boot(document.querySelector(\"div.bind-site\"), window.location.search, document);</script>\n  </body>"
+            )
         );
+        assert!(page.contains("<html lang=\"pt-BR\">"));
+        assert!(page.contains(
+            "<div class=\"bind-site\"><main class=\"bind-loading\"><p>Loading…</p></main></div>"
+        ));
     }
 
     fn plan(source: &str) -> (CoreProgram, FrontendPlan) {
@@ -314,6 +394,19 @@ mod tests {
             "fun fundo(n: Int): Int = if (n == 0) 0 else fundo(n - 1) + 1\nclient component C() {\n UI {\n Text(fundo(20000))\n }\n}\n",
         );
         assert_eq!(prerender(&core, &page), None);
+        // Work past the pre-render budget is left to run time instead of hanging `generate`:
+        // exponential recursion, and values that double at each step.
+        let started = std::time::Instant::now();
+        let (core, page) = plan(
+            "fun fib(n: Int): Int = if (n < 2) n else fib(n - 1) + fib(n - 2)\nclient component C() {\n UI {\n Text(fib(40))\n }\n}\n",
+        );
+        assert_eq!(prerender(&core, &page), None);
+        let (core, page) = plan(
+            "fun dobra(s: String, n: Int): String = if (n == 0) s else dobra(s + s, n - 1)\nfun quadrado(x: Int, n: Int): Int = if (n == 0) x else quadrado(x * x, n - 1)\nclient component C() {\n UI {\n Text(dobra(\"ab\", 40))\n Text(quadrado(3, 40))\n }\n}\n",
+        );
+        assert_eq!(prerender(&core, &page), None);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(20), "{elapsed:?}");
         // A parameter: read from the URL at run time.
         let (core, page) = plan("client component C(n: Int) {\n UI {\n Text(n)\n }\n}\n");
         assert_eq!(prerender(&core, &page), None);
@@ -386,7 +479,8 @@ mod tests {
 
     /// The site (`../website`, not modified: a temporary copy with `client = "web"` and
     /// `mode = "split"`) pre-renders exactly the HTML its former Elm client rendered
-    /// (`tests/codegen/website.html.expected`, recorded before the Elm generator was removed).
+    /// (`tests/codegen/website.html.expected`, recorded before the Elm generator was removed),
+    /// in the former page document.
     #[test]
     fn the_website_prerenders_the_html_of_the_former_elm_client() {
         let site = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../website");
@@ -415,7 +509,21 @@ mod tests {
             .strip_prefix("<div class=\"bind-site\">")
             .and_then(|rest| rest.strip_suffix("</div>"))
             .unwrap();
-        assert_eq!(files[0].1, page_html(&config.web_title, STYLESHEET, inner));
+        // The whole document is the former generator's `index.html` for the site
+        // (`tests/codegen/website.index.html.expected`, recorded with the generator of the
+        // parent of db5c316), except for the one documented difference: the Elm mount point
+        // and its two scripts become the pre-rendered page in the `bind-site` wrapper.
+        let elm_mount = "<div id=\"app\"></div>\n    <script src=\"/main.js\"></script>\n    <script>Elm.Main.init({ node: document.getElementById('app') });</script>";
+        let former = include_str!("../../../tests/codegen/website.index.html.expected");
+        assert!(former.contains(elm_mount));
+        assert_eq!(
+            files[0].1,
+            former.replace(
+                elm_mount,
+                &format!("<div class=\"bind-site\">{inner}</div>")
+            )
+        );
+        assert_eq!(files[0].1, page_html(&page_meta(&config), inner));
         assert_eq!(
             files[1].1,
             std::fs::read_to_string(site.join("styles.css")).unwrap()

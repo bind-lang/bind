@@ -282,21 +282,23 @@ pub const PAGE_CONTENT_TYPE: &str = \"text/html; charset=utf-8\";
 /// Content type of the RPC responses (`handle_rpc`).
 pub const RPC_CONTENT_TYPE: &str = \"application/json; charset=utf-8\";
 
-/// Title of the page shell.
-const PAGE_TITLE: &str = {title:?};
-
-/// Stylesheet URL of the page shell.
-const PAGE_STYLESHEET: &str = {stylesheet:?};
+/// Metadata of the page shell (`[web]` in `bind.toml`).
+const PAGE_META: {RUNTIME}::PageMeta<'static> = {RUNTIME}::PageMeta {{
+title: {title:?},
+description: {description},
+language: {language:?},
+stylesheet: {stylesheet:?},
+}};
 
 /// The error page of `error`, with its status; the message never exposes internals.
 fn page_error(error: &{RUNTIME}::AppError) -> HttpResult {{
-let (status, body) = {RUNTIME}::error_page(error, PAGE_TITLE, PAGE_STYLESHEET);
+let (status, body) = {RUNTIME}::error_page(error, &PAGE_META);
 HttpResult {{ status, body }}
 }}
 
 /// The page of a rendered component.
 fn page_result(node: &{RUNTIME}::Node) -> HttpResult {{
-let body = {RUNTIME}::page_html(PAGE_TITLE, PAGE_STYLESHEET, &{RUNTIME}::render_html(node));
+let body = {RUNTIME}::page_html(&PAGE_META, &{RUNTIME}::render_html(node));
 HttpResult {{ status: 200, body }}
 }}
 
@@ -344,6 +346,11 @@ HttpResponse {{ status: result.status, content_type: RPC_CONTENT_TYPE, body: res
 
 ",
         title = ssr.title,
+        description = match ssr.description {
+            Some(text) => format!("::std::option::Option::Some({text:?})"),
+            None => "::std::option::Option::None".to_string(),
+        },
+        language = ssr.language,
         stylesheet = ssr.stylesheet,
         name = component.name,
     ))

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="description" content="Bind is a whole-application language that verifies client, server, environment, and database boundaries before your application builds.">
+    <meta name="theme-color" content="#efeee8">
+    <meta property="og:title" content="Bind — If it does not bind, it does not build.">
+    <meta property="og:description" content="Bind is a whole-application language that verifies client, server, environment, and database boundaries before your application builds.">
+    <meta property="og:type" content="website">
+    <title>Bind — If it does not bind, it does not build.</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2311130f'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='monospace' font-size='40' font-weight='700' fill='%23c8ff36'%3EB%3C/text%3E%3C/svg%3E">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div id="app"></div>
+    <script src="/main.js"></script>
+    <script>Elm.Main.init({ node: document.getElementById('app') });</script>
+  </body>
+</html>

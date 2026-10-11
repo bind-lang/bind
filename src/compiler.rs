@@ -451,6 +451,21 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     if !built_in_target && target_config.client != "elm" {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
+    if target_config.client == "web" {
+        // One page per application, certified or not: the component is its entry point.
+        let components: Vec<_> = program
+            .functions
+            .iter()
+            .filter(|function| function.domain == Domain::Client && function.component)
+            .collect();
+        if components.len() > 1 {
+            diagnostics.push(Diagnostic::error(
+                "E8301",
+                "The web profile accepts one client component as its application entry point.",
+                components[1].span.clone(),
+            ));
+        }
+    }
     if target_config.server == "rust" {
         validate_rust_server_surface(&program, &database, &database_operations, &mut diagnostics);
     }
@@ -645,19 +660,6 @@ fn validate_certified_surface(
     config: &ProjectConfig,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let components: Vec<_> = program
-        .functions
-        .iter()
-        .filter(|function| function.domain == Domain::Client && function.component)
-        .collect();
-    if components.len() > 1 {
-        diagnostics.push(Diagnostic::error(
-            "E8301",
-            "The certified web profile currently accepts one client component as its application entry point.",
-            components[1].span.clone(),
-        ));
-    }
-
     for declaration in &program.types {
         if declaration.kind == TypeKind::Sealed && declaration.variants.is_empty() {
             diagnostics.push(Diagnostic::error(
@@ -2343,15 +2345,94 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         );
         let declared = format!("{cross}frontend_origin = \"https://app.example.com\"\n");
         assert!(e8311(PAGE, &declared).is_empty());
-        assert!(e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"/backend\"\n")).is_empty());
-        assert_eq!(
-            e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"javascript:alert(1)\"\n")),
-            vec!["`api_url = \"javascript:alert(1)\"` must be a path starting with `/` or an `http://` or `https://` URL.".to_string()]
+        assert!(e8311(PAGE, &format!("{WEB_SPLIT}api_url = \"/api\"\n")).is_empty());
+        let with_port = format!(
+            "{WEB_SPLIT}api_url = \"http://localhost:8080/api\"\nfrontend_origin = \"http://localhost:3000\"\n"
         );
+        assert!(e8311(PAGE, &with_port).is_empty());
+        // `api_url` must reach the generated routes, `/api/<endpoint>`.
+        for api_url in [
+            "/backend",
+            "/api/",
+            "/v1/api",
+            "/api?x=1",
+            "api",
+            "//api.example.com/api",
+            "javascript:alert(1)",
+            "https://api.example.com",
+            "https://api.example.com/",
+            "https://api.example.com/v1/api",
+            "https://API.example.com/api",
+            "https://user@api.example.com/api",
+        ] {
+            assert_eq!(
+                e8311(
+                    PAGE,
+                    &format!(
+                        "{WEB_SPLIT}api_url = \"{api_url}\"\nfrontend_origin = \"https://app.example.com\"\n"
+                    )
+                ),
+                vec![format!(
+                    "`api_url = \"{api_url}\"` must be `/api` or a canonical origin followed by `/api` (`https://host[:port]/api`, no trailing slash, query or fragment): the generated server answers at `/api/<endpoint>`."
+                )],
+                "{api_url}"
+            );
+        }
+        // `frontend_origin` must be what browsers send in `Origin`.
+        for origin in [
+            "https://app.example.com/page",
+            "https://app.example.com/",
+            "https://App.example.com",
+            "https://user@app.example.com",
+            "https://app.example.com:443",
+            "http://app.example.com:80",
+            "https://app.example.com:0443",
+            "https://app..example.com",
+            "https://-app.example.com",
+            "ftp://app.example.com",
+            "app.example.com",
+        ] {
+            assert_eq!(
+                e8311(PAGE, &format!("{cross}frontend_origin = \"{origin}\"\n")),
+                vec![format!(
+                    "`frontend_origin = \"{origin}\"` must be a canonical origin: `http://` or `https://`, a lowercase host and an optional non-default port, without a path, user info or trailing slash."
+                )],
+                "{origin}"
+            );
+        }
+        for origin in [
+            "https://app.example.com:8443",
+            "http://[::1]:3000",
+            "http://127.0.0.1",
+        ] {
+            assert!(
+                e8311(PAGE, &format!("{cross}frontend_origin = \"{origin}\"\n")).is_empty(),
+                "{origin}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_web_target_must_choose_its_mode() {
+        let target = "client = \"web\"\nserver = \"rust\"\ndeployment = \"vercel\"\n";
         assert_eq!(
-            e8311(PAGE, &format!("{cross}frontend_origin = \"https://app.example.com/page\"\n")),
-            vec!["`frontend_origin = \"https://app.example.com/page\"` must be an origin: `http://` or `https://`, a host and an optional port, without a path.".to_string()]
+            e8311(PAGE, target),
+            vec!["Target `t` must choose its mode: `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API).".to_string()]
         );
+    }
+
+    #[test]
+    fn every_web_target_has_one_client_component() {
+        let source = format!(
+            "{PAGE}client component Outra() {{\n    UI {{\n        Text(\"b\")\n    }}\n}}\n"
+        );
+        for target in [WEB_SSR, WEB_SPLIT] {
+            let (root, config) = web_fixture(&source, target);
+            let result = verify(&config, "t");
+            assert_eq!(codes(&result), vec!["E8301"], "{:?}", result.diagnostics);
+            assert!(result.application.is_none());
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

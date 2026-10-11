@@ -368,7 +368,8 @@ test("pageHtml and errorBody match pages.json", () => {
   const document = createDocument();
   for (const c of cases) {
     if (c.kind === "page") {
-      eq(rt.pageHtml(c.title, c.stylesheet, c.body), c.html, c.title);
+      const meta = { title: c.title, description: c.description, language: c.language, stylesheet: c.stylesheet };
+      eq(rt.pageHtml(meta, c.body), c.html, c.title);
     } else if (c.kind === "bad_parameter") {
       // The boot code shows BindError("BadParameter", name) as errorBody(kind, message).
       const { status, tree } = rt.errorBody("BadParameter", c.name);
@@ -390,6 +391,7 @@ test("TEXTS equal the Rust runtime's screen texts", () => {
     return match[1];
   };
   eq(rt.TEXTS.loading, constant("TEXT_LOADING"));
+  eq(rt.PAGE_ICON, constant("PAGE_ICON"));
   eq(rt.TEXTS.requestFailed, constant("TEXT_REQUEST_FAILED"));
   eq(rt.TEXTS.titleBadRequest, constant("TITLE_BAD_REQUEST"));
   eq(rt.TEXTS.titleNotFound, constant("TITLE_NOT_FOUND"));

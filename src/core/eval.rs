@@ -162,11 +162,52 @@ pub fn eval_function(
     name: &str,
     args: Vec<Value>,
 ) -> Result<Value, EvalError> {
+    run(program, name, args, None)
+}
+
+/// A bound on one evaluation (the compile-time pre-render): at most `steps` evaluated
+/// expressions, `Int`s of at most `int_limbs` 32-bit limbs and strings of at most
+/// `string_bytes` bytes. Past any of them the evaluation stops with
+/// `EvalError::Unsupported("evaluation budget exhausted")`.
+#[derive(Clone, Copy, Debug)]
+pub struct Budget {
+    pub steps: u64,
+    pub int_limbs: usize,
+    pub string_bytes: usize,
+}
+
+/// The budget of the static pre-render: a page that needs more is rendered at run time.
+pub const PRERENDER_BUDGET: Budget = Budget {
+    steps: 2_000_000,
+    int_limbs: 1024,
+    string_bytes: 4 * 1024 * 1024,
+};
+
+/// [`eval_function`] within `budget`.
+pub fn eval_function_within(
+    program: &CoreProgram,
+    name: &str,
+    args: Vec<Value>,
+    budget: Budget,
+) -> Result<Value, EvalError> {
+    run(program, name, args, Some(budget))
+}
+
+fn run(
+    program: &CoreProgram,
+    name: &str,
+    args: Vec<Value>,
+    budget: Option<Budget>,
+) -> Result<Value, EvalError> {
     std::thread::scope(|scope| {
         let handle = std::thread::Builder::new()
             .stack_size(STACK_SIZE)
             .spawn_scoped(scope, || {
-                let mut interp = Interp { program, depth: 0 };
+                let mut interp = Interp {
+                    program,
+                    depth: 0,
+                    budget,
+                };
                 interp.call(Value::Function(name.to_string()), args)
             });
         match handle {
@@ -200,6 +241,12 @@ type Eval = Result<Value, Signal>;
 struct Interp<'p> {
     program: &'p CoreProgram,
     depth: usize,
+    /// The remaining budget, if bounded (`steps` counts down).
+    budget: Option<Budget>,
+}
+
+fn exhausted() -> EvalError {
+    unsupported("evaluation budget exhausted")
 }
 
 impl Interp<'_> {
@@ -253,6 +300,12 @@ impl Interp<'_> {
     }
 
     fn eval(&mut self, expr: &Expr, env: &mut Env) -> Eval {
+        if let Some(budget) = &mut self.budget {
+            if budget.steps == 0 {
+                return Err(exhausted().into());
+            }
+            budget.steps -= 1;
+        }
         match &expr.kind {
             ExprKind::Lit(literal) => Ok(literal_value(literal, &expr.ty)?),
             ExprKind::Local(id) => env
@@ -323,7 +376,18 @@ impl Interp<'_> {
             }
             ExprKind::Prim { op, args } => {
                 let args = self.eval_all(args, env)?;
-                Ok(prim(*op, args)?)
+                let value = prim(*op, args)?;
+                if let Some(budget) = &self.budget {
+                    let too_big = match &value {
+                        Value::Int(value) => value.limb_count() > budget.int_limbs,
+                        Value::Str(text) => text.len() > budget.string_bytes,
+                        _ => false,
+                    };
+                    if too_big {
+                        return Err(exhausted().into());
+                    }
+                }
+                Ok(value)
             }
             ExprKind::Db { .. } => Err(unsupported("database access").into()),
             ExprKind::Return(value) => Err(Signal::Return(self.eval(value, env)?)),

@@ -743,16 +743,61 @@ fn is_allowed_href(url: &str) -> bool {
     true
 }
 
-/// The single page shell of both modes: a full HTML document with the title, the stylesheet
-/// link and `body` (already HTML) inside the one `<div class="bind-site">`.
-pub fn page_html(title: &str, stylesheet: &str, body: &str) -> String {
+/// The metadata of the page shell (`[web]` in `bind.toml`): the document title, the optional
+/// description (meta description and og:description), the language (`<html lang>`) and the
+/// stylesheet URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageMeta<'a> {
+    pub title: &'a str,
+    pub description: Option<&'a str>,
+    pub language: &'a str,
+    pub stylesheet: &'a str,
+}
+
+/// The page icon of the shell (an inline SVG "B"), written as is.
+pub const PAGE_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2311130f'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='monospace' font-size='40' font-weight='700' fill='%23c8ff36'%3EB%3C/text%3E%3C/svg%3E";
+
+/// The single page shell of both modes: a full HTML document with the metadata of `meta` (each
+/// value HTML-escaped; the description lines only when there is one) and `body` (already HTML)
+/// inside the one `<div class="bind-site">`. Line by line the markup of the former generator's
+/// `index.html`.
+pub fn page_html(meta: &PageMeta, body: &str) -> String {
+    let description = meta.description.map(escape_html);
+    let line = |text: String| format!("    {text}\n");
+    let mut head = String::new();
+    head.push_str(&line("<meta charset=\"utf-8\">".into()));
+    head.push_str(&line(
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">".into(),
+    ));
+    if let Some(description) = &description {
+        head.push_str(&line(format!(
+            "<meta name=\"description\" content=\"{description}\">"
+        )));
+    }
+    head.push_str(&line(
+        "<meta name=\"theme-color\" content=\"#efeee8\">".into(),
+    ));
+    let title = escape_html(meta.title);
+    head.push_str(&line(format!(
+        "<meta property=\"og:title\" content=\"{title}\">"
+    )));
+    if let Some(description) = &description {
+        head.push_str(&line(format!(
+            "<meta property=\"og:description\" content=\"{description}\">"
+        )));
+    }
+    head.push_str(&line(
+        "<meta property=\"og:type\" content=\"website\">".into(),
+    ));
+    head.push_str(&line(format!("<title>{title}</title>")));
+    head.push_str(&line(format!("<link rel=\"icon\" href=\"{PAGE_ICON}\">")));
+    head.push_str(&line(format!(
+        "<link rel=\"stylesheet\" href=\"{}\">",
+        escape_html(meta.stylesheet)
+    )));
     format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-         <title>{}</title><link rel=\"stylesheet\" href=\"{}\"></head>\
-         <body><div class=\"bind-site\">{body}</div></body></html>",
-        escape_html(title),
-        escape_html(stylesheet)
+        "<!doctype html>\n<html lang=\"{}\">\n  <head>\n{head}  </head>\n  <body>\n    <div class=\"bind-site\">{body}</div>\n  </body>\n</html>\n",
+        escape_html(meta.language)
     )
 }
 
@@ -773,10 +818,10 @@ pub fn error_body(error: &AppError) -> (u16, String) {
     (status, body)
 }
 
-/// The status and HTML of a whole error page: `page_html(title, stylesheet, error_body)`.
-pub fn error_page(error: &AppError, title: &str, stylesheet: &str) -> (u16, String) {
+/// The status and HTML of a whole error page: `page_html(meta, error_body)`.
+pub fn error_page(error: &AppError, meta: &PageMeta) -> (u16, String) {
     let (status, body) = error_body(error);
-    (status, page_html(title, stylesheet, &body))
+    (status, page_html(meta, &body))
 }
 
 /// ECMAScript `Number::toString(10)` of `value` (what `String(x)` gives in JavaScript).
@@ -1063,23 +1108,29 @@ mod tests {
 
     #[test]
     fn page_and_error_pages() {
-        let page = page_html("A & B", "/s.css?x=\"1\"", "<p>hi</p>");
-        assert!(page.starts_with("<!DOCTYPE html>"));
+        let meta = PageMeta {
+            title: "A & B",
+            description: None,
+            language: "en",
+            stylesheet: "/s.css?x=\"1\"",
+        };
+        let page = page_html(&meta, "<p>hi</p>");
+        assert!(page.starts_with("<!doctype html>\n<html lang=\"en\">"));
         assert!(page.contains("<title>A &amp; B</title>"));
         assert!(page.contains("<link rel=\"stylesheet\" href=\"/s.css?x=&quot;1&quot;\">"));
         assert!(page.contains("<div class=\"bind-site\"><p>hi</p></div>"));
+        assert!(!page.contains("description"));
 
-        let (status, html) =
-            error_page(&AppError::NotFound("user 42 secret".into()), "T", "/s.css");
+        let (status, html) = error_page(&AppError::NotFound("user 42 secret".into()), &meta);
         assert_eq!(status, 404);
         assert!(html.contains(TITLE_NOT_FOUND));
         assert!(html.contains("not found"));
         assert!(!html.contains("secret"));
-        let (status, html) = error_page(&AppError::BadRequest("bad <id>".into()), "T", "/s.css");
+        let (status, html) = error_page(&AppError::BadRequest("bad <id>".into()), &meta);
         assert_eq!(status, 400);
         assert!(html.contains(TITLE_BAD_REQUEST));
         assert!(html.contains("bad &lt;id&gt;"));
-        let (status, html) = error_page(&AppError::Internal("db password".into()), "T", "/s.css");
+        let (status, html) = error_page(&AppError::Internal("db password".into()), &meta);
         assert_eq!(status, 500);
         assert!(html.contains(TITLE_ERROR));
         assert!(html.contains("internal error"));

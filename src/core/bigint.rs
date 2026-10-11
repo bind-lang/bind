@@ -48,6 +48,11 @@ impl BigInt {
         Some(BigInt::new(negative, limbs))
     }
 
+    /// The number of 32-bit limbs of the magnitude (0 for zero).
+    pub fn limb_count(&self) -> usize {
+        self.limbs.len()
+    }
+
     fn is_zero(&self) -> bool {
         self.limbs.is_empty()
     }

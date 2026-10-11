@@ -20,8 +20,8 @@ pub struct BuildReport {
     /// The files of `web/` (no build step: they are deployed as generated).
     pub web_artifacts: Vec<PathBuf>,
     pub cargo_lock_hash: String,
-    /// The hash of the JS runtime (`web/bind-runtime.js` when the page uses it).
-    pub js_runtime_hash: String,
+    /// The hash of `web/bind-runtime.js`, when the page ships it (the split mode's dynamic page).
+    pub js_runtime_hash: Option<String>,
     pub target_lock: PathBuf,
     pub manifest: PathBuf,
 }
@@ -103,7 +103,11 @@ pub fn build(
     }
 
     let cargo_lock_hash = hash_file(&generated.join("Cargo.lock"))?;
-    let js_runtime_hash = hash_bytes(crate::backend::js::RUNTIME.as_bytes());
+    let js_runtime = generated.join("web/bind-runtime.js");
+    let js_runtime_hash = js_runtime
+        .exists()
+        .then(|| hash_file(&js_runtime))
+        .transpose()?;
     fs::write(
         config.root.join("bind.lock"),
         certified::workspace_lock(config),
@@ -115,7 +119,7 @@ pub fn build(
     let target_lock = lock_directory.join(format!("{}.lock", app.target));
     fs::write(
         &target_lock,
-        certified::dependency_lock(target, Some(&cargo_lock_hash), &js_runtime_hash),
+        certified::dependency_lock(target, Some(&cargo_lock_hash), js_runtime_hash.as_deref()),
     )
     .map_err(|error| format!("Cannot write {}: {error}", target_lock.display()))?;
 
@@ -172,19 +176,24 @@ pub fn build(
     fs::write(
         &manifest,
         format!(
-            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"mode\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n  \"jsRuntimeSha256\": {},\n  \"wireVersion\": {},\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
+            "{{\n  \"languageVersion\": \"0.1.0\",\n  \"compilerVersion\": \"bindc-0.1.0\",\n  \"profile\": {},\n  \"certified\": {},\n  \"certificationState\": {},\n  \"project\": {},\n  \"target\": {},\n  \"mode\": {},\n  \"deployment\": {},\n  \"sourceHash\": {},\n  \"schemaFingerprint\": {},\n  \"cargoLockSha256\": {},\n{}  \"wireVersion\": {},\n  \"apiUrl\": {},\n  \"frontendOrigin\": {},\n  \"environment\": [\n{environment_entries}\n  ],\n  \"databaseOperations\": [\n{database_entries}\n  ],\n  \"unsafeOperations\": {},\n  \"artifacts\": [\n{artifact_entries}\n  ]\n}}\n",
             json(certified::profile_version()),
             mode == BuildMode::Certify,
             json(certification_state),
             json(&app.project_name),
             json(&app.target),
-            json(target.mode.as_str()),
+            json(target.mode_name()),
             json(&target.deployment),
             json(&app.source_hash),
             json(&app.database.fingerprint),
             json(&cargo_lock_hash),
-            json(&js_runtime_hash),
+            js_runtime_hash
+                .as_deref()
+                .map(|hash| format!("  \"jsRuntimeSha256\": {},\n", json(hash)))
+                .unwrap_or_default(),
             json(certified::wire_version()),
+            certified::manifest_api_url(target),
+            certified::manifest_frontend_origin(target),
             json_array(&app.unsafe_operations),
         ),
     )

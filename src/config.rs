@@ -15,11 +15,7 @@ pub struct ProjectConfig {
     pub database_url_env: Option<String>,
     pub database_verification: String,
     pub web_title: String,
-    // Read from `[web]`; the page shell, the same in every runtime, has no description or
-    // language yet.
-    #[allow(dead_code)]
     pub web_description: String,
-    #[allow(dead_code)]
     pub web_language: String,
     pub web_stylesheet: Option<PathBuf>,
     pub targets: BTreeMap<String, TargetConfig>,
@@ -31,8 +27,8 @@ pub struct TargetConfig {
     pub server: String,
     pub deployment: String,
     /// `mode = "ssr"` (the server renders the page) or `"split"` (static frontend calling the
-    /// API); `"split"` when absent.
-    pub mode: Mode,
+    /// API); required for web targets (E8311 when absent).
+    pub mode: Option<Mode>,
     /// Base URL of the RPC routes the frontend calls (`<api_url>/<endpoint>`); `/api` by default.
     pub api_url: String,
     /// The only browser origin allowed to call the API (CORS), required when `api_url` is on
@@ -50,6 +46,13 @@ pub enum Mode {
     /// Two applications: a static frontend (HTML, CSS, JS) calling the Rust API over HTTP.
     #[default]
     Split,
+}
+
+impl TargetConfig {
+    /// The mode's name, `unset` when the target declares none.
+    pub fn mode_name(&self) -> &'static str {
+        self.mode.map_or("unset", Mode::as_str)
+    }
 }
 
 impl Mode {
@@ -81,8 +84,9 @@ impl ProjectConfig {
         for (section, properties) in &values {
             if let Some(name) = section.strip_prefix("target.") {
                 let mode = match properties.get("mode").map(String::as_str) {
-                    None | Some("split") => Mode::Split,
-                    Some("ssr") => Mode::Ssr,
+                    None => None,
+                    Some("split") => Some(Mode::Split),
+                    Some("ssr") => Some(Mode::Ssr),
                     Some(other) => {
                         return Err(format!(
                             "Target `{name}`: `mode` must be \"ssr\" or \"split\", found \"{other}\""
@@ -120,7 +124,7 @@ impl ProjectConfig {
                     client: "web".into(),
                     server: "rust".into(),
                     deployment: "aws-lambda".into(),
-                    mode: Mode::Split,
+                    mode: Some(Mode::Split),
                     api_url: DEFAULT_API_URL.to_string(),
                     frontend_origin: None,
                     certified: true,
@@ -230,16 +234,16 @@ mod tests {
         )
         .unwrap();
         let a = &config.targets["a"];
-        assert_eq!((a.mode, a.api_url.as_str()), (Mode::Ssr, "/api"));
+        assert_eq!((a.mode, a.api_url.as_str()), (Some(Mode::Ssr), "/api"));
         assert_eq!(a.frontend_origin, None);
         let b = &config.targets["b"];
-        assert_eq!(b.mode, Mode::Split);
+        assert_eq!(b.mode, Some(Mode::Split));
         assert_eq!(b.api_url, "https://api.example.com/api");
         assert_eq!(
             b.frontend_origin.as_deref(),
             Some("https://app.example.com")
         );
-        assert_eq!(config.targets["c"].mode, Mode::Split);
+        assert_eq!(config.targets["c"].mode, None);
         let error = load("[target.a]\nmode = \"spa\"\n").unwrap_err();
         assert!(
             error.contains("`mode` must be \"ssr\" or \"split\""),

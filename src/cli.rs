@@ -97,7 +97,7 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                         .collect::<Vec<_>>()
                         .join("\n  "),
                     report.cargo_lock_hash,
-                    report.js_runtime_hash
+                    report.js_runtime_hash.as_deref().unwrap_or("not shipped")
                 );
             }
         }
@@ -161,7 +161,7 @@ fn target_command(args: &[String], config: &ProjectConfig) -> Result<(), String>
                     "{name}\t{} + {}\t{}\t{}\t{}",
                     target.client,
                     target.server,
-                    target.mode.as_str(),
+                    target.mode_name(),
                     target.deployment,
                     if target.certified {
                         "certified"
@@ -182,7 +182,7 @@ fn target_command(args: &[String], config: &ProjectConfig) -> Result<(), String>
                 "Target: {name}\nClient: {}\nServer: {}\nMode: {}\nDeployment: {}\nCertification profile: {}\nCapabilities:\n  {}",
                 target.client,
                 target.server,
-                target.mode.as_str(),
+                target.mode_name(),
                 target.deployment,
                 if target.certified {
                     "certified"

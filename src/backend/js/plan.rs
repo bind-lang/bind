@@ -22,11 +22,13 @@ pub const PARAMETER_TYPES: [&str; 8] = [
 pub enum FrontendProblem {
     /// The removed Elm client.
     ElmClient { target: String },
-    /// `api_url` is neither a path nor an http(s) URL.
+    /// A web target without `mode`.
+    MissingMode { target: String },
+    /// `api_url` is not `/api` nor a canonical origin followed by `/api`.
     InvalidApiUrl { api_url: String },
     /// `api_url` is on another origin and no `frontend_origin` names the allowed one.
     CrossOriginApi { api_url: String },
-    /// `frontend_origin` is not an origin.
+    /// `frontend_origin` is not a canonical origin.
     InvalidFrontendOrigin { origin: String },
     /// The program has no client component.
     NoComponent { target: String },
@@ -63,14 +65,17 @@ impl FrontendProblem {
             FrontendProblem::ElmClient { target } => format!(
                 "Target `{target}` uses `client = \"elm\"`, which is no longer supported: write `client = \"web\"` and choose `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
             ),
+            FrontendProblem::MissingMode { target } => format!(
+                "Target `{target}` must choose its mode: `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
+            ),
             FrontendProblem::InvalidApiUrl { api_url } => format!(
-                "`api_url = \"{api_url}\"` must be a path starting with `/` or an `http://` or `https://` URL."
+                "`api_url = \"{api_url}\"` must be `/api` or a canonical origin followed by `/api` (`https://host[:port]/api`, no trailing slash, query or fragment): the generated server answers at `/api/<endpoint>`."
             ),
             FrontendProblem::CrossOriginApi { api_url } => format!(
                 "`api_url = \"{api_url}\"` is on another origin, so the target must declare `frontend_origin`, the only browser origin the API answers (CORS)."
             ),
             FrontendProblem::InvalidFrontendOrigin { origin } => format!(
-                "`frontend_origin = \"{origin}\"` must be an origin: `http://` or `https://`, a host and an optional port, without a path."
+                "`frontend_origin = \"{origin}\"` must be a canonical origin: `http://` or `https://`, a lowercase host and an optional non-default port, without a path, user info or trailing slash."
             ),
             FrontendProblem::NoComponent { target } => format!(
                 "Target `{target}` has no client component: a web target renders exactly one `client component` as its page."
@@ -187,22 +192,30 @@ pub fn target_problems(name: &str, target: &TargetConfig) -> Vec<FrontendProblem
         }];
     }
     let mut problems = Vec::new();
-    if target.mode == Mode::Split {
-        let api_url = &target.api_url;
-        let absolute = api_url.starts_with("http://") || api_url.starts_with("https://");
-        let relative = api_url.starts_with('/') && !api_url.starts_with("//");
-        if !absolute && !relative {
-            problems.push(FrontendProblem::InvalidApiUrl {
-                api_url: api_url.clone(),
-            });
-        } else if absolute && target.frontend_origin.is_none() {
-            problems.push(FrontendProblem::CrossOriginApi {
-                api_url: api_url.clone(),
-            });
+    match target.mode {
+        None => problems.push(FrontendProblem::MissingMode {
+            target: name.to_string(),
+        }),
+        Some(Mode::Split) => {
+            let api_url = &target.api_url;
+            match api_url.strip_suffix("/api") {
+                Some("") => {}
+                Some(origin) if is_canonical_origin(origin) => {
+                    if target.frontend_origin.is_none() {
+                        problems.push(FrontendProblem::CrossOriginApi {
+                            api_url: api_url.clone(),
+                        });
+                    }
+                }
+                _ => problems.push(FrontendProblem::InvalidApiUrl {
+                    api_url: api_url.clone(),
+                }),
+            }
         }
+        Some(Mode::Ssr) => {}
     }
     if let Some(origin) = &target.frontend_origin
-        && !is_origin(origin)
+        && !is_canonical_origin(origin)
     {
         problems.push(FrontendProblem::InvalidFrontendOrigin {
             origin: origin.clone(),
@@ -211,17 +224,58 @@ pub fn target_problems(name: &str, target: &TargetConfig) -> Vec<FrontendProblem
     problems
 }
 
-/// `http://` or `https://`, then a non-empty host (with an optional port) and nothing else.
-fn is_origin(text: &str) -> bool {
-    let host = text
-        .strip_prefix("https://")
-        .or_else(|| text.strip_prefix("http://"));
-    host.is_some_and(|host| {
-        !host.is_empty()
-            && host
+/// An origin as browsers write it in the `Origin` header: `http://` or `https://`, a lowercase
+/// host (DNS labels of `a-z`, `0-9` and inner `-`, or a bracketed IPv6 address) and an optional
+/// port that is not the scheme's default, with nothing after it.
+fn is_canonical_origin(text: &str) -> bool {
+    let (rest, default_port) = if let Some(rest) = text.strip_prefix("https://") {
+        (rest, "443")
+    } else if let Some(rest) = text.strip_prefix("http://") {
+        (rest, "80")
+    } else {
+        return false;
+    };
+    let (host, port) = if let Some(inner) = rest.strip_prefix('[') {
+        let Some((address, after)) = inner.split_once(']') else {
+            return false;
+        };
+        let valid = !address.is_empty()
+            && address
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-    })
+                .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f' | ':' | '.'));
+        if !valid {
+            return false;
+        }
+        match after {
+            "" => ("ipv6", None),
+            _ => match after.strip_prefix(':') {
+                Some(port) => ("ipv6", Some(port)),
+                None => return false,
+            },
+        }
+    } else {
+        match rest.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (rest, None),
+        }
+    };
+    let label = |label: &str| {
+        !label.is_empty()
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    };
+    let port_ok = port.is_none_or(|port| {
+        !port.is_empty()
+            && port.len() <= 5
+            && !port.starts_with('0')
+            && port.chars().all(|c| c.is_ascii_digit())
+            && port.parse::<u32>().is_ok_and(|value| value <= 65535)
+            && port != default_port
+    });
+    host.split('.').all(label) && port_ok
 }
 
 fn program_plan(
@@ -367,7 +421,7 @@ mod tests {
         let (ast, _) = crate::parser::parse(crate::lexer::lex("main.bd", source).0);
         let target = TargetConfig {
             client: "web".into(),
-            mode: Mode::Split,
+            mode: Some(Mode::Split),
             api_url: "https://api.example.com/api".into(),
             ..TargetConfig::default()
         };
@@ -395,7 +449,7 @@ mod tests {
         );
         // The split mode's API settings do not apply to the ssr mode.
         let ssr = TargetConfig {
-            mode: Mode::Ssr,
+            mode: Some(Mode::Ssr),
             ..target
         };
         assert_eq!(target_problems("t", &ssr), Vec::new());

@@ -856,13 +856,31 @@ export function badParameterMessage(name) {
   return `invalid parameter: ${name}`;
 }
 
-/** Rust's page_html: the full document; title and stylesheet escaped, `body` (HTML) as is. */
-export function pageHtml(title, stylesheet, body) {
+/** The page icon of the shell (Rust's PAGE_ICON), written as is. */
+export const PAGE_ICON =
+  "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2311130f'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='monospace' font-size='40' font-weight='700' fill='%23c8ff36'%3EB%3C/text%3E%3C/svg%3E";
+
+/**
+ * Rust's page_html: the full document. `meta` is { title, description (string or null: no
+ * description lines), language, stylesheet }, each value escaped; `body` (HTML) as is.
+ */
+export function pageHtml(meta, body) {
+  const title = escapeHtml(meta.title);
+  const description = meta.description === null ? null : escapeHtml(meta.description);
+  const lines = ['<meta charset="utf-8">', '<meta name="viewport" content="width=device-width,initial-scale=1">'];
+  if (description !== null) lines.push(`<meta name="description" content="${description}">`);
+  lines.push('<meta name="theme-color" content="#efeee8">', `<meta property="og:title" content="${title}">`);
+  if (description !== null) lines.push(`<meta property="og:description" content="${description}">`);
+  lines.push(
+    '<meta property="og:type" content="website">',
+    `<title>${title}</title>`,
+    `<link rel="icon" href="${PAGE_ICON}">`,
+    `<link rel="stylesheet" href="${escapeHtml(meta.stylesheet)}">`,
+  );
+  const head = lines.map((line) => `    ${line}\n`).join("");
   return (
-    '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">' +
-    '<meta name="viewport" content="width=device-width, initial-scale=1">' +
-    `<title>${escapeHtml(title)}</title><link rel="stylesheet" href="${escapeHtml(stylesheet)}"></head>` +
-    `<body><div class="bind-site">${body}</div></body></html>`
+    `<!doctype html>\n<html lang="${escapeHtml(meta.language)}">\n  <head>\n${head}  </head>\n` +
+    `  <body>\n    <div class="bind-site">${body}</div>\n  </body>\n</html>\n`
   );
 }
 
