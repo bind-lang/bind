@@ -79,12 +79,20 @@ pub fn generate(
     // A lock resolved for another profile's dependencies is re-resolved instead of kept.
     let same_profile = fs::read_to_string(target.join("bind-manifest.json"))
         .is_ok_and(|manifest| manifest.contains(&format!("\"profile\": \"{PROFILE_VERSION}\"")));
+    let previous_cargo_toml = fs::read_to_string(target.join("Cargo.toml")).ok();
     let preserved_cargo_lock = fs::read_to_string(target.join("Cargo.lock"))
         .ok()
         .filter(|_| same_profile);
     let preserved_npm_lock = fs::read_to_string(target.join("package-lock.json")).ok();
     // Everything that can fail is computed first: a failure leaves the previous output intact.
     let mut files = workspace_files(app, config, target_config)?;
+    let cargo_toml = files
+        .iter()
+        .find(|(path, _)| path == "Cargo.toml")
+        .map(|(_, content)| content.as_str());
+    // A lock resolved for other dependencies would fail `--locked`: it is re-resolved.
+    let preserved_cargo_lock = preserved_cargo_lock
+        .filter(|_| same_dependencies(previous_cargo_toml.as_deref(), cargo_toml));
     if let Some(lock) = preserved_cargo_lock {
         files.push(("Cargo.lock".to_string(), lock));
     }
@@ -104,6 +112,20 @@ pub fn generate(
         write(&target.join(path), content)?;
     }
     Ok(target)
+}
+
+/// Whether two generated `Cargo.toml`s declare the same `[dependencies]` table (binaries and
+/// profiles do not affect the lock).
+fn same_dependencies(previous: Option<&str>, next: Option<&str>) -> bool {
+    fn table(manifest: &str) -> Option<&str> {
+        let (_, rest) = manifest.split_once("\n[dependencies]\n")?;
+        Some(
+            rest.split_once("\n[")
+                .map_or(rest, |(table, _)| table)
+                .trim(),
+        )
+    }
+    matches!((previous.and_then(table), next.and_then(table)), (Some(a), Some(b)) if a == b)
 }
 
 /// Every generated file (relative path, content) except the preserved lock files.
@@ -1936,6 +1958,24 @@ for (const input of inputs) app.ports.input.send(input);
     }
 
     /// A generation that fails leaves the previous output untouched.
+    #[test]
+    fn a_lock_is_kept_only_for_the_same_dependencies() {
+        let manifest = |dependencies: &str, bins: &str| {
+            format!(
+                "[package]\nname = \"bind-app\"\n\n[dependencies]\n{dependencies}\n{bins}\n[profile.release]\nstrip = true\n"
+            )
+        };
+        let old = manifest("serde = \"=1\"\nfutures = \"=0.3.31\"\n", "");
+        let new = manifest("serde = \"=1\"\n", "");
+        let more_bins = manifest(
+            "serde = \"=1\"\n",
+            "[[bin]]\nname = \"a\"\npath = \"api/a.rs\"\n",
+        );
+        assert!(!same_dependencies(Some(&old), Some(&new)));
+        assert!(same_dependencies(Some(&new), Some(&more_bins)));
+        assert!(!same_dependencies(None, Some(&new)));
+    }
+
     #[test]
     fn failed_generation_keeps_the_previous_output() {
         let root = std::env::temp_dir().join(format!("bindc-generate-{}", std::process::id()));
