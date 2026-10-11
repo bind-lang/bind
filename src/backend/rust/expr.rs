@@ -934,7 +934,11 @@ impl Generator<'_, '_> {
             (DurationNeg, [a]) => atom(format!("{RUNTIME}::duration_neg({})?", self.borrowed(a))),
             (StringConcat, [a, b]) => {
                 let a = self.expr(a);
-                let b = self.borrowed(b);
+                // A literal right operand is appended as a `&str`, without allocating.
+                let b = match &b.kind {
+                    ExprKind::Lit(Literal::Str(text)) => format!("{text:?}"),
+                    _ => self.borrowed(b),
+                };
                 complex(format!("{} + {b}", a.wrapped()))
             }
             (Eq | NotEq | Lt | LtEq | Gt | GtEq, [a, b]) => {
@@ -948,6 +952,19 @@ impl Generator<'_, '_> {
                         a.text, b.text
                     ));
                 }
+                if matches!(op, Eq | NotEq) {
+                    // A comparison with `null` asks whether the other operand is absent.
+                    let method = if op == Eq { "is_none" } else { "is_some" };
+                    match (&a.kind, &b.kind) {
+                        (_, ExprKind::None) => {
+                            return atom(format!("{}.{method}()", self.operand(a)));
+                        }
+                        (ExprKind::None, _) => {
+                            return atom(format!("{}.{method}()", self.operand(b)));
+                        }
+                        _ => {}
+                    }
+                }
                 let symbol = match op {
                     Eq => "==",
                     NotEq => "!=",
@@ -956,6 +973,23 @@ impl Generator<'_, '_> {
                     Gt => ">",
                     _ => ">=",
                 };
+                // A string literal operand is compared as a `&str`, without allocating.
+                let literal = |expr: &Expr| match &expr.kind {
+                    ExprKind::Lit(Literal::Str(text)) => Some(format!("{text:?}")),
+                    _ => None,
+                };
+                match (literal(a), literal(b)) {
+                    (Some(a), Some(b)) => return complex(format!("{a} {symbol} {b}")),
+                    (None, Some(b)) => {
+                        let a = self.operand(a);
+                        return complex(format!("{a}.as_str() {symbol} {b}"));
+                    }
+                    (Some(a), None) => {
+                        let b = self.operand(b);
+                        return complex(format!("{a} {symbol} {b}.as_str()"));
+                    }
+                    _ => {}
+                }
                 let a = self.operand(a);
                 let b = self.operand(b);
                 complex(format!("{a} {symbol} {b}"))

@@ -1,0 +1,76 @@
+// Shapes whose Rust rendering trips clippy's default lints (the generated crate allows
+// `clippy::all`; the restriction lints stay denied).
+distinct type WideId = UUID
+distinct type Pontos = Int
+
+entity Wide(
+    val id: WideId,
+    val a: String,
+    val b: String,
+    val c: Int,
+    val d: Money,
+    val e: Boolean,
+    val f: Double,
+    val g: Date,
+    val h: Pontos?
+)
+
+sealed class Grande {
+    data class Cheio(
+        val s1: String, val s2: String, val s3: String, val s4: String,
+        val s5: String, val s6: String, val s7: String, val s8: String,
+        val s9: String, val s10: String, val s11: String, val s12: String
+    )
+    data object Vazio
+}
+
+fun admin(s: String): Boolean = s == "admin" || "root" == s || s != "guest" && s < "m"
+
+fun nulo(x: Int?): Boolean = x == null || null != x
+
+fun presente(x: Int?): Boolean = when (x) {
+    null -> false
+    _ -> true
+}
+
+fun constantes(): Double = 3.14 + 2.718281828 + 1.4142 + 6.283185307 + 1e-400
+
+fun flutua(): Float = 3.14f
+
+fun usaOpcional(d: Double?, b: Boolean?): Boolean = d == null && b == null
+
+fun passaOpcional(d: Double?, b: Boolean?): Boolean {
+    val e = d
+    val c = b
+    return usaOpcional(e, c) && usaOpcional(e, c)
+}
+
+fun impossivel(d: Double): Boolean = d > 1.0 && d < 0.0
+
+fun vazio(s: String): String = s + ""
+
+fun tamanho(g: Grande): Int = when (g) {
+    Grande.Cheio(s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12) -> 12
+    Grande.Vazio -> 0
+}
+
+fun sete(a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int): Int = a + b + c + d + e + f + g
+
+server fun largo(
+    a: String, b: String, c: Int, d: Money, e: Boolean, f: Double, g: Date, h: Pontos?,
+    x: Int?, y: Double?, z: Boolean?
+): Wide effects [db.read, db.write] {
+    val checks = admin(a) && nulo(x) && presente(x) && passaOpcional(y, z) && impossivel(f) && flutua() > 3.0f
+    val total = sete(c, c, c, c, c, c, c) + tamanho(Grande.Vazio)
+    val w = db.wide.insert {
+        a = vazio(a)
+        b = b
+        c = total
+        d = d
+        e = checks
+        f = constantes() + f
+        g = g
+        h = h
+    }
+    return db.wide.require(w.id)
+}

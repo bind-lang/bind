@@ -6,8 +6,8 @@
 //! front end (lexer, parser, type checker, lowering, IR validation). Each function is evaluated
 //! by `core::eval`; all of them are rendered into one crate (`target/bind-differential/`) whose
 //! `main` runs each `bind_p<i>(Ctx::pure())` on a tokio runtime with 64 MiB worker stacks and
-//! prints `p<i>=<render>` in the canonical form of `Value::render`. The two outputs must agree
-//! line by line.
+//! prints `p<i>=<render>` in the canonical form of `Value::render`. The crate must pass
+//! `cargo clippy -- -D warnings`, and the two outputs must agree line by line.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1309,6 +1309,19 @@ fn differential_evaluator_vs_generated_rust() {
     )
     .unwrap();
     fs::write(crate_dir.join("src/main.rs"), main_rs(&programs)).unwrap();
+    // Certified servers must pass `clippy -D warnings`: so must this crate of random programs.
+    super::tests::cargo(
+        &crate_dir,
+        &[
+            "clippy",
+            "--quiet",
+            "--release",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    );
     let stdout = super::tests::cargo(&crate_dir, &["run", "--quiet", "--release"]);
     let actual: Vec<&str> = stdout.lines().collect();
 

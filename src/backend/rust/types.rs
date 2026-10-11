@@ -301,10 +301,19 @@ impl<'p> Layout<'p> {
         }
     }
 
+    /// Whether the representation of `ty` is `Copy`: a `Copy` scalar or an optional one.
     pub fn is_copy(&self, ty: &Type) -> bool {
-        matches!(ty, Type::Con(name, args) if args.is_empty()
-            && COPY_SCALARS.contains(&name.as_str())
-            && !self.user_types.contains(name.as_str()))
+        match ty {
+            Type::Con(name, args) if name == "Option" && !self.user_types.contains("Option") => {
+                matches!(args.as_slice(), [inner] if self.is_copy(inner))
+            }
+            Type::Con(name, args) => {
+                args.is_empty()
+                    && COPY_SCALARS.contains(&name.as_str())
+                    && !self.user_types.contains(name.as_str())
+            }
+            _ => false,
+        }
     }
 
     /// The Rust type of `ty`; `generics` names the type variables of the current function.

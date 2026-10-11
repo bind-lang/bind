@@ -7,26 +7,12 @@
     // Bind names are emitted verbatim (`bind_getX`, user type and field names).
     non_snake_case,
     non_camel_case_types,
-    // Every `val` becomes a `let` and every `when` arm binds its variables, whatever their type
-    // or use.
-    clippy::let_and_return,
-    clippy::let_unit_value,
-    clippy::match_single_binding,
-    // Function types are spelled out in full (`Arc<dyn Fn(Ctx, A) -> BoxFuture<…> + …>`), so a
-    // function returning a function has a long type.
-    clippy::type_complexity,
-    // The generated code mirrors the logic of the Bind source; lints about that logic (`x == x`,
-    // `if (c) true else false`, identical branches, a `val` bound to a `return`, …) are the Bind
-    // programmer's concern.
-    clippy::bool_comparison,
-    // A `when` arm `"" ->` is a comparison with the empty string.
-    clippy::comparison_to_empty,
-    clippy::diverging_sub_expression,
-    clippy::double_comparisons,
-    clippy::eq_op,
-    clippy::if_same_then_else,
-    clippy::needless_bool,
-    clippy::neg_cmp_op_on_partial_ord,
+    // Clippy's default lints judge the code's logic and shape, and generated code mirrors the Bind
+    // program: its comparisons (`x == x`, `d > 1.0 && d < 0.0`), literals (`3.14`), `when`s,
+    // parameter counts, type sizes and `val`s are the Bind programmer's to write. Every `val`
+    // becomes a `let`, every `when` arm binds its variables and function types are spelled out
+    // in full, whatever their use.
+    clippy::all,
 )]
 
 pub fn bind_classifica(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::string::String> {
