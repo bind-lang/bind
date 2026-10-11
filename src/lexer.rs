@@ -5,7 +5,11 @@ use crate::diagnostic::{Diagnostic, Span};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
     Identifier,
+    /// A string literal; `text` is its value (escapes decoded).
     String,
+    /// A string literal with a template (`$name` or `${…}`, not an escaped `\$`); `text` is
+    /// as for `String`. Bind rejects templates (E7001).
+    TemplateString,
     Character,
     Number,
     Symbol,
@@ -26,6 +30,34 @@ pub struct Token {
 /// spellings follow KotlinLexer.g4; comments and whitespace use Kotlin's hidden channel behavior.
 pub fn lex(file: &str, source: &str) -> (Vec<Token>, Vec<Diagnostic>) {
     Lexer::new(file, source).run()
+}
+
+fn string_kind(template: bool) -> TokenKind {
+    if template {
+        TokenKind::TemplateString
+    } else {
+        TokenKind::String
+    }
+}
+
+/// Whether the source of a string literal contains a template: `$` followed by `{`, `_` or a
+/// letter. In a line string (`escapes`) a `\$` is a literal dollar sign and an escape is
+/// skipped as a whole, so in `"\\$x"` the `$` is a template again; a raw string has no escapes.
+fn has_template(source: &[char], escapes: bool) -> bool {
+    let mut index = 0;
+    while index < source.len() {
+        match source[index] {
+            '\\' if escapes => index += 2,
+            '$' if source
+                .get(index + 1)
+                .is_some_and(|next| *next == '{' || *next == '_' || next.is_alphabetic()) =>
+            {
+                return true;
+            }
+            _ => index += 1,
+        }
+    }
+    false
 }
 
 struct Lexer<'a> {
@@ -244,7 +276,9 @@ impl<'a> Lexer<'a> {
 
     fn scan_line_string(&mut self) {
         let span = self.span();
+        let start = self.index;
         let (text, closed) = self.line_string_value();
+        let template = has_template(&self.chars[start..self.index], true);
         if !closed {
             self.diagnostics.push(Diagnostic::error(
                 "E1002",
@@ -253,7 +287,7 @@ impl<'a> Lexer<'a> {
             ));
         }
         self.tokens.push(Token {
-            kind: TokenKind::String,
+            kind: string_kind(template),
             text,
             span,
         });
@@ -305,6 +339,7 @@ impl<'a> Lexer<'a> {
 
     fn scan_multiline_string(&mut self) {
         let span = self.span();
+        let start = self.index;
         self.advance_count(3);
         let mut text = String::new();
         let mut closed = false;
@@ -342,8 +377,10 @@ impl<'a> Lexer<'a> {
                 span.clone(),
             ));
         }
+        // A raw string has no escapes: every `$name` or `${` in it is a template.
+        let template = has_template(&self.chars[start..self.index], false);
         self.tokens.push(Token {
-            kind: TokenKind::String,
+            kind: string_kind(template),
             text,
             span,
         });
@@ -843,9 +880,43 @@ text ${map["key"]}""""#;
         assert_eq!(
             tokens
                 .iter()
-                .filter(|token| token.kind == TokenKind::String)
+                .filter(|token| token.kind == TokenKind::TemplateString)
                 .count(),
             2
+        );
+    }
+
+    #[test]
+    fn an_escaped_dollar_is_not_a_template() {
+        let kinds = |source: &str| -> Vec<(TokenKind, String)> {
+            let (tokens, diagnostics) = lex("dollar.bd", source);
+            assert!(diagnostics.is_empty(), "{diagnostics:?}");
+            tokens
+                .into_iter()
+                .filter(|token| token.kind != TokenKind::Eof)
+                .map(|token| (token.kind, token.text))
+                .collect()
+        };
+        assert_eq!(
+            kinds(r#""\$nome" "a\${b}" "$" "$1""#),
+            vec![
+                (TokenKind::String, "$nome".to_string()),
+                (TokenKind::String, "a${b}".to_string()),
+                (TokenKind::String, "$".to_string()),
+                (TokenKind::String, "$1".to_string()),
+            ]
+        );
+        assert_eq!(
+            kinds(r#""\\$x" "$_y""#),
+            vec![
+                (TokenKind::TemplateString, "\\$x".to_string()),
+                (TokenKind::TemplateString, "$_y".to_string()),
+            ]
+        );
+        // A raw string has no escapes.
+        assert_eq!(
+            kinds(r#""""\$x""""#),
+            vec![(TokenKind::TemplateString, "\\$x".to_string())]
         );
     }
 

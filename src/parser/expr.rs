@@ -131,6 +131,12 @@ impl ExprParser {
         &self.tokens[(self.index + offset).min(self.tokens.len() - 1)]
     }
 
+    /// Whether the token `offset` ahead is the symbol `text` (never a string literal).
+    fn symbol_at(&self, offset: usize, text: &str) -> bool {
+        let token = self.peek_at(offset);
+        token.kind == TokenKind::Symbol && token.text == text
+    }
+
     fn at_end(&self) -> bool {
         self.peek().kind == TokenKind::Eof
     }
@@ -176,6 +182,7 @@ impl ExprParser {
         let (a, b) = (self.peek(), self.peek_at(1));
         a.kind == TokenKind::Symbol
             && a.text == first
+            && b.kind == TokenKind::Symbol
             && b.text == second
             && b.span.line == a.span.line
             && b.span.column == a.span.column + a.text.chars().count()
@@ -513,9 +520,9 @@ impl ExprParser {
                     }
                 }
             }
-            TokenKind::String => {
+            TokenKind::String | TokenKind::TemplateString => {
                 self.advance();
-                if has_interpolation(&token.text) {
+                if token.kind == TokenKind::TemplateString {
                     self.removed("interpolation", token.span.clone());
                 }
                 Some(self.node(ExprKind::Str(token.text), token.span))
@@ -695,17 +702,17 @@ impl ExprParser {
     /// `{ x, y -> ... }` or `{ -> ... }`.
     fn looks_like_lambda(&self) -> bool {
         let mut offset = 1;
-        if self.peek_at(offset).text == "->" {
+        if self.symbol_at(offset, "->") {
             return true;
         }
         loop {
             if self.peek_at(offset).kind != TokenKind::Identifier {
                 return false;
             }
-            match self.peek_at(offset + 1).text.as_str() {
-                "," => offset += 2,
-                "->" => return true,
-                _ => return false,
+            if self.symbol_at(offset + 1, ",") {
+                offset += 2;
+            } else {
+                return self.symbol_at(offset + 1, "->");
             }
         }
     }
@@ -751,7 +758,7 @@ impl ExprParser {
     }
 
     fn looks_like_builder(&self) -> bool {
-        self.peek_at(1).kind == TokenKind::Identifier && self.peek_at(2).text == "="
+        self.peek_at(1).kind == TokenKind::Identifier && self.symbol_at(2, "=")
     }
 
     fn builder_fields(&mut self) -> Option<Vec<FieldInit>> {
@@ -907,9 +914,9 @@ impl ExprParser {
                 self.advance();
                 Some(self.number_pattern(&token, ""))
             }
-            TokenKind::String => {
+            TokenKind::String | TokenKind::TemplateString => {
                 self.advance();
-                if has_interpolation(&token.text) {
+                if token.kind == TokenKind::TemplateString {
                     self.removed("interpolation", token.span.clone());
                 }
                 Some(Pattern::Str(token.text, token.span))
@@ -980,7 +987,7 @@ impl ExprParser {
 
     /// `! [db.read, e]` after a function type, or nothing.
     fn effect_list(&mut self) -> Option<Vec<String>> {
-        if !(self.is("!") && self.peek_at(1).text == "[") {
+        if !(self.is("!") && self.symbol_at(1, "[")) {
             return Some(Vec::new());
         }
         self.advance();
@@ -1055,17 +1062,9 @@ impl ExprParser {
 fn describe(token: &Token) -> String {
     match token.kind {
         TokenKind::Eof => "end of input".into(),
-        TokenKind::String => "a string".into(),
+        TokenKind::String | TokenKind::TemplateString => "a string".into(),
         _ => format!("`{}`", token.text),
     }
-}
-
-/// `$name` or `${...}`; a `$` followed by anything else is a literal dollar sign.
-fn has_interpolation(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    chars
-        .windows(2)
-        .any(|pair| pair[0] == '$' && (pair[1] == '{' || pair[1] == '_' || pair[1].is_alphabetic()))
 }
 
 fn classify_number(text: &str) -> Result<NumberLiteral, &'static str> {

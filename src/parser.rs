@@ -65,7 +65,10 @@ impl Parser {
                 _ => {
                     self.diagnostics.push(Diagnostic::error(
                         "E1101",
-                        format!("Unexpected top-level declaration `{}`.", self.peek_text()),
+                        format!(
+                            "Unexpected top-level declaration `{}`.",
+                            self.peek_display()
+                        ),
                         self.peek().span.clone(),
                     ));
                     self.skip_declaration();
@@ -200,7 +203,7 @@ impl Parser {
                 "E1104",
                 format!(
                     "Expected a sealed variant (`data class` or `data object`), found `{}`.",
-                    self.peek_text()
+                    self.peek_display()
                 ),
                 self.peek().span.clone(),
             ));
@@ -529,7 +532,7 @@ impl Parser {
                     "E1103",
                     format!(
                         "Expected `]` to close the effect list, found `{}`.",
-                        self.peek_text()
+                        self.peek_display()
                     ),
                     self.peek().span.clone(),
                 ));
@@ -619,10 +622,10 @@ impl Parser {
         let mut output = Vec::new();
         while !self.at_eof() && depth > 0 {
             let token = self.advance().clone();
-            if token.text == "{" {
+            if structural_text(&token) == "{" {
                 depth += 1;
             }
-            if token.text == "}" {
+            if structural_text(&token) == "}" {
                 depth -= 1;
             }
             if depth > 0 {
@@ -661,7 +664,7 @@ impl Parser {
         } else {
             self.diagnostics.push(Diagnostic::error(
                 "E1102",
-                format!("Expected identifier, found `{}`.", self.peek_text()),
+                format!("Expected identifier, found `{}`.", self.peek_display()),
                 self.peek().span.clone(),
             ));
             None
@@ -674,7 +677,7 @@ impl Parser {
         } else {
             self.diagnostics.push(Diagnostic::error(
                 "E1103",
-                format!("Expected `{text}`, found `{}`.", self.peek_text()),
+                format!("Expected `{text}`, found `{}`.", self.peek_display()),
                 self.peek().span.clone(),
             ));
             None
@@ -692,13 +695,19 @@ impl Parser {
     fn peek(&self) -> &Token {
         &self.tokens[self.index.min(self.tokens.len() - 1)]
     }
+    /// The text of the next token when it is a keyword, name, symbol or number; `""` for a
+    /// string or character literal, so a literal `"{"` or `"fun"` is never taken for syntax.
     fn peek_text(&self) -> &str {
+        structural_text(self.peek())
+    }
+    /// The next token as written in a message.
+    fn peek_display(&self) -> &str {
         &self.peek().text
     }
     fn peek_n(&self, n: usize) -> &str {
         self.tokens
             .get(self.index + n)
-            .map(|t| t.text.as_str())
+            .map(structural_text)
             .unwrap_or("")
     }
     fn advance(&mut self) -> &Token {
@@ -770,6 +779,14 @@ fn with_eof(mut tokens: Vec<Token>) -> Vec<Token> {
     tokens
 }
 
+/// A token's text if it can be syntax (keyword, name, symbol, number), else `""`.
+fn structural_text(token: &Token) -> &str {
+    match token.kind {
+        TokenKind::Identifier | TokenKind::Symbol | TokenKind::Number => &token.text,
+        TokenKind::String | TokenKind::TemplateString | TokenKind::Character | TokenKind::Eof => "",
+    }
+}
+
 fn is_top_level_start(text: &str) -> bool {
     [
         "package",
@@ -802,6 +819,32 @@ mod tests {
         let (program, diagnostics) = parse(tokens);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         program
+    }
+
+    /// String literals that spell syntax (`"{"`, `"}"`, `"fun"`, `"->"`, `":"`) are never
+    /// taken for it (found by the differential test: a `"{"` in a block body unbalanced it).
+    #[test]
+    fn string_literals_are_not_syntax() {
+        let program = parse_source(
+            "fun f(s: String): String {\n    val a = when (s) {\n        \"{\" -> \"a\"\n        _ -> \"b\"\n    }\n    a\n}\nfun g(b: Boolean): String = if (b) \"a\" else\n    \"fun\"\n",
+        );
+        let names: Vec<&str> = program.functions.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["f", "g"]);
+        // `?` followed by the string `":"` is not `?:`; `{ "->" }` is a block, not a lambda.
+        for (source, message) in [
+            ("fun h(x: String?): String = x ?\":\"\n", "before `?`"),
+            (
+                "fun k() = map(listOf(1), { \"->\" })\n",
+                "A block cannot be used",
+            ),
+        ] {
+            let (tokens, _) = lex("test.bd", source);
+            let (_, diagnostics) = parse(tokens);
+            assert!(
+                diagnostics.iter().any(|d| d.message.contains(message)),
+                "{source}: {diagnostics:?}"
+            );
+        }
     }
 
     #[test]
