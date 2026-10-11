@@ -913,7 +913,17 @@ mod tests {
     fn ui_renders_as_html() {
         assert_eq!(
             rendered("fun f() = UI { Div { Text(1 + 1) } }", vec![]),
-            "<div class=\"bind-site\"><div>2</div></div>"
+            "<div>2</div>"
+        );
+        // A `UI` from a helper is a fragment: nesting it adds no wrapper.
+        let nested = r#"
+            fun card(t: String) = UI { Span("card") { Text(t) }; Text("!") }
+            fun f() = UI { Div("outer") { card("a"); card("b") }; Rule() }
+        "#;
+        assert_eq!(
+            rendered(nested, vec![]),
+            "<div class=\"outer\"><span class=\"card\">a</span>!<span class=\"card\">b</span>!\
+             </div><hr>"
         );
         let source = r#"
             fun f(name: String, ok: Boolean, x: Double, y: Float) = UI {
@@ -936,10 +946,10 @@ mod tests {
         ];
         assert_eq!(
             rendered(source, args),
-            "<div class=\"bind-site\"><section class=\"hero\" id=\"top\">\
+            "<section class=\"hero\" id=\"top\">\
              <h2 class=\"title\">Hi A &amp; B</h2>true1e+210.10000000149011612&lt;yes&gt;\
              <a href=\"https://x\" class=\"c\" target=\"_blank\" rel=\"noopener noreferrer\">\
-             10000000000000000000000</a></section></div>"
+             10000000000000000000000</a></section>"
         );
     }
 
