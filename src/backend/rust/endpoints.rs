@@ -22,7 +22,7 @@ pub fn input_names(endpoints: &[&CoreFunction], layout: &Layout) -> BTreeMap<Str
     taken.extend(["HttpResult".to_string()]);
     let mut names = BTreeMap::new();
     for endpoint in endpoints {
-        let mut name = format!("{}Input", pascal_case(&endpoint.name));
+        let mut name = format!("{}Input", crate::certified::pascal_case(&endpoint.name));
         while taken.contains(&name) {
             name.push('_');
         }
@@ -187,12 +187,4 @@ assert_eq!(malformed.status, 400);
 }}
 "
     )
-}
-
-fn pascal_case(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
-        None => String::new(),
-    }
 }

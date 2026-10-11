@@ -11,6 +11,8 @@ pub mod expr;
 pub mod types;
 
 #[cfg(test)]
+mod differential;
+#[cfg(test)]
 mod transactions;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -798,5 +800,3 @@ fn deep_recursion_reaches_the_limit_without_overflow() {
 }
 "##;
 }
-#[cfg(test)]
-mod differential;

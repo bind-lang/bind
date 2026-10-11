@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::certified;
 use crate::compiler::{ir_json, verify};
@@ -257,6 +257,3 @@ Options:
 "#
     );
 }
-
-#[allow(dead_code)]
-fn _path(_: &Path) {}

@@ -39,7 +39,6 @@ pub enum Resolution {
     Variant(String),
 }
 
-#[allow(dead_code)] // Consumed by subprojects 2 and 3 (typed IR for verification and code generation).
 #[derive(Clone, Debug, Default)]
 pub struct TypedProgram {
     /// Rendered type scheme of each function, e.g. `('a) -> 'a`.

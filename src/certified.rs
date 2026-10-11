@@ -23,7 +23,6 @@ const NUM_BIGINT: &str = "0.4.6";
 const BIGDECIMAL: &str = "0.4.8";
 const RUST_DECIMAL: &str = "1.37.2";
 const CHRONO: &str = "0.4.41";
-const FUTURES: &str = "0.3.31";
 /// The runtime of the generated server, written to its `src/bind_runtime.rs`.
 const RUNTIME_SOURCE: &str = include_str!("../runtime/bind-runtime/src/lib.rs");
 const LAMBDA_HTTP: &str = "1.3.1";
@@ -202,7 +201,7 @@ pub fn workspace_lock(config: &ProjectConfig) -> String {
 /// The `[dependencies]` table of `bind.lock` and the target locks: every pinned version.
 fn locked_dependencies() -> String {
     format!(
-        "[dependencies]\nserde = \"{SERDE}\"\nserdeJson = \"{SERDE_JSON}\"\ntokio = \"{TOKIO}\"\nuuid = \"{UUID}\"\nsqlx = \"{SQLX}\"\nnumBigint = \"{NUM_BIGINT}\"\nbigdecimal = \"{BIGDECIMAL}\"\nrustDecimal = \"{RUST_DECIMAL}\"\nchrono = \"{CHRONO}\"\nfutures = \"{FUTURES}\"\nlambdaHttp = \"{LAMBDA_HTTP}\"\nvercelRuntime = \"{VERCEL_RUNTIME}\"\nhttpBodyUtil = \"{HTTP_BODY_UTIL}\"\n"
+        "[dependencies]\nserde = \"{SERDE}\"\nserdeJson = \"{SERDE_JSON}\"\ntokio = \"{TOKIO}\"\nuuid = \"{UUID}\"\nsqlx = \"{SQLX}\"\nnumBigint = \"{NUM_BIGINT}\"\nbigdecimal = \"{BIGDECIMAL}\"\nrustDecimal = \"{RUST_DECIMAL}\"\nchrono = \"{CHRONO}\"\nlambdaHttp = \"{LAMBDA_HTTP}\"\nvercelRuntime = \"{VERCEL_RUNTIME}\"\nhttpBodyUtil = \"{HTTP_BODY_UTIL}\"\n"
     )
 }
 
@@ -211,7 +210,7 @@ fn locked_dependencies() -> String {
 /// `Arc<Vec<T>>`) and `uuid` with `serde` (generated types hold `Uuid`s).
 pub(crate) fn server_dependencies() -> String {
     format!(
-        "serde = {{ version = \"={SERDE}\", features = [\"derive\", \"rc\"] }}\nserde_json = \"={SERDE_JSON}\"\ntokio = {{ version = \"={TOKIO}\", features = [\"rt-multi-thread\", \"macros\", \"sync\"] }}\nsqlx = {{ version = \"={SQLX}\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"uuid\", \"chrono\", \"bigdecimal\", \"rust_decimal\"] }}\nuuid = {{ version = \"={UUID}\", features = [\"serde\"] }}\nnum-bigint = \"={NUM_BIGINT}\"\nbigdecimal = \"={BIGDECIMAL}\"\nrust_decimal = {{ version = \"={RUST_DECIMAL}\", features = [\"serde-str\"] }}\nchrono = {{ version = \"={CHRONO}\", features = [\"serde\"] }}\nfutures = \"={FUTURES}\"\n"
+        "serde = {{ version = \"={SERDE}\", features = [\"derive\", \"rc\"] }}\nserde_json = \"={SERDE_JSON}\"\ntokio = {{ version = \"={TOKIO}\", features = [\"rt-multi-thread\", \"macros\", \"sync\"] }}\nsqlx = {{ version = \"={SQLX}\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"uuid\", \"chrono\", \"bigdecimal\", \"rust_decimal\"] }}\nuuid = {{ version = \"={UUID}\", features = [\"serde\"] }}\nnum-bigint = \"={NUM_BIGINT}\"\nbigdecimal = \"={BIGDECIMAL}\"\nrust_decimal = {{ version = \"={RUST_DECIMAL}\", features = [\"serde-str\"] }}\nchrono = {{ version = \"={CHRONO}\", features = [\"serde\"] }}\n"
     )
 }
 
@@ -1468,7 +1467,7 @@ fn snake_case(value: &str) -> String {
     output
 }
 
-fn pascal_case(value: &str) -> String {
+pub(crate) fn pascal_case(value: &str) -> String {
     let mut output = String::new();
     let mut upper = true;
     for ch in value.chars() {
