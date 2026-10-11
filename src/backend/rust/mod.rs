@@ -337,7 +337,7 @@ pub(super) fn children(expr: &Expr) -> Vec<&Expr> {
 /// Re-indents generated code (4 spaces per level). Of the brackets a line leaves open, only
 /// the last one opens a level, so `f(async move {` indents its body once. The generator never
 /// emits raw newlines inside string literals, so the line structure is the code's.
-pub(super) fn indent(code: &str) -> String {
+pub(crate) fn indent(code: &str) -> String {
     // Open brackets, innermost last: whether each one opened an indentation level.
     let mut open: Vec<bool> = Vec::new();
     let mut output = String::new();
@@ -417,6 +417,12 @@ pub(crate) mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "bd"))
+            // `web_*` cases are client code: the JS backend's snapshots (`backend::js`).
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("web_"))
+            })
             .collect();
         cases.sort();
         assert!(!cases.is_empty(), "no codegen cases");

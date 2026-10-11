@@ -14,7 +14,9 @@
 //   ({some: v} only when T is itself optional); records -> frozen null-prototype objects
 //   (record()); sealed/enum -> frozen {tag, ...fields} (variant()); Result -> variant("Ok" |
 //   "Err", [["value", v]]); List<T> -> frozen array; Decimal/Money -> Decimal; functions ->
-//   async (ctx, ...args) => ...
+//   async (ctx, ...args) => ...; Unit -> undefined; Long -> BigInt; distinct -> the underlying
+//   value. Generated code stores record and variant fields under escaped property names
+//   (`u_<name>`), so no field meets `tag`, `some` or an Object.prototype name.
 
 /** Maximum nesting of Bind function / lambda entries before RecursionLimit (as in Rust). */
 export const MAX_DEPTH = 10000;
@@ -107,6 +109,7 @@ export function intRem(a, b) {
 
 const MANTISSA_LIMIT = 1n << 96n; // mantissa < 2^96
 const MAX_SCALE = 28;
+const MAX_MANTISSA_DIGITS = 29;
 const CANONICAL_DECIMAL = /^(-?)(0|[1-9][0-9]*)(?:\.([0-9]+))?$/;
 const POW10 = [];
 for (let i = 0n, p = 1n; i <= 58n; i++, p *= 10n) POW10.push(p);
@@ -151,6 +154,9 @@ export class Decimal {
     if (match === null) return null;
     const fraction = match[3] ?? "";
     if (fraction.length > MAX_SCALE) return null;
+    // 2^96 has 29 digits: longer digit strings never fit, so they are rejected before BigInt
+    // (a 100000-digit input must not cost a 100000-digit conversion).
+    if (match[2].length + fraction.length > MAX_MANTISSA_DIGITS) return null;
     const mantissa = BigInt(match[2] + fraction);
     if (mantissa >= MANTISSA_LIMIT) return null;
     return new Decimal(match[1] === "-" && mantissa !== 0n, mantissa, fraction.length);
@@ -338,8 +344,16 @@ export function listFrom(array) {
   return Object.freeze(Array.from(array));
 }
 
+/**
+ * `Some(value)` of an optional type whose inner type is itself optional: {some: value}, so
+ * `Some(null)` stays distinct from `null`. (Other optional values are the value itself.)
+ */
+export function some(value) {
+  return Object.freeze({ some: value });
+}
+
 function optional(value, nested) {
-  return nested ? Object.freeze({ some: value }) : value;
+  return nested ? some(value) : value;
 }
 
 /**
@@ -433,9 +447,38 @@ export function decodeDouble(json) {
   return typeof json === "number" ? json : fail("a number");
 }
 
-/** Float: a number that is exactly an f32. */
+/**
+ * Float: a number, rounded to the nearest f32. The server writes an f32 with its shortest
+ * f32 digits (serde_json: `0.1`), which as a JS number is not an f32; serde_json reads a
+ * number as f64 and casts it to f32, which is exactly this rounding.
+ */
 export function decodeFloat(json) {
-  return typeof json === "number" && Math.fround(json) === json ? json : fail("an f32 number");
+  return typeof json === "number" ? Math.fround(json) : fail("a number");
+}
+
+/** Unit: null (serde's `()`); the value is `undefined`. */
+export function decodeUnit(json) {
+  return json === null ? undefined : fail("null");
+}
+
+/** Long: a JSON integer (serde's i64) that a JS number holds exactly; the value is a BigInt. */
+export function decodeLong(json) {
+  return Number.isSafeInteger(json) ? BigInt(json) : fail("a safe integer");
+}
+
+/** The JSON number of a Long (a BigInt); TypeError when it is beyond 2^53 - 1 in magnitude. */
+export function encodeLong(n) {
+  const value = Number(n);
+  if (!Number.isSafeInteger(value)) throw new TypeError("Long beyond the exact range of JSON numbers");
+  return value;
+}
+
+/** A pair [k, v] (an entry of a Map, serde's tuple form); gives a frozen two-element array. */
+export function decodePair(key, value) {
+  return (json) => {
+    if (!Array.isArray(json) || json.length !== 2) fail("a pair");
+    return Object.freeze([key(json[0]), value(json[1])]);
+  };
 }
 
 /** T?: null, or the inner decoder's value. */
@@ -455,8 +498,9 @@ export function decodeList(item) {
   };
 }
 
+/** [wireName, decoder, property?] entries -> Map(wireName -> {decoder, property}). */
 function fieldMap(fields) {
-  return new Map(fields);
+  return new Map(fields.map(([wire, decoder, property]) => [wire, { decoder, property: property ?? wire }]));
 }
 
 function decodeFields(fields, json, prefix) {
@@ -465,18 +509,20 @@ function decodeFields(fields, json, prefix) {
     if (!fields.has(key)) fail(`no field ${JSON.stringify(key)}`);
   }
   const entries = [...prefix];
-  for (const [name, decoder] of fields) {
-    if (Object.hasOwn(json, name)) entries.push([name, decoder(json[name])]);
-    else if (decoder.optional === true) entries.push([name, null]);
+  for (const [name, { decoder, property }] of fields) {
+    if (Object.hasOwn(json, name)) entries.push([property, decoder(json[name])]);
+    else if (decoder.optional === true) entries.push([property, null]);
     else fail(`field ${JSON.stringify(name)}`);
   }
   return record(entries);
 }
 
 /**
- * A record decoder from [name, decoder] pairs: the JSON must be an object with exactly these
- * fields (unknown fields rejected; a missing field is null when its decoder is optional);
- * gives record(...) with the fields in the given order.
+ * A record decoder from [name, decoder] or [name, decoder, property] entries: the JSON must be
+ * an object with exactly these fields (unknown fields rejected; a missing field is null when
+ * its decoder is optional); gives record(...) with the fields in the given order, each under
+ * `property` (default: the JSON name). Generated code passes escaped property names
+ * (`u_<name>`, see bindc's backend::js::names) so a field can never meet `tag`.
  */
 export function decodeRecord(fields) {
   const map = fieldMap(fields);
@@ -485,8 +531,8 @@ export function decodeRecord(fields) {
 
 /**
  * A sum type decoder in serde's externally tagged form: cases are [wireName, tag, fields],
- * `fields` null for a unit variant (JSON: the string wireName) or [name, decoder] pairs
- * (JSON: {wireName: {fields}}). Gives variant(tag, fields).
+ * `fields` null for a unit variant (JSON: the string wireName) or field entries as in
+ * decodeRecord (JSON: {wireName: {fields}}). Gives variant(tag, fields).
  */
 export function decodeVariant(cases) {
   const byName = new Map(cases.map(([wire, tag, fields]) => [wire, { tag, fields: fields === null ? null : fieldMap(fields) }]));
@@ -533,13 +579,16 @@ function requestFailed() {
  * decode failure gives BindError("Remote", TEXTS.requestFailed). Not counted by `enter`.
  */
 export async function rpc(ctx, url, body, decode) {
+  // Outside the try: a body that cannot be serialized (a BigInt left by a compiler bug) is a
+  // TypeError, an internal error, never a Remote one.
+  const payload = JSON.stringify(body);
   let text;
   let response;
   try {
     response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify(body),
+      body: payload,
     });
     text = await response.text();
   } catch {
@@ -749,8 +798,9 @@ export function pageHtml(title, stylesheet, body) {
 /**
  * Rust's error_body as a UI tree: { status, tree } where tree renders to
  * `<main class="bind-error"><h1>title</h1><p>public message</p></main>`. `kind` is an
- * AppError kind: "BadRequest" (message shown), "NotFound", "Internal", "Overflow",
- * "RecursionLimit" (fixed public messages, the given message is never shown).
+ * AppError kind: "BadRequest" (message shown), "NotFound", "Database", "Serialization",
+ * "Overflow", "RecursionLimit", "Internal" (fixed public messages, as AppError's
+ * public_message; the given message is never shown). Any other kind is shown as "Internal".
  */
 export function errorBody(kind, message) {
   let status = 500;
@@ -763,6 +813,12 @@ export function errorBody(kind, message) {
     case "NotFound":
       status = 404;
       publicMessage = "not found";
+      break;
+    case "Database":
+      publicMessage = "database error";
+      break;
+    case "Serialization":
+      publicMessage = "serialization error";
       break;
     case "Overflow":
       publicMessage = "numeric overflow";

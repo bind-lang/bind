@@ -109,6 +109,14 @@ test("Decimal.parse agrees with rust_decimal and is strict", () => {
     eq(rt.Decimal.parse(text), null, `strict: ${JSON.stringify(text)}`);
   }
   eq(rt.Decimal.parse("-0").toString(), "0", "rust_decimal parses -0 as 0");
+  // More than 29 digits never fit in 96 bits: rejected before any BigInt conversion.
+  eq(rt.Decimal.parse("100000000000000000000000000000"), null, "30 digits");
+  eq(rt.Decimal.parse("0.0000000000000000000000000001").toString(), "0.0000000000000000000000000001", "29 digits");
+  eq(rt.Decimal.parse("79228162514264337593543950335").toString(), "79228162514264337593543950335", "2^96 - 1");
+  const started = Date.now();
+  eq(rt.Decimal.parse("9".repeat(1000000)), null, "a million digits");
+  eq(rt.Decimal.parse("1." + "0".repeat(1000000)), null, "a million decimals");
+  assert(Date.now() - started < 1000, "long inputs are rejected quickly");
   eq(rt.Decimal.parse(1), null, "not a string");
   assert(Object.isFrozen(rt.Decimal.parse("1.5")), "frozen");
 });
@@ -411,10 +419,54 @@ test("record / decodeRecord: no prototype pollution, frozen, strict", () => {
   throwsDecode(() => rt.decodeList(rt.decodeInt)(["1", 2]), "list item");
   eq(rt.decodeList(rt.decodeInt)(["1", "-2"])[1], -2n);
   assert(Object.isFrozen(rt.decodeList(rt.decodeInt)([])), "list frozen");
-  throwsDecode(() => rt.decodeFloat(0.1), "not an f32");
+  // serde_json writes an f32 with its shortest f32 digits ("0.1"): rounded, like serde's cast.
+  eq(rt.decodeFloat(0.1), Math.fround(0.1), "f32 digits round to the f32");
   eq(rt.decodeFloat(0.5), 0.5);
+  throwsDecode(() => rt.decodeFloat("0.5"), "float from string");
   eq(rt.decodeDouble(0.1), 0.1);
   throwsDecode(() => rt.decodeDouble("1"), "double from string");
+});
+
+test("decoders with property names; Unit, Long, pairs and some", () => {
+  const decode = rt.decodeRecord([
+    ["tag", rt.decodeString, "u_tag"],
+    ["__proto__", rt.decodeInt, "u_____proto____"],
+    ["n", rt.decodeOptional(rt.decodeInt), "u_n"],
+  ]);
+  const value = decode(JSON.parse('{"tag": "t", "__proto__": "1"}'));
+  eq(value.u_tag, "t");
+  eq(value.u_____proto____, 1n);
+  eq(value.u_n, null, "missing optional field");
+  eq(Object.keys(value).join(","), "u_tag,u_____proto____,u_n");
+  eq(Object.prototype.u_tag, undefined);
+  throwsDecode(() => decode({ u_tag: "t", __proto__: "1" }), "property names are not JSON names");
+  const shape = rt.decodeVariant([["box", "Box", [["tag", rt.decodeInt, "u_tag"]]]]);
+  const box = shape({ box: { tag: "2" } });
+  eq(box.tag, "Box", "the variant tag is not overwritten by a field named tag");
+  eq(box.u_tag, 2n);
+  eq(rt.decodeUnit(null), undefined);
+  throwsDecode(() => rt.decodeUnit(0), "unit");
+  eq(rt.decodeLong(-42), -42n);
+  throwsDecode(() => rt.decodeLong(1.5), "fractional long");
+  throwsDecode(() => rt.decodeLong(2 ** 53), "inexact long");
+  throwsDecode(() => rt.decodeLong("1"), "long from string");
+  eq(rt.encodeLong(-42n), -42);
+  let threw = false;
+  try {
+    rt.encodeLong(2n ** 53n);
+  } catch (error) {
+    threw = error instanceof TypeError;
+  }
+  assert(threw, "encodeLong beyond 2^53 - 1");
+  const pair = rt.decodePair(rt.decodeString, rt.decodeInt)(["a", "1"]);
+  eq(pair[0], "a");
+  eq(pair[1], 1n);
+  assert(Object.isFrozen(pair), "pair frozen");
+  throwsDecode(() => rt.decodePair(rt.decodeString, rt.decodeInt)(["a"]), "short pair");
+  const nested = rt.some(null);
+  eq(nested.some, null);
+  assert(Object.isFrozen(nested), "some frozen");
+  assert(rt.equals(rt.some(1n), rt.first([1n], true)), "some equals first(nested)");
 });
 
 test("decodeVariant and decodeResult follow serde's externally tagged form", () => {
@@ -466,6 +518,26 @@ test("rpc posts JSON and decodes the response", async () => {
   eq(seen.init.method, "POST");
   eq(seen.init.body, '{"a":"1"}');
   eq(seen.init.headers["content-type"], "application/json");
+});
+
+test("rpc: a body that cannot be serialized is a TypeError, not Remote", async () => {
+  let called = false;
+  await withFetch(
+    async () => {
+      called = true;
+      return new Response("1", { status: 200 });
+    },
+    async () => {
+      let error;
+      try {
+        await rt.rpc(rt.newCtx(), "/api/f", { a: 1n }, rt.decodeDouble);
+      } catch (caught) {
+        error = caught;
+      }
+      assert(error instanceof TypeError, `expected TypeError, got ${error}`);
+    },
+  );
+  assert(!called, "fetch not called");
 });
 
 test("rpc failures become BindError(Remote) (Review Focus 2)", async () => {

@@ -1,0 +1,36 @@
+// Lambdas, builtins as values and list builtins in the JS backend.
+fun f(xs: List<Int>) = fold(map(xs, { x -> x * 2 }), 0, { s, x -> s + x })
+
+fun soma(xs: List<Int>, k: Int) = map(xs, { x -> x + k })
+
+fun dobro(x: Int) = x * 2
+
+fun dobra(xs: List<Int>) = map(xs, dobro)
+
+fun tamanhos(xss: List<List<Int>>) = map(xss, length)
+
+fun aplica(g: (Int) -> Int, x: Int) = g(x)
+
+fun ignora(x: Int): (Int) -> Int = { y -> x }
+
+fun usaIgnora() = ignora(1)(2)
+
+fun primeiro(xs: List<Int?>): Int = when (first(xs)) {
+    null -> -1
+    v -> v ?: -2
+}
+
+fun talvez(x: Int?): List<Int?> = listOf(x, get(listOf(1), 0))
+
+fun indice(xs: List<Int>, i: Int) = get(xs, i) ?: -1
+
+client component Listas(n: Int) {
+    UI {
+        Text(f(listOf(n, 2, 3)))
+        Text(usaIgnora())
+        Text(primeiro(talvez(null)))
+        Text(indice(soma(dobra(listOf(1, 2)), n), 1))
+        Text(aplica(dobro, n))
+        Text(fold(tamanhos(listOf(listOf(1, 2), listOf(n))), 0, { s, x -> s + x }))
+    }
+}

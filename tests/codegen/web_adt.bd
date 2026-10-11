@@ -1,0 +1,74 @@
+// Recursive sealed classes, records, Result and `when` in the JS backend.
+sealed class Arvore {
+    data class No(val esq: Arvore, val valor: Int, val dir: Arvore)
+    data object Folha
+}
+
+data class Par(val tag: String, val valor: Int?)
+
+distinct type Codigo = Int
+
+fun soma(a: Arvore): Int = when (a) {
+    Folha -> 0
+    No(e, v, d) -> soma(e) + v + soma(d)
+}
+
+fun folhaUnica(a: Arvore): Boolean = when (a) {
+    No(Folha, _, Folha) -> true
+    _ -> false
+}
+
+fun rotulo(n: Int): String = when (n) {
+    0 -> "zero"
+    -1 -> "menos \"um\""
+    0x10 -> "dezesseis"
+    _ -> "outro"
+}
+
+fun valor(p: Par): Int = when (p) {
+    Par(_, null) -> 0
+    Par(t, v) -> (v ?: 0) + length(listOf(t))
+}
+
+fun aninhado(x: Int??): Int = when (x) {
+    null -> 0
+    n -> n ?: 1
+}
+
+fun codigo(c: Codigo): Int = when (c) {
+    Codigo(n) -> n
+}
+
+fun resultado(r: Result<Int, String>): Int = when (r) {
+    Ok(v) -> v
+    Err(e) -> 0
+}
+
+fun cedo(x: Int): Int {
+    val y = if (x == 0) return 7 else x
+    y + soma(No(Folha, x, Folha))
+}
+
+server fun arvore(n: Int): Arvore = No(Folha, n, Folha)
+
+server fun par(p: Par, c: Codigo): Result<Par, String> = Ok(p)
+
+client component Arvores(n: Int) {
+    val a = server.arvore(n)
+    val r = server.par(Par("t", null), Codigo(n))
+    UI {
+        Text(soma(a))
+        Text(resultado(Ok(n)))
+        Text(codigo(Codigo(n)))
+        Text(cedo(n))
+        Text(when (r) {
+            Ok(p) -> valor(p)
+            Err(e) -> 0
+        })
+        Text(folhaUnica(a))
+        Text(rotulo(n))
+        Text(rotulo(-1))
+        Text(rotulo(16))
+        Text(aninhado(null))
+    }
+}

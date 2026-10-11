@@ -1470,8 +1470,8 @@ fn wrap_lets(bound: Vec<(LocalId, Expr)>, body: Expr) -> Expr {
 
 /// The component and the functions it reaches through `Global` references, sorted by name.
 /// Empty when `component` is not a function of the program.
-// Consumed by the JavaScript frontend generator (a later task of subproject 3c).
-#[cfg_attr(not(test), expect(dead_code))]
+// Used by `backend::js::render_app` (the page generator calls it from a later task).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn client_functions(program: &CoreProgram, component: &str) -> Vec<String> {
     fn globals(expr: &Expr, output: &mut Vec<String>) {
         if let ExprKind::Global { name, .. } = &expr.kind {

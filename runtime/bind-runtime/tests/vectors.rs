@@ -93,6 +93,11 @@ fn page_vectors() {
                     "Internal" => AppError::Internal(message),
                     "Overflow" => AppError::Overflow(message),
                     "RecursionLimit" => AppError::RecursionLimit,
+                    // The message of these kinds is never shown: any inner error will do.
+                    "Database" => AppError::Database(sqlx::Error::RowNotFound),
+                    "Serialization" => AppError::Serialization(
+                        serde_json::from_str::<i32>(&message).unwrap_err(),
+                    ),
                     other => panic!("unknown error {other}"),
                 };
                 let (status, html) = error_body(&error);

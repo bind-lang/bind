@@ -1,0 +1,32 @@
+// Review Focus 5: field names `__proto__`, `constructor`, `toString`; functions and types
+// named like JS keywords, globals or runtime names.
+data class Perigo(val __proto__: String, val constructor: String, val toString: String)
+
+data class `class`(val `await`: Int)
+
+sealed class `Object` {
+    data object `default`
+    data class `enter`(val tag: Int, val ctx: Int)
+}
+
+fun `await`(x: Int): Int = x + 1
+
+fun `default`(o: `Object`): Int = when (o) {
+    `default` -> 0
+    `enter`(t, c) -> t + c
+}
+
+fun enter(c: `class`): Int = `await`(c.`await`)
+
+server fun perigo(x: Int): Perigo = Perigo("a", "b", "c")
+
+client component Nomes(x: Int) {
+    val p = server.perigo(x)
+    UI {
+        Text(p.__proto__)
+        Text(p.constructor)
+        Text(p.toString)
+        Text(enter(`class`(x)))
+        Text(`default`(`Object`.`enter`(1, 2)))
+    }
+}

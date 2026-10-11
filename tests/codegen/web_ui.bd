@@ -1,0 +1,36 @@
+// UI trees in the JS backend: `val` among children, `if`/`when`, `Text` of every displayable type.
+distinct type Nome = String
+
+sealed class Estado {
+    data object Vazio
+    data class Cheio(val n: Int)
+}
+
+fun cartao(t: String) = UI { Span("card") { Text(t) }; Text("!") }
+
+fun estado(e: Estado) = UI {
+    when (e) {
+        Vazio -> Text("vazio")
+        Cheio(n) -> Strong { Text(n) }
+    }
+}
+
+client component Pagina(nome: String, ok: Boolean, preco: Decimal, n: Int) {
+    UI {
+        Section("hero", "top") {
+            val saudacao = "Oi " + nome
+            Heading(2, "title") { Text(saudacao) }
+            Text(ok)
+            Text(n)
+            Text(preco)
+            Text(1.5)
+            Text(0.1f)
+            Text(Nome(nome))
+            Text("<script>alert(1)</script>")
+            if (ok) Text("<yes>") else Rule("sep")
+            cartao(nome)
+            estado(if (n > 0) Cheio(n) else Vazio)
+            Link("https://x", "c", "_blank") { Text(10000000000000000000000) }
+        }
+    }
+}
