@@ -190,7 +190,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     if !missing.is_empty() {
         diagnostics.push(Diagnostic::error("E8101", format!("Target `{target}` cannot implement this application.\n\nMissing capabilities:\n    {}", missing.join("\n    ")), Span::default()));
     }
-    // The frontend settings of the target (E8311), `client = "elm"` included.
+    // The frontend settings of the target (E8311).
     let frontend_target_problems = crate::backend::js::plan::target_problems(target, target_config);
     for problem in &frontend_target_problems {
         diagnostics.push(Diagnostic::error(
@@ -217,7 +217,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     let built_in_target = target_config.client == "web"
         && target_config.server == "rust"
         && matches!(target_config.deployment.as_str(), "aws-lambda" | "vercel");
-    if !built_in_target && target_config.client != "elm" {
+    if !built_in_target {
         diagnostics.push(Diagnostic::error("E8204", format!("No built-in generator can preserve the semantics of target `{target}` ({} + {}, deployment {}).", target_config.client, target_config.server, target_config.deployment), Span::default()));
     }
     if target_config.client == "web" {
@@ -1961,15 +1961,17 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
     }
 
     #[test]
-    fn the_elm_client_was_replaced_by_the_web_client() {
-        let target = "client = \"elm\"\nserver = \"rust\"\ndeployment = \"vercel\"\n";
+    fn an_unknown_client_has_no_built_in_generator() {
+        let target =
+            "client = \"native\"\nserver = \"rust\"\nmode = \"split\"\ndeployment = \"vercel\"\n";
         let (root, config) = web_fixture(PAGE, target);
         let result = verify(&config, "t");
-        assert_eq!(codes(&result), vec!["E8311"], "{:?}", result.diagnostics);
+        assert_eq!(codes(&result), vec!["E8204"], "{:?}", result.diagnostics);
         assert_eq!(
             result.diagnostics[0].message,
-            "Target `t` uses `client = \"elm\"`, which is no longer supported: write `client = \"web\"` and choose `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
+            "No built-in generator can preserve the semantics of target `t` (native + rust, deployment vercel)."
         );
+        assert!(result.application.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 

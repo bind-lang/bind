@@ -4,7 +4,7 @@ Profile identifier: `rust-web-v3`.
 
 > Nota: este perfil foi substituído pelo [v0.4](certified-profile-v0.4.md) (`rust-web-v4`, contrato `bind-json-v4`: análise tipada sobre a IR no lugar da análise por tokens, `sealed` com campos, genéricos, `Result`, `Set` e `Map` no fio, builtins de coleção e a restrição `Key`). Mantido como referência histórica.
 
-Este documento define a superfície finita para a qual `bind certify` emite uma atestação no perfil v3. O v3 substitui o v2 ([v0.2](certified-profile-v0.2.md)) no cliente: o cliente Elm foi removido e o frontend passa a ser HTML, CSS e JavaScript nativos, mais um renderizador SSR em Rust, ambos gerados da mesma IR tipada (`CoreProgram`) que já gerava o servidor. A pilha é única: Bind, HTML/CSS/JS e Rust. Semântica não suportada continua sendo erro de compilação; o compilador nunca a substitui por um comportamento mais fraco.
+Este documento define a superfície finita para a qual `bind certify` emite uma atestação no perfil v3. O v3 substitui o v2 no cliente: o frontend passa a ser HTML, CSS e JavaScript nativos, mais um renderizador SSR em Rust, ambos gerados da mesma IR tipada (`CoreProgram`) que já gerava o servidor. A pilha é única: Bind, HTML/CSS/JS e Rust. Semântica não suportada continua sendo erro de compilação; o compilador nunca a substitui por um comportamento mais fraco.
 
 ## Execution model
 
@@ -34,7 +34,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
 # frontend_origin = "https://app.exemplo.com" # exigido quando api_url é de outra origem, proibido caso contrário
 ```
 
-- `client = "web"` e `server = "rust"`. `client = "elm"` não existe mais: é recusado com E8311 e uma sugestão de correção (`client = "web"` mais `mode`).
+- `client = "web"` e `server = "rust"`; qualquer outra combinação não tem gerador embutido (E8204).
 - `mode` é obrigatório; a ausência dele é E8311.
 - `api_url`: o caminho deve ser exatamente `/api`, relativo (`/api`, o padrão) ou uma origem canônica seguida de `/api` (`https://host[:porta]/api`, sem barra final, consulta ou fragmento). O servidor gerado só responde em `/api/<endpoint>`; prefixos personalizados não são suportados.
 - `frontend_origin`: origem canônica (`http://` ou `https://`, host em minúsculas, porta não padrão opcional, sem caminho, credenciais ou barra final). Um host cujo último rótulo é numérico só é canônico como IPv4 decimal de quatro octetos 0..255 sem zeros à esquerda (`http://1` e `http://999.1.1.1` são recusados: o navegador os reescreveria ou rejeitaria); o mesmo vale para a origem de `api_url`. É obrigatória quando `api_url` aponta para outra origem e só é aceita nesse caso: com `mode = "ssr"` ou `api_url = "/api"` é E8311 (remova-a ou dê a `api_url` a URL absoluta do API).
@@ -94,9 +94,8 @@ Se o componente excede qualquer limite, falha ou usa algo que o avaliador não m
 | E7006 | literal `Double` ou `Float` fora do intervalo |
 | E9001 | erro interno: IR inconsistente |
 
-E8306 (limites do cliente Elm) foi removido. **E8311** cobre:
+**E8311** cobre:
 
-- `client = "elm"` (com a correção sugerida);
 - `mode` ausente;
 - `api_url` que não é `/api` nem origem canônica mais `/api`;
 - `api_url` de outra origem sem `frontend_origin`;
@@ -152,7 +151,7 @@ Só existe com `mode = "split"` e `api_url` de outra origem, cujo `frontend_orig
 7. Release compilation of every generated Rust entry point.
 8. SHA-256 hashes for sources, schema, manifests, locks, artifacts e do runtime JS enviado em `web/`.
 
-Não há etapa de Elm nem de npm: o Vercel serve `web/` como está. O `bind.lock` raiz registra `rust-web-v3`; projetos existentes veem o lock mudar ao regenerar.
+Não há etapa de build nem de npm: o Vercel serve `web/` como está. O `bind.lock` raiz registra `rust-web-v3`; projetos existentes veem o lock mudar ao regenerar.
 
 ## Meaning of certification
 
@@ -169,7 +168,3 @@ A certificação **não** garante:
 - autenticação: os endpoints gerados não têm nenhuma;
 - registro em log de erros de banco;
 - credenciais, alcance do banco, rede ou disponibilidade do provedor.
-
-## Migração de um projeto Elm
-
-No `bind.toml` do alvo, troque `client = "elm"` por `client = "web"`, adicione `mode = "ssr"` ou `mode = "split"` (obrigatório) e, se a API ficar em outra origem, `api_url` e `frontend_origin`. Regenere o diretório de deploy (`bind generate --target <alvo>`); `elm.json`, `package.json` e os artefatos do Elm desaparecem. No Vercel, o resultado é `web/` mais as funções Rust.

@@ -23,8 +23,6 @@ pub const ENVIRONMENT_PROBLEM: &str = "uses an `environment` value";
 /// Why a verified program or target has no web frontend (E8311).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontendProblem {
-    /// The removed Elm client.
-    ElmClient { target: String },
     /// A web target without `mode`.
     MissingMode { target: String },
     /// `api_url` is not `/api` nor a canonical origin followed by `/api`.
@@ -68,9 +66,6 @@ impl FrontendProblem {
     pub fn message(&self) -> String {
         let profile = crate::certified::profile_version();
         match self {
-            FrontendProblem::ElmClient { target } => format!(
-                "Target `{target}` uses `client = \"elm\"`, which is no longer supported: write `client = \"web\"` and choose `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
-            ),
             FrontendProblem::MissingMode { target } => format!(
                 "Target `{target}` must choose its mode: `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."
             ),
@@ -195,11 +190,6 @@ pub fn program_problems(core: &CoreProgram, ast: &Program, name: &str) -> Vec<Fr
 
 /// The problems of the target's settings alone (no program needed).
 pub fn target_problems(name: &str, target: &TargetConfig) -> Vec<FrontendProblem> {
-    if target.client == "elm" {
-        return vec![FrontendProblem::ElmClient {
-            target: name.to_string(),
-        }];
-    }
     let mut problems = Vec::new();
     match target.mode {
         None => problems.push(FrontendProblem::MissingMode {

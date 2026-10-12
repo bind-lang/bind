@@ -235,8 +235,8 @@ impl Drop for UiTree {
     }
 }
 
-/// The HTML of a UI value: the markup the former Elm client put in the DOM (pinned by
-/// `tests/codegen/website.html.expected`), serialized like `outerHTML` but with the escaping below. No whitespace or
+/// The HTML of a UI value: the markup the page puts in the DOM (pinned by the website page in
+/// `tests/codegen/website.index.html.expected`), serialized like `outerHTML` but with the escaping below. No whitespace or
 /// newline is added between nodes. The page shell (not this function) puts the component's
 /// HTML inside the single wrapper `<div class="bind-site">…</div>`.
 ///

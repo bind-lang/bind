@@ -8,7 +8,7 @@ Repository: <https://github.com/bind-lang/bind>
 
 ## Certified profiles
 
-The current profile is `rust-web-v4` ([certified profile v0.4](docs/certified-profile-v0.4.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. Every analysis after parsing works on that IR too: the application graph, the database operations and the secret-flow, insert, column-type and return checks are computed by `core::analysis`, and no token is read outside the lexer and the parser. Sealed classes with fields, instantiated generics, `Result`, `Set` and `Map` cross the wire (`bind-json-v4`); `Set` and `Map` have immutable builtins (`setOf`, `insert`, `put`, `lookup`, …) over `Key` types, with the same canonical order in the evaluator, Rust and JS. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input. Previous profiles are kept in docs: [v0.3](docs/certified-profile-v0.3.md) (`rust-web-v3`), [v0.2](docs/certified-profile-v0.2.md) (`rust-elm-web-v2`) and [v0.1](docs/certified-profile-v0.1.md) (`rust-elm-web-v1`).
+The current profile is `rust-web-v4` ([certified profile v0.4](docs/certified-profile-v0.4.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. Every analysis after parsing works on that IR too: the application graph, the database operations and the secret-flow, insert, column-type and return checks are computed by `core::analysis`, and no token is read outside the lexer and the parser. Sealed classes with fields, instantiated generics, `Result`, `Set` and `Map` cross the wire (`bind-json-v4`); `Set` and `Map` have immutable builtins (`setOf`, `insert`, `put`, `lookup`, …) over `Key` types, with the same canonical order in the evaluator, Rust and JS. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input. The previous profile is kept in docs: [v0.3](docs/certified-profile-v0.3.md) (`rust-web-v3`); earlier profiles are no longer supported.
 
 The overall shape is:
 
@@ -24,13 +24,13 @@ Bind source (.bind or .bd)
         └── HTML/CSS/JS frontend, native ES modules (mode = "split")
 ```
 
-### Migrating a `bind.toml` from the Elm client
+### Target configuration
 
-`client = "elm"` is rejected (E8311). In each target, change it to `client = "web"` and add the required `mode`:
+Each target in `bind.toml` uses the web client and the Rust server and must choose its `mode`:
 
 ```toml
 [target.vercel]
-client = "web"       # was "elm"
+client = "web"
 server = "rust"
 mode = "split"       # or "ssr"; required
 deployment = "vercel"
@@ -40,7 +40,7 @@ capabilities = ["ui.dom"]
 # frontend_origin = "https://app.example.com" # required when api_url is on another origin (and only then)
 ```
 
-Then regenerate the deploy directory (`bind generate --target <target>`); the Elm and npm files disappear. A program may have only one `client component` per web target (E8301).
+A program may have only one `client component` per web target (E8301).
 
 The compiler owns all generated dependencies and pins them. Certified applications cannot add arbitrary target dependencies, raw SQL, target code, or untyped network calls. Cargo remains the underlying resolver, while `bind.lock`, target-specific locks, hashes, and generated contract tests form Bind's reproducibility boundary. A separate package manager is therefore not needed for this profile.
 
@@ -48,7 +48,7 @@ Vercel's Rust runtime is currently Beta. Bind treats that as a deployment-platfo
 
 ## Quick start
 
-Required tool is Rust 1.98.0. The generated frontend needs no npm, bundler or Elm; `node` is only used by some tests.
+Required tool is Rust 1.98.0. The generated frontend needs no npm or bundler; `node` is only used by some tests.
 
 ```sh
 cargo test
@@ -141,4 +141,4 @@ Neither command is run automatically because both require the user's cloud accou
 
 No compiler can prove database availability, future uniqueness conflicts, network availability, or a cloud provider's uptime. `certified-host` in the manifest means the generated project passed the local certified toolchain; the cloud-native builders still produce the final Linux deployment artifact.
 
-The exact supported subset and rejection policy are specified in the [certified profile v0.4](docs/certified-profile-v0.4.md) (previous: [v0.3](docs/certified-profile-v0.3.md), [v0.2](docs/certified-profile-v0.2.md), [v0.1](docs/certified-profile-v0.1.md)). The implementation architecture is described in [architecture](docs/architecture.md).
+The exact supported subset and rejection policy are specified in the [certified profile v0.4](docs/certified-profile-v0.4.md) (previous: [v0.3](docs/certified-profile-v0.3.md)). The implementation architecture is described in [architecture](docs/architecture.md).

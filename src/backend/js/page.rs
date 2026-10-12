@@ -53,7 +53,7 @@ pub fn page_meta(config: &ProjectConfig) -> PageMeta<'_> {
 pub const PAGE_ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%2311130f'/%3E%3Ctext x='32' y='45' text-anchor='middle' font-family='monospace' font-size='40' font-weight='700' fill='%23c8ff36'%3EB%3C/text%3E%3C/svg%3E";
 
 /// The single page shell of both modes (the runtimes' `page_html` / `pageHtml`): a full HTML
-/// document, line by line the former generator's `index.html`, with the metadata of `meta`
+/// document (pinned by `tests/codegen/website.index.html.expected`), with the metadata of `meta`
 /// (HTML-escaped; the description lines only when there is one) and `body` (already HTML)
 /// inside the one `<div class="bind-site">`.
 pub fn page_html(meta: &PageMeta, body: &str) -> String {
@@ -544,26 +544,21 @@ mod tests {
         Project { root, config, app }
     }
 
-    /// The site (`../website`, not modified: a temporary copy with `client = "web"` and
-    /// `mode = "split"`) pre-renders exactly the HTML its former Elm client rendered
-    /// (`tests/codegen/website.html.expected`, recorded before the Elm generator was removed),
-    /// in the former page document.
+    /// The site (`../website`, not modified: verified from a temporary copy) pre-renders exactly
+    /// the pinned page document (`tests/codegen/website.index.html.expected`), so a change in
+    /// the HTML of a UI value or in the page shell shows up here.
     #[test]
-    fn the_website_prerenders_the_html_of_the_former_elm_client() {
+    fn the_website_prerender_is_pinned() {
         let site = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../website");
         if !site.join("src/site.bd").exists() {
             eprintln!("skipped: ../website not found");
             return;
         }
-        let manifest = std::fs::read_to_string(site.join("bind.toml"))
-            .unwrap()
-            .replace("client = \"elm\"", "client = \"web\"\nmode = \"split\"");
-        assert!(manifest.contains("mode = \"split\""));
         let root = std::env::temp_dir().join(format!("bindc-page-website-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         copy_tree(&site.join("src"), &root.join("src"));
         std::fs::copy(site.join("styles.css"), root.join("styles.css")).unwrap();
-        std::fs::write(root.join("bind.toml"), &manifest).unwrap();
+        std::fs::copy(site.join("bind.toml"), root.join("bind.toml")).unwrap();
         let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
         let result = crate::compiler::verify(&config, "vercel");
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
@@ -571,25 +566,13 @@ mod tests {
         let files = web_files(&app, &config, &config.targets["vercel"]).unwrap();
         let paths: Vec<&str> = files.iter().map(|(path, _)| path.as_str()).collect();
         assert_eq!(paths, ["web/index.html", "web/styles.css"]);
-        let expected = include_str!("../../../tests/codegen/website.html.expected");
+        let expected = include_str!("../../../tests/codegen/website.index.html.expected");
+        assert_eq!(files[0].1, expected);
         let inner = expected
-            .strip_prefix("<div class=\"bind-site\">")
-            .and_then(|rest| rest.strip_suffix("</div>"))
+            .split_once("<div class=\"bind-site\">")
+            .and_then(|(_, rest)| rest.rsplit_once("</div>\n  </body>"))
+            .map(|(inner, _)| inner)
             .unwrap();
-        // The whole document is the former generator's `index.html` for the site
-        // (`tests/codegen/website.index.html.expected`, recorded with the generator of the
-        // parent of db5c316), except for the one documented difference: the Elm mount point
-        // and its two scripts become the pre-rendered page in the `bind-site` wrapper.
-        let elm_mount = "<div id=\"app\"></div>\n    <script src=\"/main.js\"></script>\n    <script>Elm.Main.init({ node: document.getElementById('app') });</script>";
-        let former = include_str!("../../../tests/codegen/website.index.html.expected");
-        assert!(former.contains(elm_mount));
-        assert_eq!(
-            files[0].1,
-            former.replace(
-                elm_mount,
-                &format!("<div class=\"bind-site\">{inner}</div>")
-            )
-        );
         assert_eq!(files[0].1, page_html(&page_meta(&config), inner));
         assert_eq!(
             files[1].1,
