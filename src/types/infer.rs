@@ -2108,18 +2108,7 @@ impl<'a> Checker<'a> {
     }
 
     fn column_type(&mut self, column: &Column, span: &Span) -> Type {
-        let base = match parse_type_text(&column.type_name, span) {
-            Ok(te) => self.env.lower(&te, &BTreeMap::new(), &mut self.diagnostics),
-            Err(diagnostic) => {
-                self.diagnostics.push(diagnostic);
-                Type::Error
-            }
-        };
-        if column.nullable {
-            Type::option(base)
-        } else {
-            base
-        }
+        self.env.column_type(column, span, &mut self.diagnostics)
     }
 
     fn infer_ui(

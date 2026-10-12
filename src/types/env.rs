@@ -490,6 +490,28 @@ impl Env {
         row
     }
 
+    /// The type of a database column: its schema type, `Option` when nullable. The one mapping
+    /// from schema columns to types (the checker's database operations and E5204 use it).
+    pub fn column_type(
+        &self,
+        column: &crate::schema::Column,
+        span: &Span,
+        diagnostics: &mut Vec<Diagnostic>,
+    ) -> Type {
+        let base = match parse_type_text(&column.type_name, span) {
+            Ok(te) => self.lower(&te, &BTreeMap::new(), diagnostics),
+            Err(diagnostic) => {
+                diagnostics.push(diagnostic);
+                Type::Error
+            }
+        };
+        if column.nullable {
+            Type::option(base)
+        } else {
+            base
+        }
+    }
+
     pub fn lower_quiet(&self, te: &TypeExpr, vars: &BTreeMap<String, Type>) -> Type {
         self.lower(te, vars, &mut Vec::new())
     }

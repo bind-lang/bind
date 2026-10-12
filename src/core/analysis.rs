@@ -1,12 +1,16 @@
-//! Whole-program analyses over the typed core IR: the application graph and the database
-//! operations. They replace the scans of raw lexer tokens; the backends read the same facts
+//! Whole-program analyses over the typed core IR: the application graph, the database
+//! operations and the diagnostics computed from types (E4102, E5303, E5204, E2301). They replace the scans of raw lexer tokens; the backends read the same facts
 //! through [`operations`], so what `verify` reports and what is generated never diverge.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::ast::Program;
+use crate::diagnostic::{Diagnostic, Span};
+use crate::schema::DatabaseSchema;
+use crate::types::env::Env;
 use crate::types::ty::Type;
 
-use super::ir::{CoreFunction, CoreProgram, CoreType, DbOp, Expr, ExprKind};
+use super::ir::{CoreFunction, CoreProgram, CoreType, DbOp, Domain, Expr, ExprKind};
 use super::specialize::children;
 
 /// One database operation of a function, as listed in the build manifest.
@@ -358,6 +362,305 @@ impl ApplicationGraph {
             }
         }
         found.into_iter().collect()
+    }
+}
+
+/// The diagnostics computed from the typed IR (see [`typed_diagnostics`]).
+#[derive(Clone, Debug, Default)]
+pub struct TypedDiagnostics {
+    pub diagnostics: Vec<Diagnostic>,
+    /// The environment reads reported as E4102: `(function, environment value)`.
+    pub secret_reads: BTreeSet<(String, String)>,
+}
+
+impl TypedDiagnostics {
+    /// Whether every `environment` value `function` reads was already reported as a secret
+    /// reaching client code (E4102): the generators' "uses an `environment` value" rule (E8310,
+    /// E8311) then adds nothing for it.
+    pub fn reports_environment_of(&self, function: &CoreFunction) -> bool {
+        let reads = environment_reads(&function.body);
+        !reads.is_empty()
+            && reads.iter().all(|name| {
+                self.secret_reads
+                    .contains(&(function.name.clone(), name.clone()))
+            })
+    }
+}
+
+/// The diagnostics `verify` computes from the lowered program, with the AST (spans, the
+/// `environment` declarations, the declared model fields) and the database schema:
+/// - **E4102:** a secret `environment` value read by a function reachable from client code
+///   (client components and `client` functions, then every function they reference by
+///   `Global`, lambdas and function values included), with the path
+///   `environment.X -> f -> … -> client root`, located at the first client function of the path;
+/// - **E5303:** an `insert` that does not assign every column that is required, not nullable
+///   and without a default;
+/// - **E5204:** a field of the model of a table the program uses whose type differs from the
+///   column's (the checker's mapping, [`Env::column_type`]); an optional field may read a
+///   non-null column;
+/// - **E2301:** a body-less function whose result is not `Unit`.
+///
+/// It runs on the lowered IR before validation: a body-less function is lowered with a `Unit`
+/// body, which validation rejects when its result is not `Unit` (E2301 comes first).
+pub fn typed_diagnostics(
+    program: &CoreProgram,
+    ast: &Program,
+    schema: &DatabaseSchema,
+) -> TypedDiagnostics {
+    let mut output = TypedDiagnostics::default();
+    secret_leaks(program, ast, &mut output);
+    missing_insert_columns(program, ast, schema, &mut output.diagnostics);
+    model_column_mismatches(program, ast, schema, &mut output.diagnostics);
+    bodiless_results(program, ast, &mut output.diagnostics);
+    output
+}
+
+fn ast_span(ast: &Program, function: &str) -> Span {
+    ast.functions
+        .iter()
+        .find(|item| item.name == function)
+        .map(|item| item.span.clone())
+        .unwrap_or_default()
+}
+
+/// The `environment` values `expr` reads (lambdas included).
+fn environment_reads(expr: &Expr) -> BTreeSet<String> {
+    fn visit(expr: &Expr, output: &mut BTreeSet<String>) {
+        if let ExprKind::Environment(name) = &expr.kind {
+            output.insert(name.clone());
+        }
+        for child in children(expr) {
+            visit(child, output);
+        }
+    }
+    let mut output = BTreeSet::new();
+    visit(expr, &mut output);
+    output
+}
+
+/// The program functions `expr` references by `Global` (calls and function values).
+fn global_references<'e>(expr: &'e Expr, output: &mut BTreeSet<&'e str>) {
+    if let ExprKind::Global { name, .. } = &expr.kind {
+        output.insert(name);
+    }
+    for child in children(expr) {
+        global_references(child, output);
+    }
+}
+
+/// E4102: one diagnostic per function reachable from client code and secret value it reads,
+/// with a shortest path to a client root (roots in declaration order).
+fn secret_leaks(program: &CoreProgram, ast: &Program, output: &mut TypedDiagnostics) {
+    let secrets: BTreeSet<&str> = ast
+        .environment
+        .iter()
+        .filter(|declaration| declaration.secret)
+        .map(|declaration| declaration.name.as_str())
+        .collect();
+    if secrets.is_empty() {
+        return;
+    }
+    let functions: BTreeMap<&str, &CoreFunction> = program
+        .functions
+        .iter()
+        .map(|function| (function.name.as_str(), function))
+        .collect();
+    // Breadth-first from every client root: `parent[g] = f` when `f` references `g`.
+    let mut parent: BTreeMap<&str, Option<&str>> = BTreeMap::new();
+    let mut queue = VecDeque::new();
+    for function in &program.functions {
+        if function.domain == Domain::Client {
+            parent.insert(&function.name, None);
+            queue.push_back(function);
+        }
+    }
+    while let Some(function) = queue.pop_front() {
+        let mut referenced = BTreeSet::new();
+        global_references(&function.body, &mut referenced);
+        for name in referenced {
+            if let Some(callee) = functions.get(name)
+                && !parent.contains_key(name)
+            {
+                parent.insert(&callee.name, Some(&function.name));
+                queue.push_back(callee);
+            }
+        }
+    }
+    for function in &program.functions {
+        if !parent.contains_key(function.name.as_str()) {
+            continue;
+        }
+        for name in environment_reads(&function.body) {
+            if !secrets.contains(name.as_str()) {
+                continue;
+            }
+            let mut chain = vec![function.name.as_str()];
+            while let Some(Some(next)) = chain.last().and_then(|last| parent.get(last)) {
+                chain.push(next);
+            }
+            let located = chain
+                .iter()
+                .find(|item| {
+                    functions
+                        .get(*item)
+                        .is_some_and(|f| f.domain == Domain::Client)
+                })
+                .copied()
+                .unwrap_or(function.name.as_str());
+            let path: Vec<String> = std::iter::once(format!("environment.{name}"))
+                .chain(chain.iter().map(|item| item.to_string()))
+                .collect();
+            output.diagnostics.push(
+                Diagnostic::error(
+                    "E4102",
+                    format!(
+                        "Secret value `{name}` flows into client code: {}.",
+                        path.join(" -> ")
+                    ),
+                    ast_span(ast, located),
+                )
+                .with_path(path)
+                .with_hint(
+                    "Read secrets only in server code and send the client just what it needs through an endpoint.",
+                ),
+            );
+            output
+                .secret_reads
+                .insert((function.name.clone(), name.clone()));
+        }
+    }
+}
+
+/// E5303: every `insert` assigns each column that is required, not nullable and without a
+/// default.
+fn missing_insert_columns(
+    program: &CoreProgram,
+    ast: &Program,
+    schema: &DatabaseSchema,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for function in &program.functions {
+        let mut nodes = Vec::new();
+        db_nodes(&function.body, &mut nodes);
+        for node in nodes {
+            let ExprKind::Db {
+                op: DbOp::Insert { columns },
+                table,
+                ..
+            } = &node.kind
+            else {
+                continue;
+            };
+            let Some(definition) = schema.tables.get(table) else {
+                continue;
+            };
+            let missing: Vec<String> = definition
+                .columns
+                .values()
+                .filter(|column| {
+                    column.required
+                        && !column.nullable
+                        && !column.has_default
+                        && !columns.contains(&column.name)
+                })
+                .map(|column| format!("{} : {} NOT NULL", column.name, column.type_name))
+                .collect();
+            if !missing.is_empty() {
+                diagnostics.push(Diagnostic::error(
+                    "E5303",
+                    format!(
+                        "INSERT into `{table}` is missing required field(s):\n    {}",
+                        missing.join("\n    ")
+                    ),
+                    ast_span(ast, &function.name),
+                ));
+            }
+        }
+    }
+}
+
+/// E5204: for each table a database operation uses (in order of first use), each field of its
+/// model with a column must have the column's type, or be the optional version of it.
+fn model_column_mismatches(
+    program: &CoreProgram,
+    ast: &Program,
+    schema: &DatabaseSchema,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut tables: Vec<&str> = Vec::new();
+    for function in &program.functions {
+        let mut nodes = Vec::new();
+        db_nodes(&function.body, &mut nodes);
+        for node in nodes {
+            if let ExprKind::Db { table, .. } = &node.kind
+                && !tables.contains(&table.as_str())
+            {
+                tables.push(table);
+            }
+        }
+    }
+    if tables.is_empty() {
+        return;
+    }
+    let env = Env::build(ast, &mut Vec::new());
+    for table in tables {
+        let Some(definition) = schema.tables.get(table) else {
+            continue;
+        };
+        let Some(fields) = program.types.iter().find_map(|ty| match ty {
+            CoreType::Record { name, fields, .. } if *name == definition.model => Some(fields),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let declared = ast.types.iter().find(|ty| ty.name == definition.model);
+        for (field, ty) in fields {
+            let Some(column) = definition.columns.get(field) else {
+                continue;
+            };
+            let expected = env.column_type(column, &Span::default(), &mut Vec::new());
+            if *ty == expected || *ty == Type::option(expected.clone()) {
+                continue;
+            }
+            let declared_field = declared
+                .and_then(|declared| declared.fields.iter().find(|item| item.name == *field));
+            let shown = declared_field
+                .map(|item| item.type_ref.display())
+                .unwrap_or_else(|| crate::types::ty::display(ty));
+            diagnostics.push(Diagnostic::error(
+                "E5204",
+                format!(
+                    "Database type mismatch for `{table}.{field}`: schema is `{}{}`, application model is `{shown}`.",
+                    column.type_name,
+                    if column.nullable { "?" } else { "" }
+                ),
+                declared_field
+                    .map(|item| item.span.clone())
+                    .unwrap_or_default(),
+            ));
+        }
+    }
+}
+
+/// E2301: a function without a body can only return `Unit`.
+fn bodiless_results(program: &CoreProgram, ast: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    for function in &program.functions {
+        if !function.bodiless || function.result == Type::con("Unit") {
+            continue;
+        }
+        let declared = ast.functions.iter().find(|item| item.name == function.name);
+        let shown = declared
+            .and_then(|item| item.return_type.as_ref())
+            .map(|ty| ty.display())
+            .unwrap_or_else(|| crate::types::ty::display(&function.result));
+        diagnostics.push(Diagnostic::error(
+            "E2301",
+            format!(
+                "Function `{}` declares return type `{shown}` but has no return expression.",
+                function.name
+            ),
+            ast_span(ast, &function.name),
+        ));
     }
 }
 

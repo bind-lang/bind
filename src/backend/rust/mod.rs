@@ -316,6 +316,9 @@ fn reachable<'p>(
     functions
 }
 
+/// The `what` of [`ServerProblem::Unsupported`] for a read of an `environment` value.
+pub const ENVIRONMENT_PROBLEM: &str = "an `environment` value";
+
 /// Why a verified program has no generated server.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ServerProblem {
@@ -398,7 +401,7 @@ pub fn server_problems(program: &CoreProgram, database: &DatabaseSchema) -> Vec<
         }
         let what = match outside_server(&function.body) {
             None => continue,
-            Some(Outside::Environment) => "an `environment` value",
+            Some(Outside::Environment) => ENVIRONMENT_PROBLEM,
             Some(Outside::Ui) => "a UI tree",
             Some(Outside::ServerCall) => {
                 // The checker rejects `server.` calls outside client code (E7401).

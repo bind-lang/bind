@@ -217,35 +217,8 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             format!("environment.{}", declaration.name),
             format!("env.{}", declaration.variable),
         );
-        if declaration.secret {
-            for function in &program.functions {
-                if function.domain == Domain::Client
-                    && function
-                        .body
-                        .iter()
-                        .any(|token| token.text == declaration.name)
-                {
-                    diagnostics.push(
-                        Diagnostic::error(
-                            "E4102",
-                            format!(
-                                "Secret value `{}` flows into client artifact.",
-                                declaration.name
-                            ),
-                            function.span.clone(),
-                        )
-                        .with_path(vec![
-                            format!("env.{}", declaration.variable),
-                            format!("environment.{}", declaration.name),
-                            function.name.clone(),
-                            "browser bundle".into(),
-                        ]),
-                    );
-                }
-            }
-        }
     }
-
+    // Secrets reaching client code (E4102) are found on the IR (`core::analysis`).
     for (function, resource, mut diagnostic) in pending_database_errors {
         token_graph.add_edge(function.clone(), resource.clone());
         diagnostic.path = token_graph.path_to(&function);
@@ -339,19 +312,38 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         None
     } else {
         let core = crate::core::lower::lower(&program, &typed, &database);
-        let problems = crate::core::validate::validate(&core);
-        if problems.is_empty() {
+        // Diagnostics computed from types (E4102, E5303, E5204, E2301) come before validation:
+        // a body-less function with a non-`Unit` result (E2301) is lowered with a `Unit` body,
+        // which validation would report as a compiler bug.
+        let typed_problems = crate::core::analysis::typed_diagnostics(&core, &program, &database);
+        let bodiless_result = typed_problems
+            .diagnostics
+            .iter()
+            .any(|item| item.code == "E2301");
+        diagnostics.extend(typed_problems.diagnostics.iter().cloned());
+        let problems = if bodiless_result {
+            Vec::new()
+        } else {
+            crate::core::validate::validate(&core)
+        };
+        if bodiless_result {
+            None
+        } else if problems.is_empty() {
             let mut server_diagnostics = if target_config.server == "rust" {
-                rust_server_diagnostics(&core, &program, &database)
+                rust_server_diagnostics(&core, &program, &database, &typed_problems)
             } else {
                 Vec::new()
             };
             if target_config.client == "web" {
-                server_diagnostics.extend(frontend_diagnostics(&core, &program, target));
+                server_diagnostics.extend(frontend_diagnostics(
+                    &core,
+                    &program,
+                    target,
+                    &typed_problems,
+                ));
             }
-            let usable = !has_errors(&server_diagnostics);
             diagnostics.extend(server_diagnostics);
-            usable.then_some(core)
+            (!has_errors(&diagnostics)).then_some(core)
         } else {
             diagnostics.push(Diagnostic::error(
                 "E9001",
@@ -578,9 +570,26 @@ fn validate_certified_surface(
 
 /// What keeps the web frontend of a verified program from being generated (E8311): the same
 /// plan `backend::js::page::web_files` and the SSR build from, so `generate` never fails.
-fn frontend_diagnostics(core: &CoreProgram, program: &Program, target: &str) -> Vec<Diagnostic> {
+///
+/// A function's "uses an `environment` value" problem is left out when E4102 already reported
+/// every value it reads (`typed`).
+fn frontend_diagnostics(
+    core: &CoreProgram,
+    program: &Program,
+    target: &str,
+    typed: &crate::core::analysis::TypedDiagnostics,
+) -> Vec<Diagnostic> {
+    use crate::backend::js::plan::FrontendProblem;
     crate::backend::js::plan::program_problems(core, program, target)
         .into_iter()
+        .filter(|problem| match problem {
+            FrontendProblem::Unsupported { function, what, .. }
+                if *what == crate::backend::js::plan::ENVIRONMENT_PROBLEM =>
+            {
+                !reported_as_secret(core, function, typed)
+            }
+            _ => true,
+        })
         .map(|problem| {
             let span = problem
                 .function()
@@ -696,14 +705,26 @@ fn validate_rust_server_surface(
 /// What keeps the Rust backend from generating the server of a verified program: E8310 for
 /// code or columns the profile does not support, E9001 for inconsistencies. Run on the core
 /// IR so `generate` never fails on a program `verify` accepted.
+///
+/// A function's "uses an `environment` value" problem is left out when E4102 already reported
+/// every value it reads (`typed`).
 fn rust_server_diagnostics(
     core: &CoreProgram,
     program: &Program,
     database: &DatabaseSchema,
+    typed: &crate::core::analysis::TypedDiagnostics,
 ) -> Vec<Diagnostic> {
     use crate::backend::rust::ServerProblem;
     crate::backend::rust::server_problems(core, database)
         .into_iter()
+        .filter(|problem| match problem {
+            ServerProblem::Unsupported { function, what, .. }
+                if *what == crate::backend::rust::ENVIRONMENT_PROBLEM =>
+            {
+                !reported_as_secret(core, function, typed)
+            }
+            _ => true,
+        })
         .map(|problem| {
             let span = match &problem {
                 ServerProblem::Unsupported { function, .. }
@@ -735,6 +756,18 @@ fn rust_server_diagnostics(
             Diagnostic::error(code, problem.message(), span.unwrap_or_default())
         })
         .collect()
+}
+
+/// Whether E4102 reported every `environment` value `function` reads.
+fn reported_as_secret(
+    core: &CoreProgram,
+    function: &str,
+    typed: &crate::core::analysis::TypedDiagnostics,
+) -> bool {
+    core.functions
+        .iter()
+        .find(|item| item.name == function)
+        .is_some_and(|item| typed.reports_environment_of(item))
 }
 
 /// Parses a type the checker already accepted; a failure is a compiler bug (E9001).
@@ -1010,8 +1043,6 @@ fn analyze_function(
                         ));
                     }
                     if method == "insert" {
-                        let assigned: BTreeSet<_> =
-                            assignments.iter().map(|(name, _)| name.as_str()).collect();
                         for (name, _) in &assignments {
                             if !table.columns.contains_key(name) {
                                 diagnostics.push(Diagnostic::error(
@@ -1024,34 +1055,7 @@ fn analyze_function(
                                 ));
                             }
                         }
-                        let missing: Vec<_> = table
-                            .columns
-                            .values()
-                            .filter(|column| {
-                                column.required
-                                    && !column.nullable
-                                    && !column.has_default
-                                    && !assigned.contains(column.name.as_str())
-                            })
-                            .collect();
-                        if !missing.is_empty() {
-                            diagnostics.push(Diagnostic::error(
-                                "E5303",
-                                format!(
-                                    "INSERT into `{}` is missing required field(s):\n    {}",
-                                    table.name,
-                                    missing
-                                        .iter()
-                                        .map(|column| format!(
-                                            "{} : {} NOT NULL",
-                                            column.name, column.type_name
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join("\n    ")
-                                ),
-                                body[index].span.clone(),
-                            ));
-                        }
+                        // A missing required column (E5303) is found on the IR.
                     } else if write {
                         diagnostics.push(Diagnostic::error(
                             "E8204",
@@ -1088,17 +1092,9 @@ fn analyze_function(
                                     resource,
                                     diagnostic,
                                 ));
-                            } else if let Some(column) = table.columns.get(&field.name)
-                                && !compatible(
-                                    &field.type_ref,
-                                    &TypeRef {
-                                        name: column.type_name.clone(),
-                                        nullable: column.nullable,
-                                    },
-                                )
-                            {
-                                diagnostics.push(Diagnostic::error("E5204", format!("Database type mismatch for `{}.{}`: schema is `{}{}`, application model is `{}`.", table.name, field.name, column.type_name, if column.nullable { "?" } else { "" }, field.type_ref.display()), field.span.clone()));
                             }
+                            // A field whose type differs from the column's (E5204) is found
+                            // on the IR.
                         }
                     } else {
                         diagnostics.push(Diagnostic::error(
@@ -1134,38 +1130,8 @@ fn analyze_function(
         }
         index += 1;
     }
-    validate_return_contract(function, diagnostics);
+    // A body-less function with a non-`Unit` result (E2301) is found on the IR.
     let _ = program;
-}
-
-/// Declared return type as far as the legacy pass can trust it: absent
-/// annotations and types mentioning the function's type parameters are
-/// unknown here (the type checker already verified them).
-fn known_return(function: &Function) -> Option<TypeRef> {
-    let declared = function.return_type.as_ref()?;
-    (!mentions_type_param(declared, &function.type_params)).then(|| declared.clone())
-}
-
-/// A declared non-`Unit` return needs a return expression. Whether the returned value has
-/// the declared type is the type checker's job.
-fn validate_return_contract(function: &Function, diagnostics: &mut Vec<Diagnostic>) {
-    let Some(declared_return) = known_return(function) else {
-        return;
-    };
-    if declared_return.name == "Unit" {
-        return;
-    }
-    if function.body.is_empty() {
-        diagnostics.push(Diagnostic::error(
-            "E2301",
-            format!(
-                "Function `{}` declares return type `{}` but has no return expression.",
-                function.name,
-                declared_return.display()
-            ),
-            function.span.clone(),
-        ));
-    }
 }
 
 fn insert_assignments(body: &[Token], brace_index: usize) -> Vec<(String, String)> {
@@ -1205,13 +1171,6 @@ fn insert_assignments(body: &[Token], brace_index: usize) -> Vec<(String, String
         }
     }
     result
-}
-
-fn compatible(expected: &TypeRef, actual: &TypeRef) -> bool {
-    if actual.name == "Nothing" {
-        return expected.nullable;
-    }
-    expected.name == actual.name && (expected.nullable || !actual.nullable)
 }
 
 fn validate_environment(
@@ -2553,5 +2512,190 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         );
         assert_eq!(app.graph.impact("dobro"), vec!["Pagina", "usa"]);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A secret `token` declared in the `development` environment.
+    const SECRET_TOKEN: &str = "environment development {\n    secret val token: String = env(\"BIND_TEST_TOKEN\", default = \"local\")\n}\n";
+
+    /// The diagnostics of `code` for `source` on `schema` (none of them in a verified program).
+    fn with_code(source: &str, schema: &str, code: &str) -> Vec<Diagnostic> {
+        let (root, config) = fixture(source, schema);
+        let result = verify(&config, "aws-lambda");
+        let found: Vec<Diagnostic> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == code)
+            .cloned()
+            .collect();
+        if !found.is_empty() {
+            assert!(result.application.is_none());
+        }
+        fs::remove_dir_all(root).unwrap();
+        found
+    }
+
+    #[test]
+    fn e4102_secret_read_directly_by_a_client_function() {
+        let source = format!("{SECRET_TOKEN}client fun leak(): String {{ return token }}\n");
+        let found = with_code(&source, EMPTY_SCHEMA, "E4102");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Secret value `token` flows into client code: environment.token -> leak."
+        );
+        assert_eq!(found[0].path, vec!["environment.token", "leak"]);
+        assert_eq!(found[0].span.line, 4);
+    }
+
+    /// Review Focus 2: the secret reaches the client through a lambda passed to a shared
+    /// function, and through a function reference passed the same way. One precise E4102 each,
+    /// and no E8311 for the same read.
+    #[test]
+    fn e4102_secret_passed_to_a_shared_function_as_a_lambda_or_a_function_value() {
+        let shared = "fun aplica(f: () -> String): String = f()\n";
+        let lambda = format!(
+            "{SECRET_TOKEN}{shared}client component Pagina() {{\n    val t = aplica({{ -> token }})\n    UI {{\n        Text(t)\n    }}\n}}\n"
+        );
+        let found = with_code(&lambda, EMPTY_SCHEMA, "E4102");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].path, vec!["environment.token", "Pagina"]);
+        assert!(with_code(&lambda, EMPTY_SCHEMA, "E8311").is_empty());
+
+        let reference = format!(
+            "{SECRET_TOKEN}{shared}fun lerToken(): String = token\nclient component Pagina() {{\n    UI {{\n        Text(aplica(lerToken))\n    }}\n}}\n"
+        );
+        let found = with_code(&reference, EMPTY_SCHEMA, "E4102");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Secret value `token` flows into client code: environment.token -> lerToken -> Pagina."
+        );
+        assert_eq!(
+            found[0].path,
+            vec!["environment.token", "lerToken", "Pagina"]
+        );
+        assert!(with_code(&reference, EMPTY_SCHEMA, "E8311").is_empty());
+    }
+
+    #[test]
+    fn e4102_secret_reached_through_helper_functions() {
+        let source = format!(
+            "{SECRET_TOKEN}fun segredo(): String = token\nfun rotulo(): String = \"x\" + segredo()\nclient component Pagina() {{\n    UI {{\n        Text(rotulo())\n    }}\n}}\n"
+        );
+        let found = with_code(&source, EMPTY_SCHEMA, "E4102");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].path,
+            vec!["environment.token", "segredo", "rotulo", "Pagina"]
+        );
+        // The span is the first client function of the path: the component (line 6).
+        assert_eq!(found[0].span.line, 6);
+        assert!(with_code(&source, EMPTY_SCHEMA, "E8311").is_empty());
+    }
+
+    /// A secret read reported as E4102 is not reported again by the server's environment rule
+    /// (E8310) when an endpoint also reaches it; a non-secret read in the same function is.
+    #[test]
+    fn e4102_reads_are_not_reported_again_as_e8310() {
+        let source = format!(
+            "{SECRET_TOKEN}fun segredo(): String = token\nserver fun a(): String = segredo()\nclient component Pagina() {{\n    UI {{\n        Text(segredo())\n    }}\n}}\n"
+        );
+        assert_eq!(with_code(&source, EMPTY_SCHEMA, "E4102").len(), 1);
+        assert!(with_code(&source, EMPTY_SCHEMA, "E8310").is_empty());
+
+        let mixed = source
+            .replace(
+                "secret val token",
+                "public val nome: String = env(\"BIND_TEST_NOME\", default = \"x\")\n    secret val token",
+            )
+            .replace("= token", "= token + nome");
+        assert_eq!(with_code(&mixed, EMPTY_SCHEMA, "E4102").len(), 1);
+        assert_eq!(with_code(&mixed, EMPTY_SCHEMA, "E8310").len(), 1);
+        assert_eq!(with_code(&mixed, EMPTY_SCHEMA, "E8311").len(), 1);
+    }
+
+    #[test]
+    fn e4102_ignores_locals_and_strings_named_like_the_secret() {
+        let source = format!(
+            "{SECRET_TOKEN}client fun local(): String {{\n    val token = \"token\"\n    return token + \"TOKEN\"\n}}\n"
+        );
+        let (root, config) = fixture(&source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn non_secret_environment_reads_keep_e8311() {
+        let source = "environment development {\n    public val appName: String = env(\"BIND_TEST_APP_NAME\", default = \"x\")\n}\nclient component Pagina() {\n    UI {\n        Text(appName)\n    }\n}\n";
+        assert!(with_code(source, EMPTY_SCHEMA, "E4102").is_empty());
+        assert_eq!(with_code(source, EMPTY_SCHEMA, "E8311").len(), 1);
+    }
+
+    const CUSTOMER_EMAIL_SCHEMA: &str = "table,model,primary_key,column,type,nullable,required,has_default,engine\ncustomers,Customer,id,id,UUID,false,true,true,postgresql\ncustomers,Customer,id,name,String,false,true,false,postgresql\ncustomers,Customer,id,email,Email,false,true,false,postgresql\n";
+
+    #[test]
+    fn e5303_insert_without_a_required_column() {
+        let missing = "entity Customer(val id: UUID, val name: String, val email: Email)\nserver fun criar(name: String): UUID effects [db.write] {\n    val c = db.customers.insert {\n        name = name\n    }\n    return c.id\n}\n";
+        let found = with_code(missing, CUSTOMER_EMAIL_SCHEMA, "E5303");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "INSERT into `customers` is missing required field(s):\n    email : Email NOT NULL"
+        );
+        assert_eq!(found[0].span.line, 2);
+
+        let complete = "entity Customer(val id: UUID, val name: String, val email: Email)\nserver fun criar(name: String, email: Email): UUID effects [db.write] {\n    val c = db.customers.insert {\n        name = name\n        email = email\n    }\n    return c.id\n}\n";
+        let (root, config) = fixture(complete, CUSTOMER_EMAIL_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn e5204_model_field_type_differs_from_the_column() {
+        let source = "entity Customer(val id: UUID, val name: Int)\nserver fun ler(id: UUID): Int effects [db.read] = db.customers.require(id).name\n";
+        let found = with_code(source, CUSTOMER_EMAIL_SCHEMA, "E5204");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Database type mismatch for `customers.name`: schema is `String`, application model is `Int`."
+        );
+        assert_eq!(found[0].span.line, 1);
+
+        // An optional field may read a non-null column; a non-null field a nullable one not.
+        let optional = "entity Customer(val id: UUID, val name: String?, val email: Email)\nserver fun ler(id: UUID): Email effects [db.read] = db.customers.require(id).email\n";
+        assert!(with_code(optional, CUSTOMER_EMAIL_SCHEMA, "E5204").is_empty());
+        let nullable = CUSTOMER_EMAIL_SCHEMA.replace(",name,String,false,", ",name,String,true,");
+        let source = "entity Customer(val id: UUID, val name: String, val email: Email)\nserver fun ler(id: UUID): Email effects [db.read] = db.customers.require(id).email\n";
+        let found = with_code(source, &nullable, "E5204");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Database type mismatch for `customers.name`: schema is `String?`, application model is `String`."
+        );
+    }
+
+    #[test]
+    fn e2301_body_less_function_with_a_non_unit_result() {
+        let found = with_code(
+            "external fun g(x: Int): Int\nfun f(): Int = g(1)\n",
+            EMPTY_SCHEMA,
+            "E2301",
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Function `g` declares return type `Int` but has no return expression."
+        );
+        assert_eq!(found[0].span.line, 1);
+        assert!(
+            with_code(
+                "fun g(x: Int): Unit\nfun h(x: Int)\nfun f() = g(1)\n",
+                EMPTY_SCHEMA,
+                "E2301"
+            )
+            .is_empty()
+        );
     }
 }

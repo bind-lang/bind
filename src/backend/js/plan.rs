@@ -17,6 +17,9 @@ pub const PARAMETER_TYPES: [&str; 8] = [
     "String", "Email", "Url", "Int", "UUID", "Date", "DateTime", "Instant",
 ];
 
+/// The `what` of [`FrontendProblem::Unsupported`] for a read of an `environment` value.
+pub const ENVIRONMENT_PROBLEM: &str = "uses an `environment` value";
+
 /// Why a verified program or target has no web frontend (E8311).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FrontendProblem {
@@ -386,7 +389,7 @@ fn program_plan(
         if contains(&function.body, &|expr| {
             matches!(expr.kind, ExprKind::Environment(_))
         }) {
-            problems.push(problem("uses an `environment` value"));
+            problems.push(problem(ENVIRONMENT_PROBLEM));
         }
         if contains(&function.body, &|expr| {
             matches!(
