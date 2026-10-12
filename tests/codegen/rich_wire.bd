@@ -1,0 +1,25 @@
+// Rich wire types at the endpoints (Review Focus 4 and 5): `Set`, `Map`, a generic record
+// instantiated twice in one signature, `Result` and a sealed class with fields.
+distinct type CustomerId = UUID
+
+data class Customer(val id: CustomerId, val name: String)
+
+data class Pagina<T>(val itens: List<T>, val total: Int)
+
+enum class Cor { Z, A, M }
+
+sealed class Evento {
+    data class Criado(val em: Instant, val por: Customer)
+    data object Nenhum
+}
+
+server fun agrupa(paginas: Map<CustomerId, Pagina<Customer>>, numeros: Pagina<Int>): Map<CustomerId, Pagina<Customer>> =
+    if (numeros.total > 0) paginas else emptyMap()
+
+server fun conta(paginas: Map<CustomerId, Pagina<Customer>>, numeros: Pagina<Int>): Pagina<Int> =
+    Pagina(values(put(emptyMap(), mapSize(paginas), numeros.total)), length(numeros.itens))
+
+server fun cores(xs: Set<Cor>): Result<List<Cor>, String> =
+    if (setSize(xs) > 0) Ok(toList(insert(xs, M))) else Err("vazio")
+
+server fun evento(e: Evento): Evento = e

@@ -86,6 +86,26 @@ pub(super) fn function_with_db(
     )
 }
 
+/// The runtime function of a `Set`/`Map` builtin applied to a collection, and whether it takes
+/// its arguments by value: updates do (an unshared collection is updated in place), queries
+/// borrow them.
+fn collection_function(name: &str) -> Option<(&'static str, bool)> {
+    Some(match name {
+        "insert" => ("set_insert", true),
+        "remove" => ("set_remove", true),
+        "put" => ("map_put", true),
+        "removeKey" => ("map_remove_key", true),
+        "contains" => ("set_contains", false),
+        "setSize" => ("set_size", false),
+        "toList" => ("set_to_list", false),
+        "lookup" => ("map_lookup", false),
+        "keys" => ("map_keys", false),
+        "values" => ("map_values", false),
+        "mapSize" => ("map_size", false),
+        _ => return None,
+    })
+}
+
 /// A prefix for generic parameters (`T0`, `T1`, …) that no user type name can collide with.
 fn generic_prefix(layout: &Layout) -> String {
     let mut prefix = String::from("T");
@@ -848,6 +868,31 @@ impl Generator<'_, '_> {
                 values.extend(self.owned_args(items));
                 atom(format!("{RUNTIME}::{name}({}).await?", values.join(", ")))
             }
+            ("setOf", items) => {
+                let items = self.owned_args(items);
+                atom(format!(
+                    "{RUNTIME}::set_of::<{element}>(::std::vec![{}])",
+                    items.join(", ")
+                ))
+            }
+            ("emptySet", []) => atom(format!("{RUNTIME}::empty_set::<{element}>()")),
+            ("emptyMap", []) => {
+                let value = instance
+                    .get(1)
+                    .map_or_else(|| self.ty(&Type::Error), |ty| self.ty(ty));
+                atom(format!("{RUNTIME}::empty_map::<{element}, {value}>()"))
+            }
+            (name, items) if collection_function(name).is_some() => {
+                let Some((function, by_value)) = collection_function(name) else {
+                    return atom("::std::compile_error!(\"bindc: unknown builtin call\")");
+                };
+                let items: Vec<String> = if by_value {
+                    self.owned_args(items)
+                } else {
+                    items.iter().map(|item| self.borrowed(item)).collect()
+                };
+                atom(format!("{RUNTIME}::{function}({})", items.join(", ")))
+            }
             _ => atom("::std::compile_error!(\"bindc: unknown builtin call\")"),
         }
     }
@@ -874,7 +919,33 @@ impl Generator<'_, '_> {
             ("map" | "fold", items) => {
                 format!("{BOX}::pin({RUNTIME}::{name}(ctx, {}))", items.join(", "))
             }
-            _ => "::std::compile_error!(\"bindc: unknown builtin\")".to_string(),
+            ("setOf", items) => ready(format!(
+                "{RUNTIME}::set_of::<{element}>(::std::vec![{}])",
+                items.join(", ")
+            )),
+            ("emptySet", []) => ready(format!("{RUNTIME}::empty_set::<{element}>()")),
+            ("emptyMap", []) => {
+                let value = instance
+                    .get(1)
+                    .map_or_else(|| self.ty(&Type::Error), |ty| self.ty(ty));
+                ready(format!("{RUNTIME}::empty_map::<{element}, {value}>()"))
+            }
+            (name, items) => match collection_function(name) {
+                Some((function, by_value)) => {
+                    let items: Vec<String> = items
+                        .iter()
+                        .map(|item| {
+                            if by_value {
+                                item.clone()
+                            } else {
+                                format!("&{item}")
+                            }
+                        })
+                        .collect();
+                    ready(format!("{RUNTIME}::{function}({})", items.join(", ")))
+                }
+                None => "::std::compile_error!(\"bindc: unknown builtin\")".to_string(),
+            },
         };
         let mut inputs = vec![format!("ctx: {RUNTIME}::Ctx")];
         for (name, param) in names.iter().zip(params) {

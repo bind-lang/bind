@@ -31,13 +31,13 @@ pub mod bind_runtime;
 /// The program's types and functions. User names live only here, so they never meet the
 /// items below (database layer, request types, router, tests) or the runtime.
 pub mod app {
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct Nome {
         pub value: ::std::string::String,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct Codigo {
         pub value: Nome,

@@ -1,0 +1,178 @@
+[
+  {
+    "kind": "set",
+    "element": "Int",
+    "setOf": ["3", "1", "2", "1", "-5", "10"],
+    "steps": [["insert", "2"], ["remove", "4"], ["insert", "0"]],
+    "toList": ["-5", "0", "1", "2", "3", "10"],
+    "contains": [["10", true], ["4", false], ["-5", true]]
+  },
+  {
+    "kind": "set",
+    "element": "Int",
+    "setOf": ["100000000000000000000", "99999999999999999999", "-100000000000000000000"],
+    "steps": [["remove", "99999999999999999999"]],
+    "toList": ["-100000000000000000000", "100000000000000000000"],
+    "contains": [["99999999999999999999", false]]
+  },
+  {
+    "kind": "set",
+    "element": "Int",
+    "setOf": [],
+    "steps": [["remove", "1"], ["insert", "1"], ["insert", "1"], ["remove", "1"]],
+    "toList": [],
+    "contains": [["1", false]]
+  },
+  {
+    "kind": "set",
+    "element": "Decimal",
+    "setOf": ["1.00", "0", "1.0", "-0", "2.5", "10", "-1.50", "2.50", "9.99"],
+    "steps": [["insert", "1.000"], ["insert", "0.00"]],
+    "toList": ["-1.50", "0", "1.00", "2.5", "9.99", "10"],
+    "contains": [["1", true], ["1.0000", true], ["-0", true], ["2.51", false], ["-1.5", true]]
+  },
+  {
+    "kind": "set",
+    "element": "Decimal",
+    "setOf": ["1.00", "2"],
+    "steps": [["remove", "1.0"], ["insert", "2.000"]],
+    "toList": ["2"],
+    "contains": [["1.00", false], ["2.0", true]]
+  },
+  {
+    "kind": "set",
+    "element": "Nota",
+    "setOf": ["2.0", "10", "2", "-3.5"],
+    "steps": [],
+    "toList": ["-3.5", "2.0", "10"],
+    "contains": [["2.00", true]]
+  },
+  {
+    "kind": "set",
+    "element": "String",
+    "setOf": ["b", "a", "B", "é", "z", "😀", "！", "", "ab"],
+    "steps": [["insert", "a"], ["remove", "z"]],
+    "toList": ["", "B", "a", "ab", "b", "é", "！", "😀"],
+    "contains": [["😀", true], ["A", false]]
+  },
+  {
+    "kind": "set",
+    "element": "Boolean",
+    "setOf": [true, false, true],
+    "steps": [],
+    "toList": [false, true],
+    "contains": [[true, true], [false, true]]
+  },
+  {
+    "kind": "set",
+    "element": "Boolean",
+    "setOf": [true],
+    "steps": [["remove", false], ["insert", true]],
+    "toList": [true],
+    "contains": [[false, false]]
+  },
+  {
+    "kind": "set",
+    "element": "Cor",
+    "setOf": ["m", "a", "z", "a"],
+    "steps": [],
+    "toList": ["z", "a", "m"],
+    "contains": [["a", true]]
+  },
+  {
+    "kind": "set",
+    "element": "Cor",
+    "setOf": ["m"],
+    "steps": [["insert", "a"], ["insert", "z"], ["remove", "m"]],
+    "toList": ["z", "a"],
+    "contains": [["m", false]]
+  },
+  {
+    "kind": "set",
+    "element": "Date",
+    "setOf": ["2024-01-10", "2023-12-31", "2024-01-09"],
+    "steps": [],
+    "toList": ["2023-12-31", "2024-01-09", "2024-01-10"],
+    "contains": [["2024-01-09", true]]
+  },
+  {
+    "kind": "set",
+    "element": "DateTime",
+    "setOf": ["2024-01-01T10:00:00", "2024-01-01T09:59:59.999", "2024-01-01T10:00:00.000001"],
+    "steps": [],
+    "toList": ["2024-01-01T09:59:59.999", "2024-01-01T10:00:00", "2024-01-01T10:00:00.000001"],
+    "contains": [["2024-01-01T10:00:00", true]]
+  },
+  {
+    "kind": "set",
+    "element": "Instant",
+    "setOf": ["2024-01-01T10:00:00.500Z", "2024-01-01T10:00:00Z", "2023-06-01T00:00:00Z"],
+    "steps": [],
+    "toList": ["2023-06-01T00:00:00Z", "2024-01-01T10:00:00Z", "2024-01-01T10:00:00.500Z"],
+    "contains": [["2024-01-01T10:00:00.500Z", true]]
+  },
+  {
+    "kind": "set",
+    "element": "UUID",
+    "setOf": ["ffffffff-0000-4000-8000-000000000000", "00000000-0000-4000-8000-000000000001", "a0000000-0000-4000-8000-000000000000"],
+    "steps": [],
+    "toList": ["00000000-0000-4000-8000-000000000001", "a0000000-0000-4000-8000-000000000000", "ffffffff-0000-4000-8000-000000000000"],
+    "contains": [["a0000000-0000-4000-8000-000000000000", true]]
+  },
+  {
+    "kind": "map",
+    "key": "Int",
+    "steps": [["put", "2", "b"], ["put", "1", "a"], ["put", "10", "j"], ["put", "2", "B"], ["removeKey", "3"]],
+    "entries": [["1", "a"], ["2", "B"], ["10", "j"]],
+    "lookup": [["2", "B"], ["3", null], ["10", "j"]]
+  },
+  {
+    "kind": "map",
+    "key": "Int",
+    "steps": [["removeKey", "1"], ["put", "1", "a"], ["removeKey", "1"]],
+    "entries": [],
+    "lookup": [["1", null]]
+  },
+  {
+    "kind": "map",
+    "key": "Decimal",
+    "steps": [["put", "1.0", "x"], ["put", "1.00", "y"]],
+    "entries": [["1.0", "y"]],
+    "lookup": [["1.00", "y"], ["1", "y"], ["1.01", null]]
+  },
+  {
+    "kind": "map",
+    "key": "Decimal",
+    "steps": [["put", "1.0", "x"], ["put", "0.5", "h"], ["put", "0.00", "z"], ["put", "-0", "zz"], ["removeKey", "1.000"]],
+    "entries": [["0.00", "zz"], ["0.5", "h"]],
+    "lookup": [["0", "zz"], ["-0", "zz"], ["1.0", null], ["0.50", "h"]]
+  },
+  {
+    "kind": "map",
+    "key": "Cor",
+    "steps": [["put", "m", "1"], ["put", "z", "2"], ["put", "a", "3"], ["put", "z", "4"]],
+    "entries": [["z", "4"], ["a", "3"], ["m", "1"]],
+    "lookup": [["a", "3"]]
+  },
+  {
+    "kind": "map",
+    "key": "String",
+    "steps": [["put", "😀", "emoji"], ["put", "！", "bang"], ["put", "Z", "upper"], ["put", "a", "lower"]],
+    "entries": [["Z", "upper"], ["a", "lower"], ["！", "bang"], ["😀", "emoji"]],
+    "lookup": [["z", null], ["😀", "emoji"]]
+  },
+  {
+    "kind": "map",
+    "key": "Boolean",
+    "steps": [["put", true, "t"], ["put", false, "f"], ["removeKey", true]],
+    "entries": [[false, "f"]],
+    "lookup": [[true, null], [false, "f"]]
+  },
+  {
+    "kind": "map",
+    "key": "Instant",
+    "steps": [["put", "2024-01-01T10:00:00.500Z", "later"], ["put", "2024-01-01T10:00:00Z", "earlier"]],
+    "entries": [["2024-01-01T10:00:00Z", "earlier"], ["2024-01-01T10:00:00.500Z", "later"]],
+    "lookup": [["2024-01-01T10:00:00Z", "earlier"]]
+  }
+]

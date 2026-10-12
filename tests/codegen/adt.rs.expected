@@ -16,6 +16,7 @@
 )]
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum Arvore {
     #[serde(rename = "no")]
     No {
@@ -28,6 +29,7 @@ pub enum Arvore {
 }
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Ponto {
     pub x: crate::bind_runtime::Int,
     pub r#type: ::std::string::String,

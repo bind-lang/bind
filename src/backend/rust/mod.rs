@@ -802,6 +802,7 @@ pub(crate) mod tests {
                 "endpoint" => Some(ENDPOINT_DATABASE_TEST),
                 "ssr" => Some(SSR_TEST),
                 "ssr_text" => Some(SSR_TEXT_TEST),
+                "rich_wire" => Some(RICH_WIRE_TEST),
                 _ => None,
             };
             if let Some(test) = test {
@@ -1046,13 +1047,97 @@ fn repeated_absent_or_invalid_parameters_are_400() {
 }
 "##;
 
+    /// Runs inside the `rich_wire` server crate: the endpoints' rich wire types. Review Focus 4
+    /// (`Pagina<Customer>` and `Pagina<Int>` in one signature, each with its own codec) through
+    /// the generated functions, Review Focus 5 (malformed pairs, duplicates: 400 before any
+    /// transaction) through `handle_rpc`, and, with `BIND_TEST_DATABASE_URL` set, the whole RPC
+    /// round trip.
+    const RICH_WIRE_TEST: &str = r##"#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use bind_server_rich_wire::app;
+use bind_server_rich_wire::bind_runtime::{BindMap, BindSet, Ctx};
+
+const PAGINAS: &str = r#"[["ffffffff-0000-4000-8000-000000000000",{"itens":[],"total":"0"}],["00000000-0000-4000-8000-000000000001",{"itens":[{"id":"00000000-0000-4000-8000-000000000001","name":"Ana"}],"total":"1"}]]"#;
+const CANONICAL: &str = r#"[["00000000-0000-4000-8000-000000000001",{"itens":[{"id":"00000000-0000-4000-8000-000000000001","name":"Ana"}],"total":"1"}],["ffffffff-0000-4000-8000-000000000000",{"itens":[],"total":"0"}]]"#;
+const NUMEROS: &str = r#"{"itens":["4","5","6"],"total":"3"}"#;
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+}
+
+#[test]
+fn generic_instances_use_their_own_codecs() {
+    let rt = runtime();
+    let paginas: BindMap<app::CustomerId, app::Pagina<app::Customer>> = serde_json::from_str(PAGINAS).unwrap();
+    let numeros: app::Pagina<bind_server_rich_wire::bind_runtime::Int> = serde_json::from_str(NUMEROS).unwrap();
+    // Each instance rejects the other's elements.
+    assert!(serde_json::from_str::<app::Pagina<app::Customer>>(NUMEROS).is_err());
+    let agrupa = rt.block_on(app::bind_agrupa(Ctx::pure(), paginas.clone(), numeros.clone())).unwrap();
+    assert_eq!(serde_json::to_string(&agrupa).unwrap(), CANONICAL);
+    let conta = rt.block_on(app::bind_conta(Ctx::pure(), paginas, numeros)).unwrap();
+    assert_eq!(serde_json::to_string(&conta).unwrap(), r#"{"itens":["3"],"total":"3"}"#);
+    let cores: BindSet<app::Cor> = serde_json::from_str(r#"["a","z"]"#).unwrap();
+    let result = rt.block_on(app::bind_cores(Ctx::pure(), cores)).unwrap();
+    assert_eq!(serde_json::to_string(&result).unwrap(), r#"{"Ok":["z","a","m"]}"#);
+    let empty: BindSet<app::Cor> = serde_json::from_str("[]").unwrap();
+    let result = rt.block_on(app::bind_cores(Ctx::pure(), empty)).unwrap();
+    assert_eq!(serde_json::to_string(&result).unwrap(), r#"{"Err":"vazio"}"#);
+    let evento = r#"{"criado":{"em":"2024-01-01T10:00:00.500Z","por":{"id":"00000000-0000-4000-8000-000000000001","name":"Ana"}}}"#;
+    let e: app::Evento = serde_json::from_str(evento).unwrap();
+    let back = rt.block_on(app::bind_evento(Ctx::pure(), e)).unwrap();
+    assert_eq!(serde_json::to_string(&back).unwrap(), evento);
+}
+
+#[test]
+fn malformed_requests_are_400_before_the_transaction() {
+    let rt = runtime();
+    let pool = rt.block_on(async {
+        sqlx::postgres::PgPoolOptions::new().connect_lazy("postgresql://bind-test.invalid/none").unwrap()
+    });
+    let pair = r#"["00000000-0000-4000-8000-000000000001",{"itens":[],"total":"0"}]"#;
+    for (path, body) in [
+        ("/api/agrupa", format!(r#"{{"paginas":[["00000000-0000-4000-8000-000000000001"]],"numeros":{NUMEROS}}}"#)),
+        ("/api/agrupa", format!(r#"{{"paginas":[["00000000-0000-4000-8000-000000000001",{{"itens":[],"total":"0"}},1]],"numeros":{NUMEROS}}}"#)),
+        ("/api/agrupa", format!(r#"{{"paginas":[{pair},{pair}],"numeros":{NUMEROS}}}"#)),
+        ("/api/agrupa", format!(r#"{{"paginas":{PAGINAS},"numeros":{{"itens":[{{"id":"00000000-0000-4000-8000-000000000001","name":"Ana"}}],"total":"1"}}}}"#)),
+        ("/api/conta", format!(r#"{{"paginas":{PAGINAS},"numeros":{{"itens":[],"total":"0","extra":"1"}}}}"#)),
+        ("/api/cores", r#"{"xs":["a","a"]}"#.to_string()),
+        ("/api/cores", r#"{"xs":["x"]}"#.to_string()),
+        ("/api/evento", r#"{"e":{"criado":{"em":"2024-01-01T10:00:00Z"}}}"#.to_string()),
+        ("/api/evento", r#"{"e":{"nenhum2":null}}"#.to_string()),
+        ("/api/evento", r#"{"e":"criado"}"#.to_string()),
+    ] {
+        let result = rt.block_on(bind_server_rich_wire::handle_rpc(path, body.as_bytes(), &pool));
+        assert_eq!(result.status, 400, "{path} {body}: {}", result.body);
+    }
+}
+
+#[test]
+fn rpc_round_trip_against_postgres() {
+    let Ok(url) = std::env::var("BIND_TEST_DATABASE_URL") else {
+        eprintln!("skipped: BIND_TEST_DATABASE_URL not set");
+        return;
+    };
+    let rt = runtime();
+    rt.block_on(async move {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let body = format!(r#"{{"paginas":{PAGINAS},"numeros":{NUMEROS}}}"#);
+        let result = bind_server_rich_wire::handle_rpc("/api/agrupa", body.as_bytes(), &pool).await;
+        assert_eq!((result.status, result.body.as_str()), (200, CANONICAL));
+        let result = bind_server_rich_wire::handle_rpc("/api/conta", body.as_bytes(), &pool).await;
+        assert_eq!((result.status, result.body.as_str()), (200, r#"{"itens":["3"],"total":"3"}"#));
+        pool.close().await;
+    });
+}
+"##;
+
     /// Runs inside the snapshot crate: JSON shapes of the generated types (the `bind-json`
     /// contract) and a few generated functions.
     const SHAPES_TEST: &str = r##"#![allow(clippy::unwrap_used)]
 use std::sync::Arc;
 
-use bind_codegen_snapshots::bind_runtime::{AppError, Ctx, Int};
-use bind_codegen_snapshots::{adt, arithmetic, control, lambdas, records, returns};
+use bind_codegen_snapshots::bind_runtime::{AppError, BindMap, BindResult, BindSet, Ctx, Int};
+use bind_codegen_snapshots::{adt, arithmetic, collections, control, lambdas, records, returns};
 
 fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap()
@@ -1123,6 +1208,90 @@ fn generated_functions_run() {
     let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Arc::new(vec![child.clone(), child]) };
     assert_eq!(rt.block_on(records::bind_total(Ctx::pure(), tree)).unwrap(), Int::from_i64(5));
     assert_eq!(rt.block_on(lambdas::bind_usaIgnora(Ctx::pure())).unwrap(), Int::from_i64(1));
+}
+
+/// `runtime/vectors/wire-rich.json` at the generated types of `collections.bd` (the fixture
+/// types of the vectors' README).
+fn wire_case<T>(case: &serde_json::Value)
+where
+    T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+{
+    let decoded = serde_json::from_value::<T>(case["json"].clone());
+    if case["valid"] == serde_json::Value::Bool(false) {
+        assert!(decoded.is_err(), "{case}: accepted as {decoded:?}");
+        return;
+    }
+    let decoded = decoded.unwrap();
+    assert_eq!(serde_json::to_value(&decoded).unwrap(), case["canonical"], "{case}");
+    let back: T = serde_json::from_value(case["canonical"].clone()).unwrap();
+    assert_eq!(back, decoded, "{case}");
+}
+
+#[test]
+fn rich_wire_vectors() {
+    use collections::{Codigo, Cor, Forma, Pagina, Ponto};
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../runtime/vectors/wire-rich.json");
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    for case in &cases {
+        match case["type"].as_str().unwrap() {
+            "Set<Int>" => wire_case::<BindSet<Int>>(case),
+            "Set<Decimal>" => wire_case::<BindSet<rust_decimal::Decimal>>(case),
+            "Set<String>" => wire_case::<BindSet<String>>(case),
+            "Set<Cor>" => wire_case::<BindSet<Cor>>(case),
+            "Set<Instant>" => wire_case::<BindSet<chrono::DateTime<chrono::Utc>>>(case),
+            "Map<String, Int>" => wire_case::<BindMap<String, Int>>(case),
+            "Map<Decimal, String>" => wire_case::<BindMap<rust_decimal::Decimal, String>>(case),
+            "Map<Cor, Int>" => wire_case::<BindMap<Cor, Int>>(case),
+            "Map<Int, Set<Int>>" => wire_case::<BindMap<Int, BindSet<Int>>>(case),
+            "Result<Int, String>" => wire_case::<BindResult<Int, String>>(case),
+            "Forma" => wire_case::<Forma>(case),
+            "Pagina<Int>" => wire_case::<Pagina<Int>>(case),
+            "Pagina<Ponto>" => wire_case::<Pagina<Ponto>>(case),
+            "Map<Codigo, Pagina<Ponto>>" => wire_case::<BindMap<Codigo, Pagina<Ponto>>>(case),
+            other => panic!("unknown type {other}"),
+        }
+    }
+}
+
+#[test]
+fn collection_functions_run() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let json = |value: serde_json::Value| value.to_string();
+    // Review Focus 3: declaration order (`Z`, `A`, `M`), not the alphabetical one.
+    let cores = rt.block_on(collections::bind_cores(Ctx::pure())).unwrap();
+    assert_eq!(json(serde_json::to_value(&*cores).unwrap()), r#"["z","a","m"]"#);
+    let novo = rt.block_on(collections::bind_novo(Ctx::pure())).unwrap();
+    assert_eq!(json(serde_json::to_value(&novo).unwrap()), r#"[["z","2"],["m","1"]]"#);
+    let chaves = rt.block_on(collections::bind_chaves(Ctx::pure(), novo.clone())).unwrap();
+    assert_eq!(*chaves, vec![collections::Cor::Z, collections::Cor::M]);
+    let valores = rt.block_on(collections::bind_valores(Ctx::pure(), novo.clone())).unwrap();
+    assert_eq!(*valores, vec![Int::from_i64(2), Int::from_i64(1)]);
+    assert_eq!(rt.block_on(collections::bind_tamanho(Ctx::pure(), novo)).unwrap(), Int::from_i64(2));
+    let xs: BindSet<Int> = serde_json::from_str(r#"["0","5"]"#).unwrap();
+    let troca = rt.block_on(collections::bind_troca(Ctx::pure(), xs.clone(), Int::from_i64(3))).unwrap();
+    assert_eq!(json(serde_json::to_value(&troca).unwrap()), r#"["3","5"]"#);
+    assert_eq!(json(serde_json::to_value(&xs).unwrap()), r#"["0","5"]"#);
+    assert!(rt.block_on(collections::bind_tem(Ctx::pure(), xs.clone(), Int::from_i64(4))).unwrap());
+    assert!(!rt.block_on(collections::bind_tem(Ctx::pure(), xs.clone(), Int::from_i64(5))).unwrap());
+    let como = rt.block_on(collections::bind_comoValor(Ctx::pure())).unwrap();
+    assert_eq!(json(serde_json::to_value(&como).unwrap()), r#"["1","2"]"#);
+    let same: BindSet<Int> = serde_json::from_str(r#"["5","0"]"#).unwrap();
+    assert!(rt.block_on(collections::bind_iguais(Ctx::pure(), xs.clone(), same)).unwrap());
+    let m: BindMap<String, Int> = serde_json::from_str(r#"[["a","7"]]"#).unwrap();
+    assert_eq!(rt.block_on(collections::bind_tabela(Ctx::pure(), m.clone(), "a".into())).unwrap(), Some(Int::from_i64(7)));
+    assert_eq!(rt.block_on(collections::bind_tabela(Ctx::pure(), m.clone(), "b".into())).unwrap(), None);
+    assert_eq!(rt.block_on(collections::bind_procura(Ctx::pure(), m, "a".into())).unwrap(), Some(Int::from_i64(7)));
+    let notas: BindMap<collections::Nota, String> = serde_json::from_str(r#"[["1.0","x"],["2","y"]]"#).unwrap();
+    let nota: collections::Nota = serde_json::from_str(r#""1.00""#).unwrap();
+    let limpa = rt.block_on(collections::bind_limpa(Ctx::pure(), notas, nota)).unwrap();
+    assert_eq!(json(serde_json::to_value(&limpa).unwrap()), r#"[["2","y"]]"#);
+    let pagina = rt.block_on(collections::bind_pagina(Ctx::pure(), xs)).unwrap();
+    assert_eq!(json(serde_json::to_value(&pagina).unwrap()), r#"{"itens":["0","5"],"total":"2"}"#);
+    let err = rt.block_on(collections::bind_resultado(Ctx::pure(), Int::from_i64(0))).unwrap();
+    assert_eq!(json(serde_json::to_value(&err).unwrap()), r#"{"Err":"negativo"}"#);
+    let forma: collections::Forma = serde_json::from_str(r#"{"retangulo":{"largura":"2","altura":"3"}}"#).unwrap();
+    assert_eq!(rt.block_on(collections::bind_area(Ctx::pure(), forma)).unwrap(), Int::from_i64(6));
 }
 
 /// `return` as an operand, with the values `core::eval` gives (its test

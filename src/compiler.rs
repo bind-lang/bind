@@ -630,39 +630,58 @@ fn valid_environment_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-/// Wire types of profile rust-web-v3: the scalars of the certified wire format except
-/// `Duration`; `data class`/`entity` (and `distinct type`) whose fields are wire types;
-/// `enum class`/`sealed class` whose variants have no fields; `List<T>` and `T?` of wire
-/// types. Generic user types, functions, `Result`, `Set` and `Map` are not wire types.
+/// Wire types of the Rust server: the scalars of the certified wire format (everything but
+/// functions, `Duration` and `Long`, which the JS frontend cannot hold exactly); `T?`, `List`,
+/// `Set`, `Map` and `Result` of wire types; user types (records, entities, distinct types, enum
+/// and sealed classes, with or without fields) whose fields are wire types, generic ones at
+/// wire type arguments.
 fn v2_wire_type(ty: &TypeExpr, program: &Program, visiting: &mut BTreeSet<String>) -> bool {
+    wire_type_in(ty, program, &BTreeSet::new(), visiting)
+}
+
+/// [`v2_wire_type`] inside a generic declaration whose type parameters are `params`: they stand
+/// for the type arguments, which the use site checks.
+fn wire_type_in(
+    ty: &TypeExpr,
+    program: &Program,
+    params: &BTreeSet<String>,
+    visiting: &mut BTreeSet<String>,
+) -> bool {
     const SCALARS: &[&str] = &[
         "Unit", "String", "Int", "Float", "Double", "Decimal", "Boolean", "UUID", "Date",
         "DateTime", "Instant", "Money", "Email", "Url",
     ];
     match ty {
         TypeExpr::Function { .. } => false,
-        TypeExpr::Nullable(inner) => v2_wire_type(inner, program, visiting),
+        TypeExpr::Nullable(inner) => wire_type_in(inner, program, params, visiting),
         TypeExpr::Named { name, args, .. } => {
-            if args.is_empty() && SCALARS.contains(&name.as_str()) {
+            if args.is_empty() && (SCALARS.contains(&name.as_str()) || params.contains(name)) {
                 return true;
             }
-            if name == "List" {
-                return matches!(args.as_slice(), [inner] if v2_wire_type(inner, program, visiting));
-            }
-            let Some(declaration) = program.types.iter().find(|item| item.name == *name) else {
-                return false;
+            let all_wire = |visiting: &mut BTreeSet<String>| {
+                args.iter()
+                    .all(|arg| wire_type_in(arg, program, params, visiting))
             };
-            if !args.is_empty() || !declaration.type_params.is_empty() {
+            let builtin_arity = match name.as_str() {
+                "List" | "Set" => Some(1),
+                "Map" | "Result" => Some(2),
+                _ => None,
+            };
+            let Some(declaration) = program.types.iter().find(|item| item.name == *name) else {
+                return builtin_arity == Some(args.len()) && all_wire(visiting);
+            };
+            if args.len() != declaration.type_params.len() || !all_wire(visiting) {
                 return false;
             }
             if !visiting.insert(name.clone()) {
                 // A recursive occurrence: decided by the enclosing check.
                 return true;
             }
+            let inner: BTreeSet<String> = declaration.type_params.iter().cloned().collect();
             let field_is_wire =
                 |type_ref: &TypeRef, span: &Span, visiting: &mut BTreeSet<String>| {
                     parse_type_text(&type_ref.display(), span)
-                        .is_ok_and(|parsed| v2_wire_type(&parsed, program, visiting))
+                        .is_ok_and(|parsed| wire_type_in(&parsed, program, &inner, visiting))
                 };
             let wire = match declaration.kind {
                 TypeKind::Data | TypeKind::Entity => declaration
@@ -672,9 +691,11 @@ fn v2_wire_type(ty: &TypeExpr, program: &Program, visiting: &mut BTreeSet<String
                 TypeKind::Distinct => declaration.underlying.as_ref().is_some_and(|underlying| {
                     field_is_wire(underlying, &declaration.span, visiting)
                 }),
-                TypeKind::Enum | TypeKind::Sealed => {
-                    declaration.cases.iter().all(|case| case.fields.is_empty())
-                }
+                TypeKind::Enum | TypeKind::Sealed => declaration.cases.iter().all(|case| {
+                    case.fields
+                        .iter()
+                        .all(|field| field_is_wire(&field.type_ref, &field.span, visiting))
+                }),
             };
             visiting.remove(name);
             wire
@@ -1370,12 +1391,24 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
                 "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
-                "sealed class S { data class A(val n: Int) }\nserver fun h(): S = A(1)\n",
-                "Endpoint `h` uses `S`, which cannot cross the wire in profile rust-web-v3.",
+                "server fun h(n: Long): Int = 1\n",
+                "Endpoint `h` uses `Long`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
-                "server fun r(): Result<Int, String> = Ok(1)\n",
-                "Endpoint `r` uses `Result<Int, String>`, which cannot cross the wire in profile rust-web-v3.",
+                "server fun r(): Result<Int, Long> = Ok(1)\n",
+                "Endpoint `r` uses `Result<Int, Long>`, which cannot cross the wire in profile rust-web-v3.",
+            ),
+            (
+                "data class Caixa<T>(val x: T)\nserver fun c(x: Caixa<Duration>): Int = 1\n",
+                "Endpoint `c` uses `Caixa<Duration>`, which cannot cross the wire in profile rust-web-v3.",
+            ),
+            (
+                "sealed class S { data class A(val f: (Int) -> Int)\n data object B }\nserver fun e(): S = B\n",
+                "Endpoint `e` uses `S`, which cannot cross the wire in profile rust-web-v3.",
+            ),
+            (
+                "server fun m(x: Map<String, Duration>): Int = 1\n",
+                "Endpoint `m` uses `Map<String, Duration>`, which cannot cross the wire in profile rust-web-v3.",
             ),
             (
                 "server fun s(xs: List<Duration>?): Int = 1\n",
@@ -1402,6 +1435,22 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         let source = "enum class Cor { Azul, Verde }\nsealed class Forma { data object Ponto }\ndata class Par(val a: Int, val cores: List<Cor>, val nota: String?)\nfun aplica(f: (Int) -> Int, x: Int): Int = f(x)\nfun espera(d: Duration): Duration = d\nserver fun usa(p: Par, xs: List<Int?>, f: Forma): Par effects [] {\n    val n = aplica({ y -> y + 1 }, p.a)\n    return Par(n, p.cores, p.nota)\n}\n";
         let (root, config) = certified_fixture(source, EMPTY_SCHEMA);
         let result = verify(&config, "aws-lambda");
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// `Set`, `Map`, `Result`, sealed classes with fields and instantiated generic types cross
+    /// the wire (Review Focus 4: one generic record at two instances in one signature).
+    #[test]
+    fn rich_types_cross_the_wire() {
+        let source = "distinct type CustomerId = UUID\nenum class Cor { Z, A, M }\ndata class Customer(val id: CustomerId, val nome: String)\ndata class Pagina<T>(val itens: List<T>, val total: Int)\nsealed class Evento { data class Criado(val por: Customer, val cores: Set<Cor>)\n data object Nenhum }\nserver fun agrupa(p: Map<CustomerId, Pagina<Customer>>, n: Pagina<Int>): Map<CustomerId, Pagina<Customer>> = p\nserver fun cores(xs: Set<Cor>, e: Evento): Result<List<Cor>, String> = Ok(toList(xs))\nserver fun aninhado(x: Pagina<Pagina<Set<Cor>?>>): Map<Cor, Set<Int>> = emptyMap()\n";
+        let (root, config) = certified_fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        assert!(
+            !codes(&result).contains(&"E8309"),
+            "{:?}",
+            result.diagnostics
+        );
         assert!(result.application.is_some(), "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }

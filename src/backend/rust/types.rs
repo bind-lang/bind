@@ -104,6 +104,8 @@ pub struct Layout<'p> {
     /// `(constructor, field index)` of every field stored as `Box<T>` to keep its type sized.
     boxed: BTreeSet<(String, usize)>,
     user_types: BTreeSet<&'p str>,
+    /// User types that satisfy `Key` (set elements, map keys): they derive `Eq` and `Ord`.
+    key_types: BTreeSet<&'p str>,
     /// User type names and type parameters: a primitive of the same name is qualified.
     shadowing: BTreeSet<&'p str>,
     /// Rust identifiers of the type names, type parameters and variant names that cannot be
@@ -167,10 +169,12 @@ impl<'p> Layout<'p> {
                 idents.insert(name.to_string(), ident);
             }
         }
+        let key_types = key_types(program);
         let mut layout = Layout {
             program,
             boxed: BTreeSet::new(),
             user_types,
+            key_types,
             shadowing,
             idents,
             prefix: String::new(),
@@ -364,8 +368,9 @@ impl<'p> Layout<'p> {
                 ("Duration", []) => "::chrono::TimeDelta".into(),
                 ("UUID", []) => "::uuid::Uuid".into(),
                 ("Option", [inner]) => format!("{OPTION}<{inner}>"),
-                ("List" | "Set", [inner]) => format!("{ARC}<::std::vec::Vec<{inner}>>"),
-                ("Map", [key, value]) => format!("{ARC}<::std::vec::Vec<({key}, {value})>>"),
+                ("List", [inner]) => format!("{ARC}<::std::vec::Vec<{inner}>>"),
+                ("Set", [inner]) => format!("{RUNTIME}::BindSet<{inner}>"),
+                ("Map", [key, value]) => format!("{RUNTIME}::BindMap<{key}, {value}>"),
                 ("Result", [ok, err]) => format!("{RUNTIME}::BindResult<{ok}, {err}>"),
                 _ => "::std::compile_error!(\"bindc: unknown type\")".into(),
             },
@@ -469,6 +474,11 @@ impl<'p> Layout<'p> {
         if !self.closure(&["Ui"], true).contains(name) {
             derives.push("PartialEq");
         }
+        // Key types: the canonical order (declaration order of the variants; a distinct type's
+        // base order) is the derived one.
+        if self.key_types.contains(name) {
+            derives.extend(["Eq", "PartialOrd", "Ord"]);
+        }
         // `Duration` (and `Ui`) have no wire form.
         let serde = !self.closure(&["Ui", "Duration"], true).contains(name);
         if serde {
@@ -490,6 +500,10 @@ impl<'p> Layout<'p> {
             };
             let (derives, serde) = self.derives(name);
             output.push_str(&format!("#[derive({})]\n", derives.join(", ")));
+            // `bind-json`: a field the type does not have is rejected (as by the JS decoders).
+            if serde && !matches!(ty, CoreType::Distinct { .. }) {
+                output.push_str("#[serde(deny_unknown_fields)]\n");
+            }
             let generics = if params.is_empty() {
                 String::new()
             } else {
@@ -606,6 +620,50 @@ impl<'p> Layout<'p> {
             format!("{BOX}<{rendered}>")
         } else {
             rendered
+        }
+    }
+}
+
+/// The user types that satisfy `Key` (`Env::key_types` of the checker): sum types without type
+/// parameters whose variants all lack fields, and distinct types over a key scalar or over
+/// another key type.
+fn key_types(program: &CoreProgram) -> BTreeSet<&str> {
+    let mut set: BTreeSet<&str> = program
+        .types
+        .iter()
+        .filter_map(|ty| match ty {
+            CoreType::Sum {
+                name,
+                params,
+                variants,
+            } if name != "Result"
+                && params.is_empty()
+                && !variants.is_empty()
+                && variants.iter().all(|(_, fields)| fields.is_empty()) =>
+            {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    loop {
+        let mut changed = false;
+        for ty in &program.types {
+            if let CoreType::Distinct {
+                name,
+                underlying: Type::Con(base, args),
+            } = ty
+                && args.is_empty()
+                && !set.contains(name.as_str())
+                && (crate::types::ty::KEY_SCALARS.contains(&base.as_str())
+                    || set.contains(base.as_str()))
+            {
+                set.insert(name);
+                changed = true;
+            }
+        }
+        if !changed {
+            return set;
         }
     }
 }
@@ -740,8 +798,65 @@ mod tests {
         assert!(output.contains("#[derive(Clone)]\npub struct W "));
         assert!(output.contains("#[derive(Clone, Debug, PartialEq)]\npub struct D "));
         assert!(output.contains(
-            "#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\npub struct P "
+            "#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n#[serde(deny_unknown_fields)]\npub struct P "
         ));
+    }
+
+    #[test]
+    fn sets_and_maps_are_the_runtime_collections() {
+        let program = compile("data class P(val x: Int)\n");
+        let set = Type::Con("Set".into(), vec![Type::con("Decimal")]);
+        assert_eq!(
+            rust_type(&set, &program),
+            "crate::bind_runtime::BindSet<::rust_decimal::Decimal>"
+        );
+        let map = Type::Con("Map".into(), vec![Type::con("String"), Type::con("P")]);
+        assert_eq!(
+            rust_type(&map, &program),
+            "crate::bind_runtime::BindMap<::std::string::String, P>"
+        );
+    }
+
+    /// Key types derive `Eq` and `Ord` (declaration order, base order); serde types reject
+    /// unknown fields, except distinct types (transparent).
+    #[test]
+    fn key_types_derive_their_canonical_order() {
+        let program = compile(
+            "enum class Cor { Z, A, M }\nsealed class Fase { data object Fim\n data object Inicio }\nsealed class Misto { data class X(val n: Int)\n data object Y }\ndistinct type Nota = Decimal\ndistinct type Tom = Cor\ndistinct type Real = Double\ndata class P(val x: Int)\n",
+        );
+        let output = type_declarations(&program);
+        let keyed = "#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]\n";
+        let plain =
+            "#[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]\n";
+        let strict = "#[serde(deny_unknown_fields)]\n";
+        assert!(
+            output.contains(&format!("{keyed}{strict}pub enum Cor ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{keyed}{strict}pub enum Fase ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{plain}{strict}pub enum Misto ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{keyed}#[serde(transparent)]\npub struct Nota ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{keyed}#[serde(transparent)]\npub struct Tom ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{plain}#[serde(transparent)]\npub struct Real ")),
+            "{output}"
+        );
+        assert!(
+            output.contains(&format!("{plain}{strict}pub struct P ")),
+            "{output}"
+        );
     }
 
     #[test]

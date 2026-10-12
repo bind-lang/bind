@@ -31,19 +31,20 @@ pub mod bind_runtime;
 /// The program's types and functions. User names live only here, so they never meet the
 /// items below (database layer, request types, router, tests) or the runtime.
 pub mod app {
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct WideId {
         pub value: ::uuid::Uuid,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct Pontos {
         pub value: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Wide {
         pub id: WideId,
         pub a: ::std::string::String,
@@ -57,6 +58,7 @@ pub mod app {
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub enum Grande {
         #[serde(rename = "cheio")]
         Cheio {

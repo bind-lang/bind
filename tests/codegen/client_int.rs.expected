@@ -31,7 +31,7 @@ pub mod bind_runtime;
 /// The program's types and functions. User names live only here, so they never meet the
 /// items below (database layer, request types, router, tests) or the runtime.
 pub mod app {
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct Count {
         pub value: crate::bind_runtime::Int,
@@ -50,6 +50,7 @@ pub mod app {
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Item {
         pub id: ::uuid::Uuid,
         pub name: ::std::string::String,
@@ -59,6 +60,7 @@ pub mod app {
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Summary {
         pub history: ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>,
         pub series: Counts,

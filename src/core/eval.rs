@@ -1748,6 +1748,173 @@ mod tests {
         );
     }
 
+    /// The fixture types of `runtime/vectors/collections.json` (see its README).
+    const COLLECTION_FIXTURES: &str = "enum class Cor { Z, A, M }\ndistinct type Nota = Decimal\n";
+
+    /// A `bind-json` value of the vectors as an evaluator value of type `ty`.
+    fn from_wire(ty: &str, json: &display::tests::Json) -> Value {
+        use display::tests::Json;
+        match (ty, json) {
+            ("Int", Json::Str(text)) => int(text),
+            ("Decimal", Json::Str(text)) => decimal(text),
+            ("Nota", _) => ctor("Nota", vec![from_wire("Decimal", json)]),
+            ("Cor", Json::Str(name)) => ctor(&name.to_uppercase(), vec![]),
+            ("Boolean", Json::Bool(value)) => Value::Bool(*value),
+            ("String" | "UUID" | "Date" | "DateTime" | "Instant", Json::Str(value)) => text(value),
+            other => panic!("unexpected vector value {other:?}"),
+        }
+    }
+
+    /// The `bind-json` form of an evaluator value of a fixture or key type.
+    fn to_wire(value: &Value) -> display::tests::Json {
+        use display::tests::Json;
+        match value {
+            Value::Int(_) => Json::Str(value.render()),
+            Value::Decimal(text) | Value::Str(text) => Json::Str(text.to_string()),
+            Value::Bool(value) => Json::Bool(*value),
+            Value::None => Json::Null,
+            Value::Some(inner) => to_wire(inner),
+            Value::Ctor { name, fields } if name == "Nota" => to_wire(&fields.0[0]),
+            Value::Ctor { name, fields } if fields.0.is_empty() => Json::Str(name.to_lowercase()),
+            Value::List(items) | Value::Set(items) => {
+                Json::Array(items.0.iter().map(to_wire).collect())
+            }
+            Value::Map { keys, values } => Json::Array(
+                keys.0
+                    .iter()
+                    .zip(values.0.iter())
+                    .map(|(key, value)| Json::Array(vec![to_wire(key), to_wire(value)]))
+                    .collect(),
+            ),
+            other => panic!("unexpected value {other:?}"),
+        }
+    }
+
+    /// `runtime/vectors/collections.json` agrees with the evaluator, the oracle of the Rust and
+    /// JS runtimes: each case becomes a Bind expression over parameters (`Decimal` has no
+    /// literal), evaluated with the case's values.
+    #[test]
+    fn collection_vectors_agree_with_the_evaluator() {
+        use display::tests::{Json, parse_json, vector_path};
+        let text = std::fs::read_to_string(vector_path("collections.json")).expect("vectors");
+        let cases = parse_json(&text);
+        assert!(cases.array().len() >= 20);
+        for case in cases.array() {
+            let set = case.get("kind").str() == "set";
+            let ty = if set {
+                case.get("element").str()
+            } else {
+                case.get("key").str()
+            };
+            // Parameters `p<i>` (with their values) and the collection expression.
+            let mut params: Vec<(String, &str)> = Vec::new();
+            let mut args = Vec::new();
+            let mut param = |param_ty: &'static str, json: &Json, args: &mut Vec<Value>| {
+                let name = format!("p{}", params.len());
+                params.push((format!("{name}: {param_ty}"), param_ty));
+                args.push(from_wire(param_ty, json));
+                name
+            };
+            let key_ty: &'static str = match ty {
+                "Int" => "Int",
+                "Decimal" => "Decimal",
+                "Nota" => "Nota",
+                "Cor" => "Cor",
+                "Boolean" => "Boolean",
+                "String" => "String",
+                "UUID" => "UUID",
+                "Date" => "Date",
+                "DateTime" => "DateTime",
+                "Instant" => "Instant",
+                other => panic!("unknown type {other}"),
+            };
+            let mut collection = if set {
+                let items: Vec<String> = case
+                    .get("setOf")
+                    .array()
+                    .iter()
+                    .map(|item| param(key_ty, item, &mut args))
+                    .collect();
+                if items.is_empty() {
+                    "emptySet()".to_string()
+                } else {
+                    format!("setOf({})", items.join(", "))
+                }
+            } else {
+                "emptyMap()".to_string()
+            };
+            for step in case.get("steps").array() {
+                let step = step.array();
+                let key = param(key_ty, &step[1], &mut args);
+                collection = match step[0].str() {
+                    "put" => {
+                        let value = param("String", &step[2], &mut args);
+                        format!("put({collection}, {key}, {value})")
+                    }
+                    op => format!("{op}({collection}, {key})"),
+                };
+            }
+            let checks: Vec<String> = case
+                .get(if set { "contains" } else { "lookup" })
+                .array()
+                .iter()
+                .map(|check| {
+                    let item = param(key_ty, &check.array()[0], &mut args);
+                    if set {
+                        format!("contains(c, {item})")
+                    } else {
+                        format!("lookup(c, {item})")
+                    }
+                })
+                .collect();
+            let collection_ty = if set {
+                format!("Set<{key_ty}>")
+            } else {
+                format!("Map<{key_ty}, String>")
+            };
+            let signature: Vec<&str> = params.iter().map(|(text, _)| text.as_str()).collect();
+            let source = format!(
+                "{COLLECTION_FIXTURES}fun c0({}): {collection_ty} = {collection}\nfun f({}): List<{}> {{\n    val c = c0({})\n    return listOf({})\n}}\nfun g({}): {collection_ty} = c0({})\n",
+                signature.join(", "),
+                signature.join(", "),
+                if set { "Boolean" } else { "String?" },
+                (0..params.len())
+                    .map(|i| format!("p{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                checks.join(", "),
+                signature.join(", "),
+                (0..params.len())
+                    .map(|i| format!("p{i}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            let program = compile(&source);
+            let collection = eval_function(&program, "g", args.clone()).expect("evaluates");
+            let results = eval_function(&program, "f", args).expect("evaluates");
+            let wire = to_wire(&collection);
+            let expected_checks: Vec<&Json> = case
+                .get(if set { "contains" } else { "lookup" })
+                .array()
+                .iter()
+                .map(|check| &check.array()[1])
+                .collect();
+            let Json::Array(found_checks) = to_wire(&results) else {
+                panic!("not a list");
+            };
+            assert_eq!(
+                found_checks.iter().collect::<Vec<_>>(),
+                expected_checks,
+                "{source}"
+            );
+            if set {
+                assert_eq!(&wire, case.get("toList"), "{source}");
+            } else {
+                assert_eq!(&wire, case.get("entries"), "{source}");
+            }
+        }
+    }
+
     /// Review Focus 3: variants are ordered by declaration, not by name.
     #[test]
     fn enum_keys_follow_declaration_order() {

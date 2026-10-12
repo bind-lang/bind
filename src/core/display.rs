@@ -522,7 +522,7 @@ fn is_allowed_href(url: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -806,7 +806,7 @@ mod tests {
 
     // ---- Shared cross-runtime vectors (`runtime/vectors/`, see its README) ----
 
-    fn vector_path(name: &str) -> std::path::PathBuf {
+    pub(crate) fn vector_path(name: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("runtime/vectors")
             .join(name)
@@ -816,16 +816,18 @@ mod tests {
         std::env::var_os("BIND_BLESS").is_some()
     }
 
-    /// A minimal JSON value: just what the vector files use (no numbers, `null` or booleans).
-    #[derive(Debug)]
-    enum Json {
+    /// A minimal JSON value: just what the vector files use (no numbers).
+    #[derive(Debug, PartialEq)]
+    pub(crate) enum Json {
         Str(String),
+        Bool(bool),
+        Null,
         Array(Vec<Json>),
         Object(Vec<(String, Json)>),
     }
 
     impl Json {
-        fn get(&self, key: &str) -> &Json {
+        pub(crate) fn get(&self, key: &str) -> &Json {
             match self {
                 Json::Object(fields) => fields
                     .iter()
@@ -836,14 +838,14 @@ mod tests {
             }
         }
 
-        fn str(&self) -> &str {
+        pub(crate) fn str(&self) -> &str {
             match self {
                 Json::Str(text) => text,
                 other => panic!("not a string: {other:?}"),
             }
         }
 
-        fn array(&self) -> &[Json] {
+        pub(crate) fn array(&self) -> &[Json] {
             match self {
                 Json::Array(items) => items,
                 other => panic!("not an array: {other:?}"),
@@ -851,7 +853,7 @@ mod tests {
         }
     }
 
-    fn parse_json(text: &str) -> Json {
+    pub(crate) fn parse_json(text: &str) -> Json {
         fn skip(chars: &mut std::iter::Peekable<std::str::Chars>) {
             while chars.peek().is_some_and(|c| c.is_whitespace()) {
                 chars.next();
@@ -915,6 +917,16 @@ mod tests {
                         if chars.peek() == Some(&',') {
                             chars.next();
                         }
+                    }
+                }
+                Some('t' | 'f' | 'n') => {
+                    let word: String =
+                        std::iter::from_fn(|| chars.next_if(|c| c.is_ascii_alphabetic())).collect();
+                    match word.as_str() {
+                        "true" => Json::Bool(true),
+                        "false" => Json::Bool(false),
+                        "null" => Json::Null,
+                        other => panic!("unexpected {other}"),
                     }
                 }
                 other => panic!("unexpected {other:?}"),

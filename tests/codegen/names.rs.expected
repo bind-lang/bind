@@ -32,104 +32,109 @@ pub mod bind_runtime;
 /// items below (database layer, request types, router, tests) or the runtime.
 pub mod app {
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct HttpResult {
         pub status: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct tests {
         pub y: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct bind_runtime {
         pub z: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct app {
         pub w: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct finish {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct begin {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct error_result {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct handle_rpc {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct serve_rpc {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct db_find_things {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct decode_things {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct ctx {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct bind_dobro {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct v0_a {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct c0 {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct m0 {
         pub value: crate::bind_runtime::Int,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct p0 {
         pub value: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct r#match {
         #[serde(rename = "_")]
         pub __: crate::bind_runtime::Int,
@@ -138,21 +143,25 @@ pub mod app {
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Self_ {
         pub a: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct self_ {
         pub a: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct __ {
         pub a: crate::bind_runtime::Int,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Caixa<r#type, Self_> {
         pub x: r#type,
         pub __phantom: crate::bind_runtime::Int,
@@ -161,6 +170,7 @@ pub mod app {
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub enum S {
         #[serde(rename = "type")]
         r#type,
@@ -173,13 +183,14 @@ pub mod app {
         crate_,
     }
 
-    #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(transparent)]
     pub struct ThingId {
         pub value: ::uuid::Uuid,
     }
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
     pub struct Thing {
         pub id: ThingId,
         pub label: ::std::string::String,

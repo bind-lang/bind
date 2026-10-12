@@ -16,6 +16,7 @@
 )]
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Par {
     pub primeiro: crate::bind_runtime::Int,
     pub segundo: ::std::string::String,

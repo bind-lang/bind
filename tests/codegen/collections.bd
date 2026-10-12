@@ -1,0 +1,59 @@
+// `Set`/`Map` builtins (runtime `BindSet`/`BindMap`) and the fixture types of
+// `runtime/vectors/wire-rich.json` (checked against the vectors by the snapshot crate's tests).
+enum class Cor { Z, A, M }
+
+distinct type Nota = Decimal
+
+distinct type Codigo = UUID
+
+data class Ponto(val x: Int, val y: Int)
+
+data class Pagina<T>(val itens: List<T>, val total: Int)
+
+sealed class Forma {
+    data class Circulo(val raio: Int)
+    data class Retangulo(val largura: Int, val altura: Int)
+    data object Vazia
+}
+
+data class Catalogo(val porCodigo: Map<Codigo, Pagina<Ponto>>, val cores: Set<Cor>, val notas: Set<Nota>)
+
+fun cores(): List<Cor> = toList(setOf(M, A, Z, A))
+
+fun troca(xs: Set<Int>, x: Int): Set<Int> = remove(insert(xs, x), 0)
+
+fun tem(xs: Set<Int>, x: Int): Boolean = contains(xs, x + 1) && setSize(xs) > 0
+
+fun vazio(): Set<String> = emptySet()
+
+fun tabela(m: Map<String, Int>, k: String): Int? = lookup(put(m, k + "!", 1), k)
+
+fun limpa(m: Map<Nota, String>, k: Nota): Map<Nota, String> = removeKey(m, k)
+
+fun chaves(m: Map<Cor, Int>): List<Cor> = keys(m)
+
+fun valores(m: Map<Cor, Int>): List<Int> = values(m)
+
+fun tamanho(m: Map<Cor, Int>): Int = mapSize(m)
+
+fun novo(): Map<Cor, Int> = put(put(emptyMap(), M, 1), Z, 2)
+
+fun iguais(a: Set<Int>, b: Set<Int>): Boolean = a == b
+
+fun aplica(f: (Set<Int>, Int) -> Set<Int>): Set<Int> = f(setOf(1), 2)
+
+fun comoValor(): Set<Int> = aplica(insert)
+
+fun tamanhos(xss: List<Set<Int>>): List<Int> = map(xss, setSize)
+
+fun <V> procura(m: Map<String, V>, k: String): V? = lookup(m, k)
+
+fun pagina(xs: Set<Int>): Pagina<Int> = Pagina(toList(xs), setSize(xs))
+
+fun resultado(x: Int): Result<Int, String> = if (x > 0) Ok(x) else Err("negativo")
+
+fun area(f: Forma): Int = when (f) {
+    Circulo(r) -> r * r * 3
+    Retangulo(l, a) -> l * a
+    Vazia -> 0
+}

@@ -464,6 +464,262 @@ pub async fn fold<A: Clone + Send + Sync + 'static, B: Send + 'static>(
 }
 
 // ---------------------------------------------------------------------------------------------
+// `Set<T>` and `Map<K, V>`: immutable, ordered by the canonical order of their elements or keys
+// (the `Ord` of the key types: numeric for `Int` and `Decimal`, by value, so `1.0` and `1.00` are
+// the same key; by code point for strings; typed for dates; by declaration for enums, whose
+// generated `Ord` is derived; `false < true`; a distinct type by its base). On the wire a set is
+// the array of its elements and a map the array of its `[key, value]` pairs, both in canonical
+// order; decoding accepts any order and rejects duplicates and malformed pairs.
+// ---------------------------------------------------------------------------------------------
+
+/// Bind's `Set<T>`.
+pub struct BindSet<T>(pub Arc<std::collections::BTreeSet<T>>);
+
+/// Bind's `Map<K, V>`.
+pub struct BindMap<K, V>(pub Arc<std::collections::BTreeMap<K, V>>);
+
+impl<T> Clone for BindSet<T> {
+    fn clone(&self) -> Self {
+        BindSet(Arc::clone(&self.0))
+    }
+}
+
+impl<K, V> Clone for BindMap<K, V> {
+    fn clone(&self) -> Self {
+        BindMap(Arc::clone(&self.0))
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for BindSet<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.0.iter()).finish()
+    }
+}
+
+impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for BindMap<K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.0.iter()).finish()
+    }
+}
+
+/// Element by element in canonical order (the checker's equality; `Decimal` by value).
+impl<T: PartialEq> PartialEq for BindSet<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().eq(other.0.iter())
+    }
+}
+
+impl<K: PartialEq, V: PartialEq> PartialEq for BindMap<K, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().eq(other.0.iter())
+    }
+}
+
+impl<T: serde::Serialize> serde::Serialize for BindSet<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+impl<K: serde::Serialize, V: serde::Serialize> serde::Serialize for BindMap<K, V> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de> + Ord> serde::Deserialize<'de> for BindSet<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct SetVisitor<T>(std::marker::PhantomData<fn() -> T>);
+
+        impl<'de, T: serde::Deserialize<'de> + Ord> serde::de::Visitor<'de> for SetVisitor<T> {
+            type Value = BindSet<T>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an array of distinct set elements")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<BindSet<T>, A::Error> {
+                let mut set = std::collections::BTreeSet::new();
+                while let Some(element) = seq.next_element::<T>()? {
+                    if !set.insert(element) {
+                        return Err(serde::de::Error::custom("duplicate set element"));
+                    }
+                }
+                Ok(BindSet(Arc::new(set)))
+            }
+        }
+
+        deserializer.deserialize_seq(SetVisitor(std::marker::PhantomData))
+    }
+}
+
+/// One `[key, value]` pair of a map on the wire: an array of exactly two elements.
+struct WirePair<K, V>(K, V);
+
+impl<'de, K: serde::Deserialize<'de>, V: serde::Deserialize<'de>> serde::Deserialize<'de>
+    for WirePair<K, V>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct PairVisitor<K, V>(std::marker::PhantomData<fn() -> (K, V)>);
+
+        impl<'de, K: serde::Deserialize<'de>, V: serde::Deserialize<'de>> serde::de::Visitor<'de>
+            for PairVisitor<K, V>
+        {
+            type Value = WirePair<K, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a [key, value] pair")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<WirePair<K, V>, A::Error> {
+                let malformed = || serde::de::Error::custom("malformed map pair");
+                let key = seq.next_element::<K>()?.ok_or_else(malformed)?;
+                let value = seq.next_element::<V>()?.ok_or_else(malformed)?;
+                if seq.next_element::<serde::de::IgnoredAny>()?.is_some() {
+                    return Err(malformed());
+                }
+                Ok(WirePair(key, value))
+            }
+        }
+
+        deserializer.deserialize_seq(PairVisitor(std::marker::PhantomData))
+    }
+}
+
+impl<'de, K: serde::Deserialize<'de> + Ord, V: serde::Deserialize<'de>> serde::Deserialize<'de>
+    for BindMap<K, V>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct MapVisitor<K, V>(std::marker::PhantomData<fn() -> (K, V)>);
+
+        impl<'de, K: serde::Deserialize<'de> + Ord, V: serde::Deserialize<'de>>
+            serde::de::Visitor<'de> for MapVisitor<K, V>
+        {
+            type Value = BindMap<K, V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("an array of [key, value] pairs with distinct keys")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<BindMap<K, V>, A::Error> {
+                let mut map = std::collections::BTreeMap::new();
+                while let Some(WirePair(key, value)) = seq.next_element::<WirePair<K, V>>()? {
+                    match map.entry(key) {
+                        std::collections::btree_map::Entry::Occupied(_) => {
+                            return Err(serde::de::Error::custom("duplicate map key"));
+                        }
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(value);
+                        }
+                    }
+                }
+                Ok(BindMap(Arc::new(map)))
+            }
+        }
+
+        deserializer.deserialize_seq(MapVisitor(std::marker::PhantomData))
+    }
+}
+
+pub fn empty_set<T>() -> BindSet<T> {
+    BindSet(Arc::new(std::collections::BTreeSet::new()))
+}
+
+/// `setOf(a, b, …)`: the elements inserted left to right (of two equal ones, the first stays).
+pub fn set_of<T: Ord>(items: Vec<T>) -> BindSet<T> {
+    let mut set = std::collections::BTreeSet::new();
+    for item in items {
+        if !set.contains(&item) {
+            set.insert(item);
+        }
+    }
+    BindSet(Arc::new(set))
+}
+
+/// `insert(s, x)`: an element equal to `x` already in `s` stays (`s` is returned as is).
+pub fn set_insert<T: Ord + Clone>(mut set: BindSet<T>, item: T) -> BindSet<T> {
+    if !set.0.contains(&item) {
+        Arc::make_mut(&mut set.0).insert(item);
+    }
+    set
+}
+
+pub fn set_remove<T: Ord + Clone>(mut set: BindSet<T>, item: T) -> BindSet<T> {
+    if set.0.contains(&item) {
+        Arc::make_mut(&mut set.0).remove(&item);
+    }
+    set
+}
+
+pub fn set_contains<T: Ord>(set: &BindSet<T>, item: &T) -> bool {
+    set.0.contains(item)
+}
+
+pub fn set_size<T>(set: &BindSet<T>) -> Int {
+    Int(num_bigint::BigInt::from(set.0.len()))
+}
+
+/// `toList(s)`: the elements in canonical order.
+pub fn set_to_list<T: Clone>(set: &BindSet<T>) -> Arc<Vec<T>> {
+    Arc::new(set.0.iter().cloned().collect())
+}
+
+pub fn empty_map<K, V>() -> BindMap<K, V> {
+    BindMap(Arc::new(std::collections::BTreeMap::new()))
+}
+
+/// `put(m, k, v)`: on a key equal to `k` already in `m`, that key stays and only its value is
+/// replaced.
+pub fn map_put<K: Ord + Clone, V: Clone>(
+    mut map: BindMap<K, V>,
+    key: K,
+    value: V,
+) -> BindMap<K, V> {
+    let entries = Arc::make_mut(&mut map.0);
+    match entries.get_mut(&key) {
+        Some(slot) => *slot = value,
+        None => {
+            entries.insert(key, value);
+        }
+    }
+    map
+}
+
+pub fn map_lookup<K: Ord, V: Clone>(map: &BindMap<K, V>, key: &K) -> Option<V> {
+    map.0.get(key).cloned()
+}
+
+pub fn map_remove_key<K: Ord + Clone, V: Clone>(mut map: BindMap<K, V>, key: K) -> BindMap<K, V> {
+    if map.0.contains_key(&key) {
+        Arc::make_mut(&mut map.0).remove(&key);
+    }
+    map
+}
+
+/// `keys(m)`: the keys in canonical order.
+pub fn map_keys<K: Clone, V>(map: &BindMap<K, V>) -> Arc<Vec<K>> {
+    Arc::new(map.0.keys().cloned().collect())
+}
+
+/// `values(m)`: the values in the order of their keys.
+pub fn map_values<K, V: Clone>(map: &BindMap<K, V>) -> Arc<Vec<V>> {
+    Arc::new(map.0.values().cloned().collect())
+}
+
+pub fn map_size<K, V>(map: &BindMap<K, V>) -> Int {
+    Int(num_bigint::BigInt::from(map.0.len()))
+}
+
+// ---------------------------------------------------------------------------------------------
 // UI nodes, HTML rendering, screens and display functions. `core::display` in `bindc` is the
 // canonical definition; these functions give the same bytes (checked against the shared vectors
 // in `runtime/vectors/`).
