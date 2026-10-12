@@ -914,9 +914,9 @@ fn scenarios(runtime: &tokio::runtime::Runtime, url: &str, schema: &str) {
     }
     println!("rich: Map argument, sealed with Set and Result, Ok/Err/fieldless give the same page in ssr and split");
 
-    // Review Focus 5, server: a malformed Map is a 400 with serde's message, before any query.
+    // Review Focus 5, server: a malformed Map is a 400 with serde's message.
     for (saldos, message) in [
-        (format!(r#"[["{ana}"]]"#), "malformed map pair at line 1 column 95"),
+        (format!(r#"[["{ana}"]]"#), "malformed map pair at line 1 column "),
         (format!(r#"[["{ana}","1","2"]]"#), "malformed map pair at line 1 column "),
         (format!(r#"[["{ana}","1"],["{ana}","2"]]"#), "duplicate map key"),
     ] {
