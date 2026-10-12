@@ -907,7 +907,8 @@ enum KeyKind {
     /// `String`, `Email`, `Url`, `UUID`: by Unicode code point (the order of the UTF-8 bytes;
     /// a `UUID` is its canonical lowercase text, so this is also the order of its 128 bits).
     Text,
-    /// An `enum class`: the declaration order of its variants.
+    /// An `enum class` or a `sealed class` of `data object`s: the declaration order of its
+    /// variants.
     Enum(Vec<String>),
     /// A distinct type: the order of the value it wraps.
     Distinct(Box<KeyKind>),
@@ -1755,6 +1756,13 @@ mod tests {
         assert_eq!(
             run(source, "g", vec![]).expect("evaluates").render(),
             "[Z, A, M]"
+        );
+        // A sealed class made only of `data object`s orders the same way, also under a distinct.
+        let sealed = "sealed class Fase {\n    data object Fim\n    data object Inicio\n}\ndistinct type Etapa = Fase\nfun f() = toList(setOf(Inicio, Fim, Inicio))\nfun g() = setOf(Etapa(Inicio), Etapa(Fim))";
+        assert_eq!(rendered(sealed, vec![]), "[Fim, Inicio]");
+        assert_eq!(
+            run(sealed, "g", vec![]).expect("evaluates").render(),
+            "Set[Etapa(Fim), Etapa(Inicio)]"
         );
     }
 

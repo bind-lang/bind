@@ -42,8 +42,8 @@ impl Type {
 
 const NUMERIC: &[&str] = &["Int", "Double", "Float", "Decimal"];
 
-/// Built-in types that satisfy `Key`; `enum class` types and distinct types over a `Key`
-/// type satisfy it too (`TypeTable::is_key_type`).
+/// Built-in types that satisfy `Key`; `enum class` types, `sealed class` types made only of
+/// `data object`s and distinct types over a `Key` type satisfy it too (`TypeTable::is_key_type`).
 pub const KEY_SCALARS: &[&str] = &[
     "Int", "String", "Email", "Url", "Boolean", "UUID", "Decimal", "Money", "Date", "DateTime",
     "Instant",
@@ -54,7 +54,7 @@ pub const KEY_SCALARS: &[&str] = &[
 /// accepted by the weaker ones. `Key` (set elements and map keys) is not on that chain, so a
 /// variable that must satisfy both `Key` and an operator constraint gets their intersection
 /// (`KeyOrd`, `KeyAdd`, `KeySub`, `KeyNum`; `Key` already implies `Eq`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Constraint {
     Eq,
     Ord,
@@ -92,12 +92,24 @@ impl Constraint {
         }
     }
 
+    /// The position of an operator constraint on the chain `Eq < Ord < Add < Sub < Num`.
+    fn strength(self) -> u8 {
+        match self.parts().0 {
+            Constraint::Ord => 1,
+            Constraint::Add => 2,
+            Constraint::Sub => 3,
+            Constraint::Num => 4,
+            _ => 0,
+        }
+    }
+
     /// The constraint of a variable that must satisfy both: the stronger operator constraint,
     /// with `Key` when either requires it.
     pub fn meet(self, other: Constraint) -> Constraint {
         let (a, key_a) = self.parts();
         let (b, key_b) = other.parts();
-        Constraint::from_parts(a.max(b), key_a || key_b)
+        let operator = if a.strength() >= b.strength() { a } else { b };
+        Constraint::from_parts(operator, key_a || key_b)
     }
 
     /// Whether a built-in type constructor (ignoring its arguments) satisfies the constraint.
@@ -133,7 +145,7 @@ impl Constraint {
             }
             Constraint::Eq => "equality (functions and type parameters cannot be compared)",
             Constraint::Key => {
-                "use as a set element or map key (accepted types: Int, String, Email, Url, Boolean, UUID, Decimal, Money, Date, DateTime, Instant, enum classes and distinct types over them)"
+                "use as a set element or map key (accepted types: Int, String, Email, Url, Boolean, UUID, Decimal, Money, Date, DateTime, Instant, enum classes, sealed classes whose variants are all `data object`s, and distinct types over them)"
             }
             Constraint::KeyOrd => {
                 "ordering comparisons and use as a set element or map key (accepted types: Int, Decimal, Money, String, Date, DateTime, Instant)"
@@ -167,8 +179,8 @@ pub struct TypeTable {
     /// Type constructors that never support equality: `Ui` and user types whose fields
     /// contain a function or another such type (see `Env::build`).
     non_equatable: BTreeSet<String>,
-    /// User types that satisfy `Key`: `enum class` types and distinct types over a `Key` type
-    /// (see `Env::build`).
+    /// User types that satisfy `Key`: `enum class` types, `sealed class` types made only of
+    /// `data object`s and distinct types over a `Key` type (see `Env::build`).
     key_types: BTreeSet<String>,
 }
 

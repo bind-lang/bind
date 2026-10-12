@@ -1493,7 +1493,6 @@ pub fn client_functions(program: &CoreProgram, component: &str) -> Vec<String> {
     seen.into_iter().collect()
 }
 
-/// The element type of `List<T>`.
 /// The element type of a `List<T>` or `Set<T>`.
 fn list_element(ty: &Type) -> Type {
     match ty {

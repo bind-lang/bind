@@ -730,6 +730,9 @@ impl<'p> Validator<'p> {
                 ));
                 return;
             };
+            if name == "setOf" {
+                self.key_instance(name, element);
+            }
             let collection = if name == "listOf" { "List" } else { "Set" };
             let list = Type::Con(collection.into(), vec![element.clone()]);
             let fits = matches!(ty, Type::Fun(params, result, _)
@@ -759,10 +762,39 @@ impl<'p> Validator<'p> {
             ));
             return;
         }
+        if scheme.key
+            && let Some(key) = instance.first()
+        {
+            self.key_instance(name, key);
+        }
         let vars: Vec<usize> = (0..scheme.vars).collect();
         let expected = instantiate(&scheme.ty, &vars, instance);
         if !same(&expected, ty) {
             self.mismatch(&format!("a reference to builtin `{name}`"), &expected, ty);
+        }
+    }
+
+    /// A cheap self-check of the checker's `Key` constraint: the element or key type of a
+    /// `Set`/`Map` builtin is never a float, a function, a generic type (`Option`, `List`,
+    /// `Set`, `Map`, …) or a record.
+    fn key_instance(&mut self, name: &str, key: &Type) {
+        let rejected = match key {
+            Type::Fun(..) => true,
+            Type::Con(type_name, args) => {
+                !args.is_empty()
+                    || matches!(type_name.as_str(), "Double" | "Float")
+                    || matches!(
+                        self.signatures.types.get(type_name.as_str()),
+                        Some(CoreType::Record { .. })
+                    )
+            }
+            Type::Var(_) | Type::Error => false,
+        };
+        if rejected {
+            self.problem(format!(
+                "builtin `{name}` has the key type {}, which is not a `Key` type",
+                display(key)
+            ));
         }
     }
 
@@ -1094,6 +1126,51 @@ mod tests {
             problems.iter().any(|problem| problem.contains(keyword)),
             "expected a problem mentioning {keyword:?}, got {problems:?}"
         );
+    }
+
+    #[test]
+    fn collection_builtins_reject_a_non_key_instance() {
+        let set = |element: Type| Type::Con("Set".into(), vec![element]);
+        let builtin = |name: &str, instance: Vec<Type>, ty: Type| {
+            e(
+                ty,
+                ExprKind::Builtin {
+                    name: name.into(),
+                    instance,
+                },
+            )
+        };
+        for key in [
+            t("Double"),
+            t("Float"),
+            t("P"),
+            Type::option(t("Int")),
+            Type::list(t("Int")),
+        ] {
+            let ty = Type::Fun(Vec::new(), Box::new(set(key.clone())), Row::empty());
+            rejects(
+                function(
+                    "f",
+                    Vec::new(),
+                    ty.clone(),
+                    builtin("emptySet", vec![key.clone()], ty),
+                ),
+                "not a `Key` type",
+            );
+            let of = Type::Fun(vec![key.clone()], Box::new(set(key.clone())), Row::empty());
+            rejects(
+                function("g", Vec::new(), of.clone(), builtin("setOf", vec![key], of)),
+                "not a `Key` type",
+            );
+        }
+        let ok = Type::Fun(Vec::new(), Box::new(set(t("Int"))), Row::empty());
+        let valid = function(
+            "f",
+            Vec::new(),
+            ok.clone(),
+            builtin("emptySet", vec![t("Int")], ok),
+        );
+        assert_eq!(validate(&program(vec![valid])), Vec::<String>::new());
     }
 
     #[test]

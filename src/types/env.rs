@@ -350,15 +350,17 @@ impl Env {
         env
     }
 
-    /// `enum class` types (variants without fields) and distinct types over a `Key` type,
-    /// directly or through other distinct types (a fixpoint).
+    /// `enum class` types and `sealed class` types whose variants all have no fields (only
+    /// `data object`s), and distinct types over a `Key` type, directly or through other distinct
+    /// types (a fixpoint). `Result` has type parameters and fields, so it is never one.
     fn key_types(&self) -> BTreeSet<String> {
         let mut set: BTreeSet<String> = self
             .types
             .iter()
             .filter(|(_, info)| {
-                info.kind == TypeKind::Enum
+                matches!(info.kind, TypeKind::Enum | TypeKind::Sealed)
                     && info.params.is_empty()
+                    && !info.ctors.is_empty()
                     && info
                         .ctors
                         .iter()

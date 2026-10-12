@@ -1213,7 +1213,7 @@ impl<'a> Checker<'a> {
                 ),
                 span.clone(),
             )
-            .with_hint("Annotate a parameter or value, e.g. `a: Int` or `a: Double`."),
+            .with_hint(ambiguity_hint(constraint)),
         );
     }
 
@@ -2436,7 +2436,21 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// `db.<table>.<method>` as written, before any shadowing check.
+/// How to resolve a variable left ambiguous under `constraint`: an example of an accepted type.
+fn ambiguity_hint(constraint: Constraint) -> &'static str {
+    match constraint {
+        Constraint::Eq | Constraint::Ord | Constraint::Add | Constraint::Sub | Constraint::Num => {
+            "Annotate a parameter or value, e.g. `a: Int` or `a: Double`."
+        }
+        Constraint::Key => {
+            "Annotate the collection or its key, e.g. `val s: Set<Int> = emptySet()` or `k: String`."
+        }
+        Constraint::KeyOrd | Constraint::KeyAdd | Constraint::KeySub | Constraint::KeyNum => {
+            "Annotate the collection or its key, e.g. `val s: Set<Int> = emptySet()` or `k: Int`."
+        }
+    }
+}
+
 /// A written type whose `Set` elements and `Map` keys satisfy `Key`. Each one that does not
 /// (a type parameter never does) is reported (E7301) and replaced by `Error`, so the uses of
 /// the value do not report it again.
@@ -2470,6 +2484,7 @@ fn checked_keys(env: &Env, ty: Type, span: &Span, diagnostics: &mut Vec<Diagnost
     }
 }
 
+/// `db.<table>.<method>` as written, before any shadowing check.
 fn db_method(expr: &Expr) -> Option<(&str, &str)> {
     let ExprKind::Field {
         target,
@@ -2925,7 +2940,7 @@ mod tests {
         );
     }
 
-    const KEYS: &str = "distinct type CustomerId = UUID\ndistinct type Codigo = CustomerId\ndistinct type Peso = Double\nentity Customer(val id: CustomerId, val name: String)\nenum class Cor { Z, A, M }\n";
+    const KEYS: &str = "sealed class Fase {\n    data object Fim\n    data object Inicio\n}\ndistinct type Etapa = Fase\nsealed class Misto {\n    data object Nada\n    data class Um(val x: Int)\n}\ndistinct type CustomerId = UUID\ndistinct type Codigo = CustomerId\ndistinct type Peso = Double\nentity Customer(val id: CustomerId, val name: String)\nenum class Cor { Z, A, M }\n";
 
     #[test]
     fn key_constraint_accepts_closed_set_of_types() {
@@ -3037,6 +3052,15 @@ mod tests {
                 "{diagnostics:?}"
             );
         }
+        // The hint of an ambiguous key suggests a key type, not `Double`.
+        let (tokens, _) = crate::lexer::lex("test.bd", "fun f() = emptySet()");
+        let (program, _) = crate::parser::parse(tokens);
+        let (_, diagnostics) = crate::types::check(&program, &DatabaseSchema::default());
+        let hint = diagnostics[0].hint.clone().unwrap_or_default();
+        assert!(
+            hint.contains("Set<Int>") && !hint.contains("Double"),
+            "{hint}"
+        );
         // No defaulting: an unresolved `Key` variable is ambiguous.
         assert_eq!(errors("fun f() = emptySet()"), vec!["E7302"]);
         assert_eq!(errors("fun f(x) = setOf(x)"), vec!["E7302"]);
