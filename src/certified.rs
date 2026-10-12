@@ -493,10 +493,10 @@ fn sample_json(ty: &TypeExpr, app: &VerifiedApplication, depth: usize) -> String
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
-                TypeKind::Enum | TypeKind::Sealed => declaration
-                    .variants
-                    .first()
-                    .map_or_else(|| "null".to_string(), |variant| json(&lower_camel(variant))),
+                TypeKind::Enum | TypeKind::Sealed => declaration.cases.first().map_or_else(
+                    || "null".to_string(),
+                    |variant| json(&lower_camel(&variant.name)),
+                ),
                 TypeKind::Distinct => declaration.underlying.as_ref().map_or_else(
                     || "null".to_string(),
                     |underlying| sample_json(&parse_wire_type(underlying), app, depth + 1),

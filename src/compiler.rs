@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,10 +7,10 @@ use crate::ast::*;
 use crate::config::ProjectConfig;
 use crate::core::ir::CoreProgram;
 use crate::diagnostic::{Diagnostic, Severity, Span, has_errors};
-use crate::lexer::{Token, TokenKind, lex};
+use crate::lexer::lex;
 use crate::parser::expr::parse_type_text;
 use crate::parser::parse;
-use crate::schema::{DatabaseSchema, closest, stable_hash};
+use crate::schema::{DatabaseSchema, stable_hash};
 use crate::syntax::expr::TypeExpr;
 
 #[derive(Clone, Debug)]
@@ -158,27 +158,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             module_count: files.len(),
         };
     }
-    // Token-based graph and database operations, still used by the checks below that run before
-    // lowering (diagnostic paths, the tables in use, E8307). The graph and operations of the
-    // verified application are computed from the IR (`core::analysis`) after lowering.
-    let mut token_graph = ApplicationGraph::default();
-    let type_map: BTreeMap<_, _> = program
-        .types
-        .iter()
-        .map(|item| (item.name.clone(), item))
-        .collect();
-    let function_map: BTreeMap<_, _> = program
-        .functions
-        .iter()
-        .map(|item| (item.name.clone(), item))
-        .collect();
-    validate_declarations(&program, &type_map, &function_map, &mut diagnostics);
-
+    // Declarations (duplicates, unknown types, `var` fields) and every database access
+    // (tables, models, columns, operations) were checked by the type checker above.
     let mut required_capabilities = BTreeSet::new();
-    let mut token_operations = Vec::new();
-    let mut pending_database_errors = Vec::new();
     for function in &program.functions {
-        token_graph.add_node(function.name.clone());
         match function.domain {
             Domain::Client => {
                 required_capabilities.insert("ui.dom".into());
@@ -193,38 +176,11 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
                 required_capabilities.insert(label.clone());
             }
         }
-        analyze_function(
-            function,
-            &program,
-            &type_map,
-            &function_map,
-            &database,
-            &mut token_graph,
-            &mut token_operations,
-            &mut diagnostics,
-            &mut pending_database_errors,
-        );
-        if config.strict && function.body.iter().any(|token| token.text == "!!") {
-            diagnostics.push(Diagnostic::warning("W2101", format!("Function `{}` uses a forced nullable unwrap (`!!`).", function.name), function.span.clone())
-                .with_hint("Prefer explicit null handling; strict projects may promote this warning to an error."));
-        }
     }
 
     let mut environment = validate_environment(&program, config, &mut diagnostics);
     environment.sort_by(|a, b| a.variable.cmp(&b.variable));
-    for declaration in &program.environment {
-        token_graph.add_edge(
-            format!("environment.{}", declaration.name),
-            format!("env.{}", declaration.variable),
-        );
-    }
     // Secrets reaching client code (E4102) are found on the IR (`core::analysis`).
-    for (function, resource, mut diagnostic) in pending_database_errors {
-        token_graph.add_edge(function.clone(), resource.clone());
-        diagnostic.path = token_graph.path_to(&function);
-        diagnostic.path.push(resource);
-        diagnostics.push(diagnostic);
-    }
 
     let provided: BTreeSet<_> = target_config.capabilities.iter().cloned().collect();
     let missing: Vec<_> = required_capabilities
@@ -280,10 +236,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         }
     }
     if target_config.server == "rust" {
-        validate_rust_server_surface(&program, &database, &token_operations, &mut diagnostics);
+        validate_rust_server_surface(&program, &database, &mut diagnostics);
     }
     if target_config.certified {
-        validate_certified_surface(&program, &token_operations, config, &mut diagnostics);
+        validate_certified_surface(&program, &mut diagnostics);
     }
 
     if config.warnings_as_errors {
@@ -312,6 +268,13 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         None
     } else {
         let core = crate::core::lower::lower(&program, &typed, &database);
+        // The certified database runtime needs its credential declared (E8307) as soon as the
+        // program accesses the database: any `Db` node of the IR, as the backend generates one
+        // database function per operation.
+        if target_config.certified && !crate::core::analysis::database_operations(&core).is_empty()
+        {
+            validate_database_credential(&program, config, &mut diagnostics);
+        }
         // Diagnostics computed from types (E4102, E5303, E5204, E2301) come before validation:
         // a body-less function with a non-`Unit` result (E2301) is lowered with a `Unit` body,
         // which validation would report as a compiler bug.
@@ -389,182 +352,52 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     }
 }
 
-fn validate_declarations(
-    program: &Program,
-    types: &BTreeMap<String, &TypeDecl>,
-    functions: &BTreeMap<String, &Function>,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let mut seen = BTreeSet::new();
-    for item in &program.types {
-        if !seen.insert(item.name.clone()) {
-            diagnostics.push(Diagnostic::error(
-                "E2001",
-                format!("Type `{}` is declared more than once.", item.name),
-                item.span.clone(),
-            ));
-        }
-        if let Some(underlying) = &item.underlying {
-            validate_type(underlying, types, &item.span, diagnostics);
-        }
-        for field in item
-            .fields
-            .iter()
-            .chain(item.cases.iter().flat_map(|case| &case.fields))
-        {
-            if !mentions_type_param(&field.type_ref, &item.type_params) {
-                validate_type(&field.type_ref, types, &field.span, diagnostics);
-            }
-        }
-    }
-    seen.clear();
-    for item in &program.functions {
-        if !seen.insert(item.name.clone()) {
-            diagnostics.push(Diagnostic::error(
-                "E2002",
-                format!("Function `{}` is declared more than once.", item.name),
-                item.span.clone(),
-            ));
-        }
-        if let Some(return_type) = &item.return_type
-            && !mentions_type_param(return_type, &item.type_params)
-        {
-            validate_type(return_type, types, &item.span, diagnostics);
-        }
-        for parameter in &item.parameters {
-            if let Some(type_ref) = &parameter.type_ref
-                && !mentions_type_param(type_ref, &item.type_params)
-            {
-                validate_type(type_ref, types, &item.span, diagnostics);
-            }
-        }
-    }
-    let _ = functions;
-}
-
-/// Type parameters and function types are verified by the type checker (`types`), not here.
-fn mentions_type_param(type_ref: &TypeRef, params: &[String]) -> bool {
-    type_ref.name.starts_with('(')
-        || type_ref
-            .name
-            .split(|ch: char| !ch.is_alphanumeric() && ch != '_')
-            .any(|part| params.iter().any(|param| param == part))
-}
-
-fn validate_type(
-    type_ref: &TypeRef,
-    types: &BTreeMap<String, &TypeDecl>,
-    span: &Span,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let base = type_ref
-        .name
-        .split(['<', ','])
-        .next()
-        .unwrap_or(&type_ref.name)
-        .trim_end_matches('?');
-    let builtins = [
-        "Unit",
-        "String",
-        "Int",
-        "Long",
-        "Float",
-        "Double",
-        "Decimal",
-        "Boolean",
-        "UUID",
-        "Date",
-        "DateTime",
-        "Instant",
-        "Duration",
-        "Money",
-        "Email",
-        "Url",
-        "DatabaseUrl",
-        "Port",
-        "Secret",
-        "Ui",
-        "Result",
-        "List",
-        "Set",
-        "Map",
-    ];
-    if !builtins.contains(&base) && !types.contains_key(base) {
-        diagnostics.push(Diagnostic::error(
-            "E2003",
-            format!("Unknown type `{}`.", type_ref.name),
-            span.clone(),
-        ));
-    }
-}
-
-fn validate_certified_surface(
-    program: &Program,
-    operations: &[DatabaseOperation],
-    config: &ProjectConfig,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn validate_certified_surface(program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+    // A sealed type without variants has no values: neither the checker nor the parser rejects
+    // it, and the certified data model does not accept it.
     for declaration in &program.types {
-        if declaration.kind == TypeKind::Sealed && declaration.variants.is_empty() {
+        if declaration.kind == TypeKind::Sealed && declaration.cases.is_empty() {
             diagnostics.push(Diagnostic::error(
                 "E8302",
                 format!("Sealed type `{}` has no variants.", declaration.name),
                 declaration.span.clone(),
             ));
         }
-        for field in &declaration.fields {
-            if field.mutable {
-                diagnostics.push(Diagnostic::error(
-                    "E8308",
-                    format!(
-                        "Mutable field `{}.{}` is outside the immutable certified data model.",
-                        declaration.name, field.name
-                    ),
-                    field.span.clone(),
-                ));
-            }
-            if !certified_wire_type(&field.type_ref.name, program) {
-                diagnostics.push(Diagnostic::error(
-                    "E8303",
-                    format!(
-                        "Type `{}` is not supported by the certified wire format yet.",
-                        field.type_ref.display()
-                    ),
-                    field.span.clone(),
-                ));
-            }
-        }
     }
+}
 
-    if !operations.is_empty() {
-        let configured_variable = config.database_url_env.as_deref();
-        let database_environment = configured_variable.and_then(|variable| {
-            program
-                .environment
-                .iter()
-                .find(|declaration| declaration.variable == variable)
-        });
-        match database_environment {
-            Some(declaration)
-                if configured_variable.is_some_and(valid_environment_name)
-                    && !declaration.optional
-                    && declaration.default.is_none()
-                    && declaration.secret
-                    && !declaration.public
-                    && matches!(declaration.lifecycle.as_str(), "runtime" | "compile_and_runtime") =>
-            {
-            }
-            _ => diagnostics.push(
-                Diagnostic::error(
-                    "E8307",
-                    "The certified database runtime requires a non-optional runtime secret declaration for the configured database environment variable.",
-                    Span::default(),
-                )
-                .with_hint(
-                    "Declare `runtime secret val databaseUrl: DatabaseUrl = env(\"DATABASE_URL\")` and reference the same variable from `[database.main].env`.",
-                ),
+/// E8307: a certified program that accesses the database reads its URL from a non-optional
+/// runtime secret declared for the configured variable (`[database.main].env`).
+fn validate_database_credential(
+    program: &Program,
+    config: &ProjectConfig,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let configured_variable = config.database_url_env.as_deref();
+    let database_environment = configured_variable.and_then(|variable| {
+        program
+            .environment
+            .iter()
+            .find(|declaration| declaration.variable == variable)
+    });
+    match database_environment {
+        Some(declaration)
+            if configured_variable.is_some_and(valid_environment_name)
+                && !declaration.optional
+                && declaration.default.is_none()
+                && declaration.secret
+                && !declaration.public
+                && matches!(declaration.lifecycle.as_str(), "runtime" | "compile_and_runtime") => {}
+        _ => diagnostics.push(
+            Diagnostic::error(
+                "E8307",
+                "The certified database runtime requires a non-optional runtime secret declaration for the configured database environment variable.",
+                Span::default(),
+            )
+            .with_hint(
+                "Declare `runtime secret val databaseUrl: DatabaseUrl = env(\"DATABASE_URL\")` and reference the same variable from `[database.main].env`.",
             ),
-        }
+        ),
     }
 }
 
@@ -606,7 +439,6 @@ fn frontend_diagnostics(
 fn validate_rust_server_surface(
     program: &Program,
     database: &DatabaseSchema,
-    operations: &[DatabaseOperation],
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     for function in &program.functions {
@@ -664,14 +496,13 @@ fn validate_rust_server_surface(
             }
         }
     }
-    // Only the tables the program uses: one mapped to a declared model or named by a database
-    // operation.
-    let used = database.tables.values().filter(|table| {
-        program.types.iter().any(|item| item.name == table.model)
-            || operations
-                .iter()
-                .any(|operation| operation.table == table.name)
-    });
+    // Only the tables the program may use: those mapped to a declared model. A table named by a
+    // database operation is one of them, since the type checker requires its model to be a
+    // declared entity (E7103).
+    let used = database
+        .tables
+        .values()
+        .filter(|table| program.types.iter().any(|item| item.name == table.model));
     for table in used {
         for column in table.columns.values() {
             let Ok(parsed) = parse_type_text(&column.type_name, &Span::default()) else {
@@ -799,26 +630,6 @@ fn valid_environment_name(value: &str) -> bool {
         && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
-fn certified_wire_type(name: &str, program: &Program) -> bool {
-    let base = name.split('<').next().unwrap_or(name).trim_end_matches('?');
-    let scalar = [
-        "Unit", "String", "Int", "Float", "Double", "Decimal", "Boolean", "UUID", "Date",
-        "DateTime", "Instant", "Duration", "Money", "Email", "Url",
-    ];
-    if scalar.contains(&base) {
-        return true;
-    }
-    if base == "List" {
-        return generic_arguments(name).is_some_and(|arguments| {
-            arguments.len() == 1 && certified_wire_type(&arguments[0], program)
-        });
-    }
-    program
-        .types
-        .iter()
-        .any(|declaration| declaration.name == base)
-}
-
 /// Wire types of profile rust-web-v3: the scalars of the certified wire format except
 /// `Duration`; `data class`/`entity` (and `distinct type`) whose fields are wire types;
 /// `enum class`/`sealed class` whose variants have no fields; `List<T>` and `T?` of wire
@@ -927,250 +738,6 @@ fn render_type_expr(ty: &TypeExpr) -> String {
             render_type_expr(result)
         ),
     }
-}
-
-fn generic_arguments(name: &str) -> Option<Vec<String>> {
-    let start = name.find('<')?;
-    let end = name.rfind('>')?;
-    let mut arguments = Vec::new();
-    let mut depth = 0usize;
-    let mut current = String::new();
-    for ch in name[start + 1..end].chars() {
-        match ch {
-            '<' => {
-                depth += 1;
-                current.push(ch);
-            }
-            '>' => {
-                depth = depth.saturating_sub(1);
-                current.push(ch);
-            }
-            ',' if depth == 0 => {
-                arguments.push(current.clone());
-                current.clear();
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.is_empty() {
-        arguments.push(current);
-    }
-    Some(arguments)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn analyze_function(
-    function: &Function,
-    program: &Program,
-    types: &BTreeMap<String, &TypeDecl>,
-    functions: &BTreeMap<String, &Function>,
-    database: &DatabaseSchema,
-    graph: &mut ApplicationGraph,
-    operations: &mut Vec<DatabaseOperation>,
-    diagnostics: &mut Vec<Diagnostic>,
-    pending_database_errors: &mut Vec<(String, String, Diagnostic)>,
-) {
-    let body = &function.body;
-    let mut index = 0;
-    while index < body.len() {
-        // Calls only feed the application graph: the type checker verifies them.
-        let call_name = if body.get(index).is_some_and(|token| token.text == "server")
-            && body.get(index + 1).is_some_and(|token| token.text == ".")
-        {
-            body.get(index + 2).map(|token| token.text.clone())
-        } else if body.get(index + 1).is_some_and(|token| token.text == "(")
-            && functions.contains_key(&body[index].text)
-            && !(index >= 2 && body[index - 2].text == "server" && body[index - 1].text == ".")
-        {
-            Some(body[index].text.clone())
-        } else {
-            None
-        };
-        if let Some(call_name) = call_name
-            && functions.contains_key(&call_name)
-        {
-            graph.add_edge(function.name.clone(), call_name);
-        }
-        if body.get(index).is_some_and(|token| token.text == "db")
-            && body.get(index + 1).is_some_and(|token| token.text == ".")
-        {
-            let table_name = body
-                .get(index + 2)
-                .map(|token| token.text.clone())
-                .unwrap_or_default();
-            let method = body
-                .get(index + 4)
-                .map(|token| token.text.clone())
-                .unwrap_or_default();
-            let write = ["insert", "update", "delete", "upsert"].contains(&method.as_str());
-            let effect = if write { "db.write" } else { "db.read" }.to_string();
-            let assignments = if method == "insert" {
-                insert_assignments(body, index + 5)
-            } else {
-                Vec::new()
-            };
-            operations.push(DatabaseOperation {
-                function: function.name.clone(),
-                table: table_name.clone(),
-                method: method.clone(),
-                effect: effect.clone(),
-            });
-            graph.add_edge(function.name.clone(), format!("database.main.{table_name}"));
-            match database.tables.get(&table_name) {
-                None => {
-                    let hint = closest(&table_name, database.tables.keys())
-                        .map(|name| format!("Did you mean `{name}`?"));
-                    let mut diagnostic = Diagnostic::error(
-                        "E5200",
-                        format!("Database table `{table_name}` does not exist in database `main`."),
-                        body[index].span.clone(),
-                    );
-                    if let Some(hint) = hint {
-                        diagnostic = diagnostic.with_hint(hint);
-                    }
-                    pending_database_errors.push((
-                        function.name.clone(),
-                        format!("database.main.{table_name}"),
-                        diagnostic,
-                    ));
-                }
-                Some(table) => {
-                    if !write && !["require", "find"].contains(&method.as_str()) {
-                        diagnostics.push(Diagnostic::error(
-                            "E8204",
-                            format!("The built-in generators cannot lower database read method `{method}` without losing query semantics."),
-                            body[index].span.clone(),
-                        ));
-                    }
-                    if method == "insert" {
-                        for (name, _) in &assignments {
-                            if !table.columns.contains_key(name) {
-                                diagnostics.push(Diagnostic::error(
-                                    "E5201",
-                                    format!(
-                                        "Column `{}.{name}` does not exist in database `main`.",
-                                        table.name
-                                    ),
-                                    body[index].span.clone(),
-                                ));
-                            }
-                        }
-                        // A missing required column (E5303) is found on the IR.
-                    } else if write {
-                        diagnostics.push(Diagnostic::error(
-                            "E8204",
-                            format!("The built-in generators cannot lower database method `{method}` safely."),
-                            body[index].span.clone(),
-                        ));
-                    }
-                    if let Some(model) = types.get(&table.model) {
-                        for field in &model.fields {
-                            graph.add_edge(
-                                function.name.clone(),
-                                format!("database.main.{}.{}", table.name, field.name),
-                            );
-                            if !table.columns.contains_key(&field.name) {
-                                let resource =
-                                    format!("database.main.{}.{}", table.name, field.name);
-                                let hint = closest(&field.name, table.columns.keys());
-                                let mut diagnostic = Diagnostic::error(
-                                    "E5201",
-                                    format!(
-                                        "Column `{}.{}` required by `{}` does not exist in database `main`.",
-                                        table.name, field.name, model.name
-                                    ),
-                                    field.span.clone(),
-                                );
-                                if let Some(hint) = hint {
-                                    diagnostic = diagnostic.with_hint(format!(
-                                        "Did you mean `{}.{hint}`?",
-                                        table.name
-                                    ));
-                                }
-                                pending_database_errors.push((
-                                    function.name.clone(),
-                                    resource,
-                                    diagnostic,
-                                ));
-                            }
-                            // A field whose type differs from the column's (E5204) is found
-                            // on the IR.
-                        }
-                    } else {
-                        diagnostics.push(Diagnostic::error(
-                            "E5202",
-                            format!(
-                                "Database table `{table_name}` maps to unknown model `{}`.",
-                                table.model
-                            ),
-                            body[index].span.clone(),
-                        ));
-                    }
-                    for window in body.windows(3) {
-                        if window[0].text == "it"
-                            && window[1].text == "."
-                            && !table.columns.contains_key(&window[2].text)
-                        {
-                            pending_database_errors.push((
-                                function.name.clone(),
-                                format!("database.main.{}.{}", table.name, window[2].text),
-                                Diagnostic::error(
-                                    "E5201",
-                                    format!(
-                                        "Column `{}.{}` does not exist in database `main`.",
-                                        table.name, window[2].text
-                                    ),
-                                    window[2].span.clone(),
-                                ),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        index += 1;
-    }
-    // A body-less function with a non-`Unit` result (E2301) is found on the IR.
-    let _ = program;
-}
-
-fn insert_assignments(body: &[Token], brace_index: usize) -> Vec<(String, String)> {
-    if body.get(brace_index).is_none_or(|token| token.text != "{") {
-        return Vec::new();
-    }
-    let mut result = Vec::new();
-    let mut index = brace_index + 1;
-    let mut depth = 1;
-    while index + 2 < body.len() && depth > 0 {
-        if body[index].text == "{" {
-            depth += 1;
-            index += 1;
-            continue;
-        }
-        if body[index].text == "}" {
-            depth -= 1;
-            index += 1;
-            continue;
-        }
-        if depth == 1 && body[index].kind == TokenKind::Identifier && body[index + 1].text == "=" {
-            let name = body[index].text.clone();
-            let line = body[index + 2].span.line;
-            let mut value = String::new();
-            index += 2;
-            while index < body.len()
-                && body[index].span.line == line
-                && body[index].text != ","
-                && body[index].text != "}"
-            {
-                value.push_str(&body[index].text);
-                index += 1;
-            }
-            result.push((name, value));
-        } else {
-            index += 1;
-        }
-    }
-    result
 }
 
 fn validate_environment(
@@ -1510,15 +1077,11 @@ client component CustomerPage(id: CustomerId) {
     }
 
     #[test]
-    fn legacy_validation_skips_type_parameters_and_function_types() {
+    fn type_parameters_and_function_types_verify() {
         let source = "pure fun <T> ident(x: T): T = x\npure fun aplica(f: (Int) -> Int, x: Int): Int = f(x)\n";
         let (root, config) = fixture(source, EMPTY_SCHEMA);
         let result = verify(&config, "aws-lambda");
-        assert!(
-            !result.diagnostics.iter().any(|item| item.code == "E2003"),
-            "{:?}",
-            result.diagnostics
-        );
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1681,7 +1244,7 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
     }
 
     #[test]
-    fn type_errors_abort_before_the_legacy_analysis() {
+    fn type_errors_abort_verification() {
         let (root, config) = fixture("pure fun f(): Int = \"texto\"\n", EMPTY_SCHEMA);
         let result = verify(&config, "aws-lambda");
         assert!(result.application.is_none());
@@ -1715,14 +1278,12 @@ pure fun wrong(id: CustomerId): Unit { getOrder(id) }
     }
 
     #[test]
-    fn inferred_and_generic_functions_pass_the_legacy_analysis() {
+    fn inferred_and_generic_functions_verify() {
         let source = "pure fun dobro(x) = x * 2\npure fun <T> ident(x: T): T = x\npure fun usa(): Int = dobro(ident(2))\n";
         let (root, config) = fixture(source, EMPTY_SCHEMA);
         let result = verify(&config, "aws-lambda");
-        let bad = result.diagnostics.iter().any(|item| {
-            item.code == "E2202" || item.code == "E5205" || item.severity == Severity::Error
-        });
-        assert!(!bad, "{:?}", result.diagnostics);
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -2697,5 +2258,378 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
             )
             .is_empty()
         );
+    }
+
+    // ---- Coverage of the removed diagnostics ------------------------------------------------
+    // Each test shows a program with the bug a removed code used to catch still rejected, and
+    // names the code that catches it now.
+
+    /// The diagnostics of a rejected program (no application), on the default or the certified
+    /// fixture.
+    fn rejected(source: &str, schema: &str, certified: bool) -> Vec<Diagnostic> {
+        let (root, config) = if certified {
+            certified_fixture(source, schema)
+        } else {
+            fixture(source, schema)
+        };
+        let result = verify(&config, "aws-lambda");
+        fs::remove_dir_all(root).unwrap();
+        assert!(
+            result.application.is_none(),
+            "expected a rejection:\n{source}"
+        );
+        result.diagnostics
+    }
+
+    /// Asserts that `source` is rejected with `code` and with a message containing `message`.
+    fn assert_rejected_by(source: &str, schema: &str, certified: bool, code: &str, message: &str) {
+        let diagnostics = rejected(source, schema, certified);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.code == code && item.message.contains(message)),
+            "expected {code} ({message}) for:\n{source}\ngot {diagnostics:?}"
+        );
+    }
+
+    const CUSTOMER: &str =
+        "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\n";
+
+    /// E5200 (unknown table) is E7104 of the type checker.
+    #[test]
+    fn coverage_e5200_unknown_table_is_e7104() {
+        for body in [
+            "server fun f(id: CustomerId): Customer effects [db.read] = db.custmers.require(id)\n",
+            "server fun f(id: CustomerId): Customer? effects [db.read] = db.custmers.find(id)\n",
+            "server fun f(n: String): Customer effects [db.write] = db.custmers.insert {\n    name = n\n}\n",
+            "server fun f(id: CustomerId): Int effects [db.read] = db.custmers.count(id)\n",
+        ] {
+            assert_rejected_by(
+                &format!("{CUSTOMER}{body}"),
+                SCHEMA,
+                false,
+                "E7104",
+                "Unknown database table `custmers`",
+            );
+        }
+    }
+
+    /// E5201 for an inserted column the table lacks is E7104; its `it.` heuristic (a field of a
+    /// row the table lacks) is E7104 on the record type.
+    #[test]
+    fn coverage_e5201_unknown_columns_are_e7104() {
+        let insert = format!(
+            "{CUSTOMER}server fun f(n: String): Customer effects [db.write] = db.customers.insert {{\n    nme = n\n}}\n"
+        );
+        assert_rejected_by(
+            &insert,
+            SCHEMA,
+            false,
+            "E7104",
+            "Table `customers` has no column `nme`",
+        );
+        let lambda = format!(
+            "{CUSTOMER}server fun f(id: CustomerId): List<String> effects [db.read] = map(listOf(db.customers.require(id)), {{ it -> it.nme }})\n"
+        );
+        assert_rejected_by(
+            &lambda,
+            SCHEMA,
+            false,
+            "E7104",
+            "`Customer` has no field `nme`",
+        );
+        let field = format!(
+            "{CUSTOMER}server fun f(id: CustomerId): String effects [db.read] = db.customers.require(id).nme\n"
+        );
+        assert_rejected_by(
+            &field,
+            SCHEMA,
+            false,
+            "E7104",
+            "`Customer` has no field `nme`",
+        );
+    }
+
+    /// E5202 (a table mapped to an unknown model) is E7103.
+    #[test]
+    fn coverage_e5202_unknown_model_is_e7103() {
+        let schema = SCHEMA.replace(",Customer,", ",Cliente,");
+        for body in [
+            "server fun f(id: CustomerId): String effects [db.read] = db.customers.require(id).name\n",
+            "server fun f(n: String): CustomerId effects [db.write] = db.customers.insert {\n    name = n\n}.id\n",
+        ] {
+            assert_rejected_by(
+                &format!("{CUSTOMER}{body}"),
+                &schema,
+                false,
+                "E7103",
+                "Table `customers` maps to `Cliente`, which is not a declared entity",
+            );
+        }
+    }
+
+    /// E8204 for a table operation the generators cannot lower is E7004.
+    #[test]
+    fn coverage_e8204_table_operations_are_e7004() {
+        for body in [
+            "server fun f(id: CustomerId): Int effects [db.read] = db.customers.count(id)\n",
+            "server fun f(id: CustomerId): Customer effects [db.write] = db.customers.delete(id)\n",
+            "server fun f(c: Customer): Customer effects [db.write] = db.customers.upsert(c)\n",
+            "server fun f(c: Customer): Customer effects [db.write] = db.customers.insert(c)\n",
+        ] {
+            assert_rejected_by(
+                &format!("{CUSTOMER}{body}"),
+                SCHEMA,
+                false,
+                "E7004",
+                "Unsupported table operation",
+            );
+        }
+        assert_rejected_by(
+            &format!(
+                "{CUSTOMER}server fun f(n: String): Customer effects [db.write] = db.customers.update {{\n    name = n\n}}\n"
+            ),
+            SCHEMA,
+            false,
+            "E7004",
+            "blocks are only supported on `db.<table>.insert`",
+        );
+    }
+
+    /// W2101 (`!!`) is the parser's E7001: the operator was removed from the language.
+    #[test]
+    fn coverage_w2101_forced_unwrap_is_e7001() {
+        assert_rejected_by(
+            "pure fun f(x: Int?): Int = x!!\n",
+            EMPTY_SCHEMA,
+            false,
+            "E7001",
+            "`!!` was removed",
+        );
+    }
+
+    /// E8303 (a data-model field the certified wire format cannot carry) is E8309 where the
+    /// type crosses the wire (an endpoint's parameter or result, directly or through fields)
+    /// and E8310 where an entity field cannot be stored. A record that never crosses the wire
+    /// nor reaches the database may hold any type (as on a target that is not certified).
+    #[test]
+    fn coverage_e8303_non_wire_fields_are_e8309_on_endpoints() {
+        for (types, signature) in [
+            (
+                "data class Caixa(val n: Long)\n",
+                "server fun f(c: Caixa): Int = 1\n",
+            ),
+            (
+                "data class Caixa(val f: (Int) -> Int)\n",
+                "server fun f(): Caixa = Caixa({ x -> x })\n",
+            ),
+            (
+                "data class Dentro(val n: Long)\ndata class Caixa(val d: List<Dentro>?)\n",
+                "server fun f(c: Caixa): Int = 1\n",
+            ),
+            (
+                "data class Caixa(val d: Duration)\n",
+                "server fun f(c: Caixa): Int = 1\n",
+            ),
+        ] {
+            assert_rejected_by(
+                &format!("{types}{signature}"),
+                EMPTY_SCHEMA,
+                true,
+                "E8309",
+                "Endpoint `f` uses",
+            );
+        }
+        // An entity field the database cannot store is E8310 (the generated database layer).
+        let source = format!(
+            "{DATABASE_ENVIRONMENT}distinct type ItemId = UUID\nentity Item(val id: ItemId, val tags: Set<Int>)\nserver fun f(id: ItemId): ItemId effects [db.read] = db.itens.require(id).id\n"
+        );
+        let schema = format!(
+            "{EMPTY_SCHEMA}itens,Item,id,id,ItemId,false,true,true,postgresql\nitens,Item,id,tags,Set<Int>,false,true,false,postgresql\n"
+        );
+        assert_rejected_by(
+            &source,
+            &schema,
+            true,
+            "E8310",
+            "Column `itens.tags` has type `Set<Int>`",
+        );
+    }
+
+    /// E8302 (a sealed type without variants) stays: neither the parser nor the checker rejects
+    /// it (the same program verifies on a target that is not certified). It is checked on the
+    /// parsed variants (`TypeDecl.cases`) instead of the removed `TypeDecl.variants`.
+    #[test]
+    fn coverage_e8302_empty_sealed_type_is_kept() {
+        let (root, config) = fixture(
+            "sealed class Vazio\nserver fun f(): Int = 1\n",
+            EMPTY_SCHEMA,
+        );
+        let result = verify(&config, "aws-lambda");
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        for source in [
+            "sealed class Vazio\nserver fun f(): Int = 1\n",
+            "sealed class Vazio {}\nserver fun f(): Int = 1\n",
+        ] {
+            let diagnostics = rejected(source, EMPTY_SCHEMA, true);
+            assert!(
+                diagnostics.iter().any(|item| item.code == "E8302"),
+                "{diagnostics:?}"
+            );
+        }
+    }
+
+    /// E8308 (a mutable field) is the checker's E7002.
+    #[test]
+    fn coverage_e8308_mutable_field_is_e7002() {
+        for source in [
+            "data class Conta(var saldo: Int)\nserver fun f(): Int = 1\n",
+            "entity Conta(val id: UUID, var saldo: Int)\nserver fun f(): Int = 1\n",
+            "sealed class S { data class A(var n: Int) }\nserver fun f(): Int = 1\n",
+        ] {
+            assert_rejected_by(
+                source,
+                EMPTY_SCHEMA,
+                true,
+                "E7002",
+                "is declared with `var`",
+            );
+        }
+    }
+
+    /// E2001 and E2002 (declared twice) are E7110, in one file or across files.
+    #[test]
+    fn coverage_e2001_e2002_duplicate_declarations_are_e7110() {
+        assert_rejected_by(
+            "data class A(val x: Int)\ndata class A(val y: Int)\n",
+            EMPTY_SCHEMA,
+            false,
+            "E7110",
+            "Type `A` is declared more than once",
+        );
+        assert_rejected_by(
+            "data class String(val x: Int)\n",
+            EMPTY_SCHEMA,
+            false,
+            "E7110",
+            "conflicts with a built-in type",
+        );
+        assert_rejected_by(
+            "pure fun f(): Int = 1\npure fun f(): Int = 2\n",
+            EMPTY_SCHEMA,
+            false,
+            "E7110",
+            "Function `f` is declared more than once",
+        );
+        let (root, config) = fixture(
+            "data class A(val x: Int)\npure fun f(): Int = 1\n",
+            EMPTY_SCHEMA,
+        );
+        fs::write(
+            root.join("app/other.bd"),
+            "enum class A { X }\npure fun f(): Int = 2\n",
+        )
+        .unwrap();
+        let result = verify(&config, "aws-lambda");
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.application.is_none());
+        let found: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|item| item.code == "E7110")
+            .map(|item| item.message.as_str())
+            .collect();
+        assert!(
+            found.iter().any(|message| message.contains("Type `A`"))
+                && found.iter().any(|message| message.contains("Function `f`")),
+            "{:?}",
+            result.diagnostics
+        );
+    }
+
+    /// E2003 (unknown type in a declaration) is E7103, wherever the type is written.
+    #[test]
+    fn coverage_e2003_unknown_types_are_e7103() {
+        for source in [
+            "data class A(val x: Nope)\n",
+            "entity A(val id: UUID, val x: List<Nope>)\n",
+            "sealed class S { data class A(val x: Nope?) }\n",
+            "distinct type D = Nope\n",
+            "data class Caixa<T>(val x: T, val y: Nope)\n",
+            "pure fun f(x: Nope): Int = 1\n",
+            "pure fun f(): Nope? = null\n",
+            "pure fun f(g: (Nope) -> Int): Int = 1\n",
+            "external fun g(x: Nope): Unit\n",
+            "external fun g(): Map<String, Nope>\n",
+            "server fun f(x: Int): Result<Nope, String> = Ok(x)\n",
+        ] {
+            assert_rejected_by(source, EMPTY_SCHEMA, false, "E7103", "Unknown type `Nope`");
+        }
+    }
+
+    /// E5201 for a model field without a column stays, computed on the IR (`core::analysis`):
+    /// the type checker does not compare the model with the table, and every generated query
+    /// selects every field of the model.
+    #[test]
+    fn coverage_e5201_model_field_without_a_column_is_kept_typed() {
+        let broken = SCHEMA.replace(",name,String,", ",nme,String,");
+        let found = with_code(SOURCE, &broken, "E5201");
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(
+            found[0].message,
+            "Column `customers.name` required by `Customer` does not exist in database `main`."
+        );
+        assert_eq!(
+            found[0].path,
+            vec![
+                "CustomerPage",
+                "getCustomer",
+                "database.main.customers.name"
+            ]
+        );
+        assert_eq!(
+            found[0].hint.as_deref(),
+            Some("Did you mean `customers.nme`?")
+        );
+        // Located at the model field.
+        assert_eq!(found[0].span.line, 3);
+        // A table no operation uses is not checked.
+        let unused = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun f(): Int = 1\n";
+        assert!(with_code(unused, &broken, "E5201").is_empty());
+    }
+
+    /// E8307 is decided by the database operations of the IR (what the backend generates code
+    /// for), lambdas never called included, instead of a scan for `db .` tokens.
+    #[test]
+    fn e8307_follows_the_database_operations_of_the_ir() {
+        let schema = SCHEMA;
+        let uncalled = format!(
+            "{CUSTOMER}server fun f(id: CustomerId): Int {{\n    val ler = {{ x -> db.customers.require(x) }}\n    return 1\n}}\n"
+        );
+        assert_rejected_by(
+            &uncalled,
+            schema,
+            true,
+            "E8307",
+            "certified database runtime",
+        );
+        let direct = format!(
+            "{CUSTOMER}server fun f(id: CustomerId): String effects [db.read] = db.customers.require(id).name\n"
+        );
+        assert_rejected_by(&direct, schema, true, "E8307", "certified database runtime");
+        // Declared: verifies.
+        let (root, config) = certified_fixture(&format!("{DATABASE_ENVIRONMENT}{direct}"), schema);
+        let result = verify(&config, "aws-lambda");
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
+        // No database access: no credential needed, even with a local named `db`.
+        let none = format!(
+            "{CUSTOMER}data class Caixa(val customers: Int)\nserver fun f(): Int {{\n    val db = Caixa(1)\n    return db.customers\n}}\n"
+        );
+        let (root, config) = certified_fixture(&none, schema);
+        let result = verify(&config, "aws-lambda");
+        fs::remove_dir_all(root).unwrap();
+        assert!(result.application.is_some(), "{:?}", result.diagnostics);
     }
 }

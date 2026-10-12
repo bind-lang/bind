@@ -35,6 +35,9 @@ impl Diagnostic {
         }
     }
 
+    /// No check reports a warning today (W2101 was replaced by the parser's E7001); the
+    /// severity stays for `warnings_as_errors` and future lints.
+    #[allow(dead_code)]
     pub fn warning(code: &'static str, message: impl Into<String>, span: Span) -> Self {
         Self {
             code,

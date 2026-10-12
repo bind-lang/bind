@@ -1,12 +1,13 @@
 //! Whole-program analyses over the typed core IR: the application graph, the database
-//! operations and the diagnostics computed from types (E4102, E5303, E5204, E2301). They replace the scans of raw lexer tokens; the backends read the same facts
+//! operations and the diagnostics computed from types (E4102, E5303, E5201, E5204, E2301). They
+//! replace the scans of raw lexer tokens; the backends read the same facts
 //! through [`operations`], so what `verify` reports and what is generated never diverge.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::ast::Program;
 use crate::diagnostic::{Diagnostic, Span};
-use crate::schema::DatabaseSchema;
+use crate::schema::{DatabaseSchema, closest};
 use crate::types::env::Env;
 use crate::types::ty::Type;
 
@@ -395,6 +396,8 @@ impl TypedDiagnostics {
 ///   `environment.X -> f -> … -> client root`, located at the first client function of the path;
 /// - **E5303:** an `insert` that does not assign every column that is required, not nullable
 ///   and without a default;
+/// - **E5201:** a field of the model of a table the program uses without a column in the table
+///   (every operation selects every field), with the path from a root to the column;
 /// - **E5204:** a field of the model of a table the program uses whose type differs from the
 ///   column's (the checker's mapping, [`Env::column_type`]); an optional field may read a
 ///   non-null column;
@@ -579,23 +582,25 @@ fn missing_insert_columns(
     }
 }
 
-/// E5204: for each table a database operation uses (in order of first use), each field of its
-/// model with a column must have the column's type, or be the optional version of it.
+/// E5201 and E5204: for each table a database operation uses (in order of first use), each
+/// field of its model must have a column (E5201: every operation selects every field), of the
+/// field's type or of the type the field makes optional (E5204).
 fn model_column_mismatches(
     program: &CoreProgram,
     ast: &Program,
     schema: &DatabaseSchema,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let mut tables: Vec<&str> = Vec::new();
+    // Each table with the first function that uses it.
+    let mut tables: Vec<(&str, &str)> = Vec::new();
     for function in &program.functions {
         let mut nodes = Vec::new();
         db_nodes(&function.body, &mut nodes);
         for node in nodes {
             if let ExprKind::Db { table, .. } = &node.kind
-                && !tables.contains(&table.as_str())
+                && !tables.iter().any(|(used, _)| used == table)
             {
-                tables.push(table);
+                tables.push((table, &function.name));
             }
         }
     }
@@ -603,7 +608,8 @@ fn model_column_mismatches(
         return;
     }
     let env = Env::build(ast, &mut Vec::new());
-    for table in tables {
+    let mut graph = None;
+    for (table, user) in tables {
         let Some(definition) = schema.tables.get(table) else {
             continue;
         };
@@ -615,15 +621,35 @@ fn model_column_mismatches(
         };
         let declared = ast.types.iter().find(|ty| ty.name == definition.model);
         for (field, ty) in fields {
+            let declared_field = declared
+                .and_then(|declared| declared.fields.iter().find(|item| item.name == *field));
+            let span = declared_field
+                .map(|item| item.span.clone())
+                .unwrap_or_default();
             let Some(column) = definition.columns.get(field) else {
+                let resource = format!("database.main.{table}.{field}");
+                let graph = graph.get_or_insert_with(|| application_graph(program));
+                let mut path = graph.path_to(user);
+                path.push(resource);
+                let mut diagnostic = Diagnostic::error(
+                    "E5201",
+                    format!(
+                        "Column `{table}.{field}` required by `{}` does not exist in database `main`.",
+                        definition.model
+                    ),
+                    span,
+                )
+                .with_path(path);
+                if let Some(hint) = closest(field, definition.columns.keys()) {
+                    diagnostic = diagnostic.with_hint(format!("Did you mean `{table}.{hint}`?"));
+                }
+                diagnostics.push(diagnostic);
                 continue;
             };
             let expected = env.column_type(column, &Span::default(), &mut Vec::new());
             if *ty == expected || *ty == Type::option(expected.clone()) {
                 continue;
             }
-            let declared_field = declared
-                .and_then(|declared| declared.fields.iter().find(|item| item.name == *field));
             let shown = declared_field
                 .map(|item| item.type_ref.display())
                 .unwrap_or_else(|| crate::types::ty::display(ty));
@@ -634,9 +660,7 @@ fn model_column_mismatches(
                     column.type_name,
                     if column.nullable { "?" } else { "" }
                 ),
-                declared_field
-                    .map(|item| item.span.clone())
-                    .unwrap_or_default(),
+                span,
             ));
         }
     }

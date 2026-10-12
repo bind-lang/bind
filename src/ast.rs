@@ -1,5 +1,4 @@
 use crate::diagnostic::Span;
-use crate::lexer::Token;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypeRef {
@@ -55,8 +54,6 @@ pub struct TypeDecl {
     pub type_params: Vec<String>,
     pub underlying: Option<TypeRef>,
     pub fields: Vec<Field>,
-    /// Variant names, kept for the legacy analysis and generators.
-    pub variants: Vec<String>,
     /// Variants of `sealed class` and `enum class`, with their fields.
     pub cases: Vec<Variant>,
     pub span: Span,
@@ -123,7 +120,6 @@ pub struct Function {
     pub effects_declared: bool,
     pub requires: Vec<String>,
     pub body_kind: BodyKind,
-    pub body: Vec<Token>,
     /// Parsed body; `None` for functions without a body.
     pub expr: Option<crate::syntax::expr::Block>,
     pub span: Span,

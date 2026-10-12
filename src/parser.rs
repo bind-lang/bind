@@ -94,7 +94,6 @@ impl Parser {
             type_params: vec![],
             underlying: Some(underlying),
             fields: vec![],
-            variants: vec![],
             cases: vec![],
             span,
         })
@@ -120,7 +119,6 @@ impl Parser {
             type_params,
             underlying: None,
             fields,
-            variants: vec![],
             cases: vec![],
             span,
         })
@@ -185,7 +183,6 @@ impl Parser {
             type_params,
             underlying: None,
             fields: vec![],
-            variants: cases.iter().map(|case| case.name.clone()).collect(),
             cases,
             span,
         })
@@ -253,7 +250,6 @@ impl Parser {
             type_params: vec![],
             underlying: None,
             fields: vec![],
-            variants: cases.iter().map(|case| case.name.clone()).collect(),
             cases,
             span,
         })
@@ -462,7 +458,6 @@ impl Parser {
             effects_declared,
             requires,
             body_kind,
-            body,
             expr,
             span,
         })
@@ -962,7 +957,12 @@ mod tests {
         );
         let declaration = &program.types[0];
         assert_eq!(declaration.type_params, vec!["T"]);
-        assert_eq!(declaration.variants, vec!["No", "Folha"]);
+        let names: Vec<_> = declaration
+            .cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["No", "Folha"]);
         assert_eq!(declaration.cases[0].fields.len(), 3);
         assert_eq!(declaration.cases[0].fields[1].type_ref.display(), "T");
         assert!(declaration.cases[1].fields.is_empty());
