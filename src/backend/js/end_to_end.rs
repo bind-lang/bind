@@ -30,6 +30,14 @@
 //!   (real RPCs from node): "Bad request" with serde's message for the arguments, "Request
 //!   failed" for the results. (A `Long` cannot cross the wire in rust-web-v3, E8309: the
 //!   runtime's unit tests cover its ±(2^53 − 1) rule.)
+//! - collections and rich types (`RICH_PAGE`, both modes of a fifth project): an endpoint that
+//!   receives a `Map<CustomerId, Int>` and returns a sealed class with fields holding a
+//!   `Set<String>` and a `Result<Customer, Erro>`, read from the database; the page renders
+//!   the same HTML in both modes for a found customer (`Ok`), a missing one (`Err`) and an
+//!   empty map (the variant without fields). Review Focus 5: a request whose `Map` has a
+//!   malformed pair or a duplicate key is a 400 with serde's message on both servers, and a
+//!   response tampered by a test proxy with a duplicated `Set` element shows "Request failed"
+//!   in the split page (the same response with its `Set` out of order is accepted).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -84,6 +92,66 @@ client component Fio(k: Int) {
             4 -> Text(server.grande())
             _ -> Text(server.eco(1.5))
         }
+    }
+}
+"#;
+
+/// Collections and rich types on the wire (replaces the commerce page in the rich variant):
+/// `resumo` receives a `Map<CustomerId, Int>` and returns a sealed class whose variant with
+/// fields holds a `Set<String>` and a `Result<Customer, Erro>`; the page `Rico` renders them.
+const RICH_PAGE: &str = r#"data class Erro(val codigo: Int, val mensagem: String)
+
+sealed class Resumo {
+    data class Pronto(val tags: Set<String>, val dono: Result<Customer, Erro>, val total: Int, val saldo: Int)
+    data object Vazio
+}
+
+fun soma(xs: List<Int>): Int = fold(xs, 0, { s, x -> s + x })
+
+fun junta(xs: List<String>): String = fold(xs, "", { s, x -> s + "[" + x + "]" })
+
+fun dono(achado: Customer?): Result<Customer, Erro> = when (achado) {
+    null -> Err(Erro(404, "cliente ausente"))
+    c -> Ok(c)
+}
+
+fun marcas(dono: Result<Customer, Erro>, total: Int): Set<String> = when (dono) {
+    Ok(c) -> insert(setOf("vip", "ativo", "vip"), c.name)
+    Err(_) -> if (total > 10) setOf("sem dono", "grande") else setOf("sem dono")
+}
+
+server fun resumo(id: CustomerId, saldos: Map<CustomerId, Int>): Resumo
+    effects [db.read] {
+    val achado = dono(db.customers.find(id))
+    val total = soma(values(saldos))
+    return if (mapSize(saldos) == 0) Vazio else Pronto(marcas(achado, total), achado, total, lookup(saldos, id) ?: -1)
+}
+
+fun quem(dono: Result<Customer, Erro>): String = when (dono) {
+    Ok(c) -> c.name
+    Err(e) -> e.mensagem
+}
+
+fun descreve(r: Resumo): String = when (r) {
+    Pronto(tags, dono, _, _) -> junta(toList(tags)) + " " + quem(dono)
+    Vazio -> "vazio"
+}
+
+fun numero(r: Resumo): Int = when (r) {
+    Pronto(_, Err(e), total, saldo) -> e.codigo * 1000000 + total * 1000 + saldo
+    Pronto(_, _, total, saldo) -> total * 1000 + saldo
+    Vazio -> 0
+}
+
+fun saldos(id: CustomerId, outro: CustomerId, k: Int): Map<CustomerId, Int> =
+    if (k == 0) emptyMap() else put(put(put(emptyMap(), outro, 7), id, k), outro, 5)
+
+client component Rico(id: CustomerId, outro: CustomerId, k: Int) {
+    val r = server.resumo(id, saldos(id, outro, k))
+
+    UI {
+        Text(descreve(r))
+        Text(numero(r))
     }
 }
 "#;
@@ -207,6 +275,10 @@ fn ssr_and_split_against_postgres() {
     let wire = Project::new("wire", &wire_source);
     let wire_ssr = wire.generate("ssr");
     let wire_split = wire.generate("split");
+    let rich_source = format!("{}{RICH_PAGE}", source.split(CUSTOMER_PAGE).next().unwrap());
+    let rich = Project::new("rich", &rich_source);
+    let rich_ssr = rich.generate("ssr");
+    let rich_split = rich.generate("split");
 
     let harness =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/bind-codegen-tests/bind-e2e");
@@ -218,7 +290,7 @@ fn ssr_and_split_against_postgres() {
     fs::write(
         harness.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-fail = {{ path = \"fail\" }}\nbind-e2e-wire-ssr = {{ path = \"wire-ssr\" }}\nbind-e2e-wire-split = {{ path = \"wire-split\" }}\n",
+            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-fail = {{ path = \"fail\" }}\nbind-e2e-wire-ssr = {{ path = \"wire-ssr\" }}\nbind-e2e-wire-split = {{ path = \"wire-split\" }}\nbind-e2e-rich-ssr = {{ path = \"rich-ssr\" }}\nbind-e2e-rich-split = {{ path = \"rich-split\" }}\n",
             crate::certified::server_dependencies()
         ),
     )
@@ -235,19 +307,23 @@ fn ssr_and_split_against_postgres() {
     member(&harness, "fail", "bind-e2e-fail", &fail);
     member(&harness, "wire-ssr", "bind-e2e-wire-ssr", &wire_ssr);
     member(&harness, "wire-split", "bind-e2e-wire-split", &wire_split);
+    member(&harness, "rich-ssr", "bind-e2e-rich-ssr", &rich_ssr);
+    member(&harness, "rich-split", "bind-e2e-rich-split", &rich_split);
     // The split page as generated: index.html, app.js (API_URL = "http://api.test/api") and the
     // runtime.
     fs::create_dir_all(harness.join("web")).unwrap();
     for file in ["index.html", "app.js", "bind-runtime.js"] {
         fs::copy(split.join("web").join(file), harness.join("web").join(file)).unwrap();
     }
-    fs::create_dir_all(harness.join("web-wire")).unwrap();
-    for file in ["index.html", "app.js", "bind-runtime.js"] {
-        fs::copy(
-            wire_split.join("web").join(file),
-            harness.join("web-wire").join(file),
-        )
-        .unwrap();
+    for (directory, generated) in [("web-wire", &wire_split), ("web-rich", &rich_split)] {
+        fs::create_dir_all(harness.join(directory)).unwrap();
+        for file in ["index.html", "app.js", "bind-runtime.js"] {
+            fs::copy(
+                generated.join("web").join(file),
+                harness.join(directory).join(file),
+            )
+            .unwrap();
+        }
     }
     let index = fs::read_to_string(harness.join("web/index.html")).unwrap();
     assert!(index.contains("from \"/app.js\"; page.boot("), "{index}");
@@ -370,6 +446,7 @@ fn sql(text: String) -> sqlx::AssertSqlSafe<String> {
 
 const RPC_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 const MISSING: &str = "00000000-0000-4000-8000-000000000000";
+const OTHER: &str = "11111111-1111-4111-8111-111111111111";
 
 /// One parsed HTTP request.
 struct Request {
@@ -555,6 +632,21 @@ fn oops_handler() -> Handler {
             return Response { status: 204, content_type: "text/plain".to_string(), headers, body: String::new() };
         }
         Response { status: 500, content_type: "text/plain; charset=utf-8".to_string(), headers, body: "oops".to_string() }
+    })
+}
+
+/// `inner`, with the `tags` of a successful `{"pronto": {...}}` response changed by `tamper`
+/// (a test double of a server whose response is corrupted on the way).
+fn tampering_handler(inner: Handler, tamper: fn(&mut Vec<serde_json::Value>)) -> Handler {
+    Arc::new(move |request: Request| {
+        let post = request.method == "POST";
+        let mut response = inner(request);
+        if post && response.status == 200 {
+            let mut value: serde_json::Value = serde_json::from_str(&response.body).unwrap();
+            tamper(value["pronto"]["tags"].as_array_mut().unwrap());
+            response.body = value.to_string();
+        }
+        response
     })
 }
 
@@ -802,6 +894,67 @@ fn scenarios(runtime: &tokio::runtime::Runtime, url: &str, schema: &str) {
         }
     }
     println!("wire: NaN and 1001-digit Int, as arguments and as results, give the same page in ssr and split");
+
+    // Collections and rich types: the same page in both modes.
+    let rich_ssr = Server::start(page_handler!(bind_e2e_rich_ssr, handle, pool));
+    let mut rich_split = Server::start(split_handler!(bind_e2e_rich_split, handle, pool));
+    let resumo = vec!["OPTIONS /api/resumo".to_string(), "POST /api/resumo".to_string()];
+    for (search, expected) in [
+        (format!("?id={ana}&outro={OTHER}&k=30"), "[Ana &amp; &lt;Bia&gt;][ativo][vip] Ana &amp; &lt;Bia&gt;35030"),
+        (format!("?id={MISSING}&outro={OTHER}&k=30"), "[grande][sem dono] cliente ausente404035030"),
+        (format!("?id={MISSING}&outro={MISSING}&k=3"), "[sem dono] cliente ausente404005005"),
+        (format!("?id={ana}&outro={OTHER}&k=0"), "vazio0"),
+    ] {
+        let page = http(&rich_ssr, "GET", &format!("/{search}"), &[], "");
+        assert_eq!(page.status, 200, "{search}: {}", page.body);
+        assert_eq!(site(&page.body), expected, "{search}");
+        let (html, requests) = split_page_of("./web-rich/app.js", &rich_split.origin(), "http://a.test", &search);
+        assert_eq!(html, expected, "{search}: ssr and split differ");
+        assert_eq!(requests, resumo, "{search}");
+    }
+    println!("rich: Map argument, sealed with Set and Result, Ok/Err/fieldless give the same page in ssr and split");
+
+    // Review Focus 5, server: a malformed Map is a 400 with serde's message, before any query.
+    for (saldos, message) in [
+        (format!(r#"[["{ana}"]]"#), "malformed map pair at line 1 column 95"),
+        (format!(r#"[["{ana}","1","2"]]"#), "malformed map pair at line 1 column "),
+        (format!(r#"[["{ana}","1"],["{ana}","2"]]"#), "duplicate map key"),
+    ] {
+        let body = format!(r#"{{"id":"{ana}","saldos":{saldos}}}"#);
+        for (server, headers) in [
+            (&rich_ssr, vec![("content-type", "application/json")]),
+            (&rich_split, vec![("content-type", "application/json"), ("origin", "http://a.test")]),
+        ] {
+            let reply = http(server, "POST", "/api/resumo", &headers, &body);
+            assert_eq!(reply.status, 400, "{body}: {}", reply.body);
+            let value: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+            let error = value["error"].as_str().unwrap();
+            assert!(error.starts_with(message), "{body}: {error}");
+        }
+    }
+    let well_formed = format!(r#"{{"id":"{ana}","saldos":[["{OTHER}","5"],["{ana}","30"]]}}"#);
+    let reply = http(&rich_split, "POST", "/api/resumo", &[("content-type", "application/json"), ("origin", "http://a.test")], &well_formed);
+    assert_eq!(reply.status, 200, "{}", reply.body);
+    let value: serde_json::Value = serde_json::from_str(&reply.body).unwrap();
+    assert_eq!(value["pronto"]["tags"], serde_json::json!(["Ana & <Bia>", "ativo", "vip"]), "{}", reply.body);
+    assert_eq!(value["pronto"]["dono"]["Ok"]["id"].as_str(), Some(ana.as_str()), "{}", reply.body);
+    assert_eq!((value["pronto"]["total"].as_str(), value["pronto"]["saldo"].as_str()), (Some("35"), Some("30")));
+    println!("rich: Map with a malformed pair or a duplicate key -> 400 with serde's message on both servers");
+
+    // Review Focus 5, frontend: the split server's response, tampered by a proxy.
+    let search = format!("?id={ana}&outro={OTHER}&k=30");
+    let reversed = Server::start(tampering_handler(split_handler!(bind_e2e_rich_split, handle, pool), |tags| tags.reverse()));
+    let (html, requests) = split_page_of("./web-rich/app.js", &reversed.origin(), "http://a.test", &search);
+    assert_eq!(html, "[Ana &amp; &lt;Bia&gt;][ativo][vip] Ana &amp; &lt;Bia&gt;35030", "a Set out of order is normalized");
+    assert_eq!(requests, resumo);
+    let duplicated = Server::start(tampering_handler(split_handler!(bind_e2e_rich_split, handle, pool), |tags| {
+        let first = tags[0].clone();
+        tags.push(first);
+    }));
+    let (html, requests) = split_page_of("./web-rich/app.js", &duplicated.origin(), "http://a.test", &search);
+    assert_eq!((html.as_str(), requests), (REQUEST_FAILED, resumo.clone()));
+    rich_split.shut_down();
+    println!("rich: response with a duplicated Set element -> \"Request failed\"; out of order -> normalized");
 
     runtime.block_on(pool.close());
 }
