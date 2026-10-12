@@ -750,6 +750,216 @@ test("equals and compare on values nested 200000 deep", () => {
   eq(rt.equals(rt.listOf(rt.some(null)), rt.listOf(null)), false);
 });
 
+// ---- Set / Map (runtime/vectors/collections.json and wire-rich.json) ----
+
+// The fixture types of the vectors (runtime/vectors/README.md), with the codecs and key
+// comparators bindc generates for them (backend::js::codecs).
+const COR = rt.decodeVariant([["z", "Z", null], ["a", "A", null], ["m", "M", null]]);
+const corOrder = rt.variantOrder(["Z", "A", "M"]);
+const encodeCor = (v) => ({ Z: "z", A: "a", M: "m" })[v.tag];
+const decimalCodec = { decode: rt.decodeDecimal, encode: (v) => v.toString(), compare: rt.decimalCompare };
+const stringCodec = { decode: rt.decodeString, encode: (v) => v, compare: rt.compare };
+const KEYS = {
+  Int: { decode: rt.decodeInt, encode: (v) => v.toString(), compare: rt.compare },
+  Decimal: decimalCodec,
+  Nota: decimalCodec,
+  String: stringCodec,
+  UUID: stringCodec,
+  Codigo: stringCodec,
+  Boolean: { decode: rt.decodeBool, encode: (v) => v, compare: rt.compare },
+  Cor: { decode: COR, encode: encodeCor, compare: corOrder },
+  Date: { decode: rt.decodeString, encode: (v) => v, compare: rt.compareDate },
+  DateTime: { decode: rt.decodeString, encode: (v) => v, compare: rt.compareDateTime },
+  Instant: { decode: rt.decodeString, encode: (v) => v, compare: rt.compareInstant },
+};
+
+test("Set and Map builtins match collections.json (canonical order, Ruling A)", () => {
+  const cases = readJson("../../vectors/collections.json");
+  assert(cases.length >= 20, "collection vectors");
+  for (const c of cases) {
+    const label = JSON.stringify(c).slice(0, 120);
+    const key = KEYS[c.kind === "set" ? c.element : c.key];
+    assert(key !== undefined, `codec of ${label}`);
+    const k = (json) => key.decode(json);
+    if (c.kind === "set") {
+      let s = c.setOf.length === 0 ? rt.emptySet() : rt.setOf(key.compare, ...c.setOf.map(k));
+      for (const [step, x] of c.steps) {
+        const before = s;
+        s = step === "insert" ? rt.setInsert(key.compare, s, k(x)) : rt.setRemove(key.compare, s, k(x));
+        assert(Object.isFrozen(s), `frozen after ${step}: ${label}`);
+        assert(before !== s || rt.setContains(key.compare, s, k(x)) === (step === "insert"), label);
+      }
+      const list = rt.setToList(s);
+      eq(JSON.stringify(list.map(key.encode)), JSON.stringify(c.toList), `toList: ${label}`);
+      eq(rt.setSize(s), BigInt(c.toList.length), `setSize: ${label}`);
+      for (const [x, expected] of c.contains) eq(rt.setContains(key.compare, s, k(x)), expected, `contains ${x}: ${label}`);
+      // The wire form is the same array, and decoding it gives the same set.
+      const decode = rt.decodeSet(key.decode, key.compare);
+      assert(rt.equals(decode(c.toList), s), `wire: ${label}`);
+    } else {
+      let m = rt.emptyMap();
+      for (const [step, x, v] of c.steps) {
+        m = step === "put" ? rt.mapPut(key.compare, m, k(x), v) : rt.mapRemoveKey(key.compare, m, k(x));
+        assert(Object.isFrozen(m) && m.every((pair) => Object.isFrozen(pair)), `frozen after ${step}: ${label}`);
+      }
+      eq(JSON.stringify(m.map(([x, v]) => [key.encode(x), v])), JSON.stringify(c.entries), `entries: ${label}`);
+      eq(JSON.stringify(rt.mapKeys(m).map(key.encode)), JSON.stringify(c.entries.map((e) => e[0])), `keys: ${label}`);
+      eq(JSON.stringify(rt.mapValues(m)), JSON.stringify(c.entries.map((e) => e[1])), `values: ${label}`);
+      eq(rt.mapSize(m), BigInt(c.entries.length), `mapSize: ${label}`);
+      for (const [x, expected] of c.lookup) {
+        const found = rt.mapLookup(key.compare, m, k(x));
+        eq(found === null ? null : found.some, expected, `lookup ${x}: ${label}`);
+      }
+      const decode = rt.decodeMap(key.decode, rt.decodeString, key.compare);
+      assert(rt.equals(decode(c.entries), m), `wire: ${label}`);
+    }
+  }
+});
+
+test("collections are immutable: updates never change their input", () => {
+  const s = rt.setOf(rt.compare, 3n, 1n);
+  const t = rt.setInsert(rt.compare, s, 2n);
+  eq(s.join(","), "1,3");
+  eq(t.join(","), "1,2,3");
+  eq(rt.setInsert(rt.compare, t, 2n), t, "inserting a present element returns the same set");
+  eq(rt.setRemove(rt.compare, t, 9n), t, "removing an absent element returns the same set");
+  assert(Object.isFrozen(rt.emptySet()) && Object.isFrozen(rt.emptyMap()), "empty collections frozen");
+  const m = rt.mapPut(rt.compare, rt.emptyMap(), "a", 1n);
+  const n = rt.mapPut(rt.compare, m, "a", 2n);
+  eq(rt.mapLookup(rt.compare, m, "a").some, 1n);
+  eq(rt.mapLookup(rt.compare, n, "a").some, 2n);
+  eq(rt.mapRemoveKey(rt.compare, n, "b"), n, "removing an absent key returns the same map");
+  eq(rt.mapLookup(rt.compare, rt.emptyMap(), "a"), null);
+  // A lookup of an optional value keeps the Option layers apart: Some(None) is not None.
+  const optional = rt.mapPut(rt.compare, rt.emptyMap(), "a", null);
+  eq(rt.mapLookup(rt.compare, optional, "a").some, null);
+  // Long literals: setFrom takes an array.
+  const many = Array.from({ length: 5000 }, (_, i) => BigInt(4999 - i));
+  const big = rt.setFrom(rt.compare, many.concat(many));
+  eq(big.length, 5000);
+  eq(big[0], 0n);
+  eq(big[4999], 4999n);
+});
+
+test("Review Focus 1: Decimal keys compare by value (1.0 = 1.00, -0 = 0)", () => {
+  const d = (text) => rt.Decimal.parse(text);
+  const m = rt.decodeMap(rt.decodeDecimal, rt.decodeString, rt.decimalCompare)([["1.0", "a"], ["0.5", "b"]]);
+  eq(rt.mapLookup(rt.decimalCompare, m, d("1.00")).some, "a", "lookup(m, 1.00) finds the entry written as 1.0");
+  const put = rt.mapPut(rt.decimalCompare, m, d("1.000"), "c");
+  eq(rt.mapKeys(put)[1].toString(), "1.0", "put keeps the existing key's text");
+  eq(rt.mapLookup(rt.decimalCompare, put, d("1")).some, "c");
+  throwsDecode(() => rt.decodeMap(rt.decodeDecimal, rt.decodeString, rt.decimalCompare)([["1.0", "a"], ["1.00", "b"]]), "1.0 and 1.00 are one key");
+  throwsDecode(() => rt.decodeSet(rt.decodeDecimal, rt.decimalCompare)(["0", "-0"]), "0 and -0 are one element");
+  eq(rt.setOf(rt.decimalCompare, d("1.00"), d("1.0")).map(String).join(","), "1.00", "setOf keeps the first");
+  assert(rt.equals(rt.setOf(rt.decimalCompare, d("2.50")), rt.setOf(rt.decimalCompare, d("2.5"))), "equality by value");
+});
+
+test("Review Focus 3: enum keys follow declaration order, not the alphabet", () => {
+  const z = COR("z");
+  const a = COR("a");
+  const m = COR("m");
+  eq(rt.setOf(corOrder, m, a, z, a).map(encodeCor).join(","), "z,a,m");
+  const map = rt.mapPut(corOrder, rt.mapPut(corOrder, rt.emptyMap(), m, 1n), z, 2n);
+  eq(rt.mapKeys(map).map(encodeCor).join(","), "z,m");
+  eq(rt.decodeSet(COR, corOrder)(["m", "a", "z"]).map(encodeCor).join(","), "z,a,m");
+});
+
+/** [decoder, encoder] of a vector type such as `Map<Codigo, Pagina<Ponto>>`. */
+function codecOf(type) {
+  let at = 0;
+  const parse = () => {
+    const name = /^[A-Za-z]+/.exec(type.slice(at))[0];
+    at += name.length;
+    const args = [];
+    if (type[at] === "<") {
+      at += 1;
+      for (;;) {
+        args.push(parse());
+        if (type[at] === ",") at += 2;
+        else break;
+      }
+      at += 1; // ">"
+    }
+    return { name, args };
+  };
+  const build = ({ name, args }) => {
+    const key = KEYS[name];
+    if (key !== undefined && args.length === 0) return { ...key };
+    const [a, b] = args.map(build);
+    switch (name) {
+      case "Set":
+        return { decode: rt.decodeSet(a.decode, a.compare), encode: (v) => v.map(a.encode) };
+      case "Map":
+        return { decode: rt.decodeMap(a.decode, b.decode, a.compare), encode: (v) => v.map(([k, x]) => [a.encode(k), b.encode(x)]) };
+      case "Result":
+        return {
+          decode: rt.decodeResult(a.decode, b.decode),
+          encode: (v) => (v.tag === "Ok" ? { Ok: a.encode(v.value) } : { Err: b.encode(v.value) }),
+        };
+      case "Ponto": {
+        const int = KEYS.Int;
+        return {
+          decode: rt.decodeRecord([["x", int.decode, "u_x"], ["y", int.decode, "u_y"]]),
+          encode: (v) => ({ x: int.encode(v.u_x), y: int.encode(v.u_y) }),
+        };
+      }
+      case "Pagina":
+        return {
+          decode: rt.decodeRecord([["itens", rt.decodeList(a.decode), "u_itens"], ["total", rt.decodeInt, "u_total"]]),
+          encode: (v) => ({ itens: v.u_itens.map(a.encode), total: v.u_total.toString() }),
+        };
+      case "Forma":
+        return {
+          decode: rt.decodeVariant([
+            ["circulo", "Circulo", [["raio", rt.decodeInt, "u_raio"]]],
+            ["retangulo", "Retangulo", [["largura", rt.decodeInt, "u_largura"], ["altura", rt.decodeInt, "u_altura"]]],
+            ["vazia", "Vazia", null],
+          ]),
+          encode: (v) =>
+            v.tag === "Circulo"
+              ? { circulo: { raio: v.u_raio.toString() } }
+              : v.tag === "Retangulo"
+                ? { retangulo: { largura: v.u_largura.toString(), altura: v.u_altura.toString() } }
+                : "vazia",
+        };
+      default:
+        throw new Error(`no codec for ${name}`);
+    }
+  };
+  return build(parse());
+}
+
+test("rich wire types match wire-rich.json (strict decoders, canonical encoders)", () => {
+  const cases = readJson("../../vectors/wire-rich.json");
+  assert(cases.length >= 50, "wire vectors");
+  for (const c of cases) {
+    const label = `${c.type} ${JSON.stringify(c.json)}`;
+    const codec = codecOf(c.type);
+    if (!c.valid) {
+      throwsDecode(() => codec.decode(c.json), label);
+      continue;
+    }
+    const value = codec.decode(c.json);
+    eq(JSON.stringify(codec.encode(value)), JSON.stringify(c.canonical), label);
+    assert(rt.equals(codec.decode(c.canonical), value), `canonical decodes to the same value: ${label}`);
+  }
+  // Kept strict on purpose (the Rust server is lenient here): a unit variant is a bare string.
+  throwsDecode(() => codecOf("Forma").decode({ vazia: null }), '{"vazia": null}');
+});
+
+test("Review Focus 5: rpc answers with a malformed map or a duplicate set element are Request failed", async () => {
+  for (const [text, decode] of [
+    ['[["a"]]', rt.decodeMap(rt.decodeString, rt.decodeInt, rt.compare)],
+    ['[["a", "1", "2"]]', rt.decodeMap(rt.decodeString, rt.decodeInt, rt.compare)],
+    ['["1", "1"]', rt.decodeSet(rt.decodeInt, rt.compare)],
+  ]) {
+    await withFetch(respond(200, text), async () => {
+      const error = await rejects(rt.rpc(rt.newCtx(), "/api/x", {}, decode), "Remote", text);
+      eq(error.message, rt.TEXTS.requestFailed, text);
+    });
+  }
+});
+
 // ---- Runner ----
 
 let failures = 0;

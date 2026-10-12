@@ -297,8 +297,11 @@ mod tests {
                 "import * as rt from \"./bind-runtime.js\";\nconst API_URL = \"/api\";\n",
             );
             let mut exports = Vec::new();
+            // One set of codec helpers per module, as `render_app_with` does.
+            let mut codecs = codecs::Codecs::new(&program);
+            let mut bodies = String::new();
             for function in &program.functions {
-                module.push_str(&expr::function(function, &program));
+                bodies.push_str(&expr::function_with(function, &program, &mut codecs));
                 exports.push(format!(
                     "{} as {}",
                     names::js_value(&function.name),
@@ -306,6 +309,8 @@ mod tests {
                 ));
                 count += 1;
             }
+            module.push_str(&codecs.definitions());
+            module.push_str(&bodies);
             module.push_str(&format!("export {{ {} }};\n", exports.join(", ")));
             let name = format!("{}.mjs", case.file_stem().unwrap().to_string_lossy());
             fs::write(folder.join(&name), module).unwrap();
@@ -349,33 +354,38 @@ console.log("ok returns");
         fs::write(folder.join("returns-check.mjs"), script).unwrap();
         let output = run_node(&["returns-check.mjs"], &folder);
         assert!(output.contains("ok returns"), "{output}");
-        // Uniform options: the `probe*` functions of web_generic.bd give `core::eval`'s results.
-        let source = fs::read_to_string(directory().join("web_generic.bd")).unwrap();
-        let program = crate::core::lower::tests::compile(&source);
-        let mut checks = String::from(
-            "import * as rt from \"./bind-runtime.js\";\nimport * as m from \"./web_generic.mjs\";\n",
-        );
-        let mut probes = 0;
-        for function in &program.functions {
-            if !function.name.starts_with("probe") {
-                continue;
+        // The `probe*` functions of web_generic.bd (uniform options) and web_collections.bd
+        // (`Set`/`Map` builtins, canonical order, builtins as values) give `core::eval`'s
+        // results (`Value::render`: strings as JSON strings).
+        for (case, minimum) in [("web_generic", 4), ("web_collections", 10)] {
+            let source = fs::read_to_string(directory().join(format!("{case}.bd"))).unwrap();
+            let program = crate::core::lower::tests::compile(&source);
+            let mut checks = format!(
+                "import * as rt from \"./bind-runtime.js\";\nimport * as m from \"./{case}.mjs\";\nconst show = (v) => (typeof v === \"string\" ? JSON.stringify(v) : String(v));\n"
+            );
+            let mut probes = 0;
+            for function in &program.functions {
+                if !function.name.starts_with("probe") {
+                    continue;
+                }
+                let expected =
+                    crate::core::eval::eval_function(&program, &function.name, Vec::new())
+                        .expect("evaluates")
+                        .render();
+                checks.push_str(&format!(
+                    "{{ const actual = show(await m.{0}(rt.newCtx())); if (actual !== {1}) throw new Error(`{0}: expected ${{{1}}}, got ${{actual}}`); }}\n",
+                    function.name,
+                    names::js_string(&expected),
+                ));
+                probes += 1;
             }
-            let expected = crate::core::eval::eval_function(&program, &function.name, Vec::new())
-                .expect("evaluates")
-                .render();
-            checks.push_str(&format!(
-                "{{ const actual = String(await m.{0}(rt.newCtx())); if (actual !== {1}) throw new Error(`{0}: expected {2}, got ${{actual}}`); }}\n",
-                function.name,
-                names::js_string(&expected),
-                expected
-            ));
-            probes += 1;
+            assert!(probes >= minimum, "{case}: {probes} probes");
+            checks.push_str("console.log(\"ok probes\");\n");
+            let script = format!("probes-{case}.mjs");
+            fs::write(folder.join(&script), checks).unwrap();
+            let output = run_node(&[&script], &folder);
+            assert!(output.contains("ok probes"), "{case}: {output}");
         }
-        assert!(probes >= 4, "{probes} probes");
-        checks.push_str("console.log(\"ok probes\");\n");
-        fs::write(folder.join("probes-check.mjs"), checks).unwrap();
-        let output = run_node(&["probes-check.mjs"], &folder);
-        assert!(output.contains("ok probes"), "{output}");
         assert!(count > 50, "{count} functions");
         fs::remove_dir_all(&folder).unwrap();
     }
@@ -399,6 +409,8 @@ console.log("ok returns");
             ("web_arith.bd", "arith"),
             ("web_ui.bd", "ui"),
             ("web_generic.bd", "generic"),
+            ("web_collections.bd", "collections"),
+            ("web_collections.bd", "rich"),
         ] {
             let folder = web_folder(&directory().join(case), "run");
             fs::write(folder.join("check.mjs"), script).unwrap();
@@ -407,6 +419,100 @@ console.log("ok returns");
             assert!(output.contains(&format!("ok {check}")), "{output}");
             fs::remove_dir_all(&folder).unwrap();
         }
+    }
+
+    /// The codecs bindc generates for the types of `runtime/vectors/wire-rich.json` (declared in
+    /// `tests/codegen/collections.bd`) decode every valid case to a value that encodes to its
+    /// `canonical` form, and reject every invalid case (Review Focus 1, 4 and 5).
+    #[test]
+    #[ignore = "needs node; run with `cargo test backend::js -- --ignored`"]
+    fn generated_codecs_match_the_rich_wire_vectors() {
+        if !node_available() {
+            eprintln!("skipped: node not found");
+            return;
+        }
+        const TYPES: [&str; 14] = [
+            "Set<Int>",
+            "Set<Decimal>",
+            "Set<String>",
+            "Set<Cor>",
+            "Set<Instant>",
+            "Map<String, Int>",
+            "Map<Decimal, String>",
+            "Map<Cor, Int>",
+            "Map<Int, Set<Int>>",
+            "Result<Int, String>",
+            "Forma",
+            "Pagina<Int>",
+            "Pagina<Ponto>",
+            "Map<Codigo, Pagina<Ponto>>",
+        ];
+        let mut source = fs::read_to_string(directory().join("collections.bd")).unwrap();
+        for (index, ty) in TYPES.iter().enumerate() {
+            source.push_str(&format!("\nfun eco{index}(x: {ty}): {ty} = x\n"));
+        }
+        let program = crate::core::lower::tests::compile(&source);
+        let mut codecs = codecs::Codecs::new(&program);
+        let mut entries = Vec::new();
+        for (index, ty) in TYPES.iter().enumerate() {
+            let function = program
+                .functions
+                .iter()
+                .find(|function| function.name == format!("eco{index}"))
+                .expect("echo function");
+            let param = &function.params[0].2;
+            let decoder = codecs.decoder(param);
+            let encoder = codecs.encode(param, "v");
+            entries.push(format!(
+                "[{}, [{decoder}, (v) => {encoder}]]",
+                names::js_string(ty)
+            ));
+        }
+        let vectors = fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("runtime/vectors/wire-rich.json"),
+        )
+        .unwrap();
+        let script = format!(
+            r#"import * as rt from "./bind-runtime.js";
+{}
+const codecs = new Map([
+{}
+]);
+const cases = {vectors};
+let checked = 0;
+for (const c of cases) {{
+  const label = `${{c.type}} ${{JSON.stringify(c.json)}}`;
+  const codec = codecs.get(c.type);
+  if (codec === undefined) throw new Error(`no codec for ${{c.type}}`);
+  const [decode, encode] = codec;
+  let value;
+  try {{
+    value = decode(c.json);
+  }} catch (error) {{
+    if (!(error instanceof rt.DecodeError)) throw error;
+    if (c.valid) throw new Error(`${{label}}: rejected (${{error.message}})`);
+    checked += 1;
+    continue;
+  }}
+  if (!c.valid) throw new Error(`${{label}}: accepted`);
+  const json = JSON.stringify(encode(value));
+  if (json !== JSON.stringify(c.canonical)) throw new Error(`${{label}}: encoded as ${{json}}`);
+  if (!rt.equals(decode(c.canonical), value)) throw new Error(`${{label}}: canonical form differs`);
+  checked += 1;
+}}
+if (checked < 50) throw new Error(`only ${{checked}} cases`);
+console.log(`ok wire ${{checked}}`);
+"#,
+            codecs.definitions(),
+            entries.join(",\n")
+        );
+        let folder = std::env::temp_dir().join(format!("bind-js-{}-wire", std::process::id()));
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("bind-runtime.js"), RUNTIME).unwrap();
+        fs::write(folder.join("wire.mjs"), script).unwrap();
+        let output = run_node(&["wire.mjs"], &folder);
+        assert!(output.contains("ok wire"), "{output}");
+        fs::remove_dir_all(&folder).unwrap();
     }
 
     #[test]

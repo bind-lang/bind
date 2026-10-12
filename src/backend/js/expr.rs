@@ -15,8 +15,11 @@
 //! numbers, `Float` results rounded with `rt.f32`; `Unit` is `undefined`; `T?` is `null`
 //! (`None`) or `rt.some(v)` (`Some(v)`), uniformly for every `T`; records are `rt.record`, variants
 //! `rt.variant(tag, …)` and `Result` `rt.variant("Ok" | "Err", [["value", v]])`, fields under
-//! their escaped names (`names::js_value`); a distinct value is its underlying value; UI
-//! nodes are `rt.node` / `rt.text` / `rt.EMPTY`.
+//! their escaped names (`names::js_value`); a distinct value is its underlying value; a
+//! `Set` is a frozen array in canonical order and a `Map` a frozen array of frozen `[k, v]`
+//! pairs in canonical key order, operated with the runtime's collection builtins and the key
+//! comparator of the element / key type (`Codecs::key_order`); UI nodes are `rt.node` /
+//! `rt.text` / `rt.EMPTY`.
 
 use std::collections::BTreeMap;
 
@@ -286,7 +289,10 @@ impl Generator<'_, '_> {
             ExprKind::Lit(literal) => Some(literal_code(literal, &expr.ty)),
             ExprKind::Local(local) => Some(atom(self.local(*local))),
             ExprKind::Global { name, .. } => Some(atom(js_value(name))),
-            ExprKind::Builtin { name, .. } => Some(builtin_value(name, &expr.ty)),
+            ExprKind::Builtin { name, instance } => {
+                let order = self.key_order(name, instance);
+                Some(builtin_value(name, &order, &expr.ty))
+            }
             ExprKind::Environment(name) => {
                 self.unsupported(&format!("the environment value `{name}`"), out)
             }
@@ -456,9 +462,10 @@ impl Generator<'_, '_> {
                     false,
                 ))
             }
-            ExprKind::Builtin { name, .. } => {
+            ExprKind::Builtin { name, instance } => {
                 let values = self.all(args, out)?;
-                Some(builtin_call(name, values))
+                let order = self.key_order(name, instance);
+                Some(builtin_call(name, &order, values))
             }
             _ => {
                 let mut operands = vec![callee];
@@ -839,6 +846,18 @@ impl Generator<'_, '_> {
         }
     }
 
+    /// The key comparator a `Set`/`Map` builtin takes: the canonical order of its element / key
+    /// type (instance 0), or `""` for the builtins that need none.
+    fn key_order(&mut self, name: &str, instance: &[Type]) -> String {
+        match (name, instance.first()) {
+            (
+                "setOf" | "insert" | "remove" | "contains" | "put" | "lookup" | "removeKey",
+                Some(key),
+            ) => self.codecs.key_order(key),
+            _ => String::new(),
+        }
+    }
+
     /// `==`, `!=`, `<`, … on operands of type `ty`: JS operators on BigInts, numbers, booleans
     /// and strings (equality only: strings are ordered by code point, `rt.compare`; `Date`,
     /// `DateTime` and `Instant` texts by `rt.compareDate` / `rt.compareDateTime` /
@@ -1047,10 +1066,38 @@ fn rust_debug_string(text: &str) -> Option<String> {
     Some(output)
 }
 
-fn builtin_call(name: &str, values: Vec<Code>) -> Code {
+/// A builtin applied to `values`; `order` is the key comparator of the `Set`/`Map` builtins
+/// that take one (`Generator::key_order`). Collections are immutable frozen arrays, so every
+/// builtin but `map`/`fold` is a pure call when its arguments are.
+fn builtin_call(name: &str, order: &str, values: Vec<Code>) -> Code {
     let texts: Vec<String> = values.iter().map(|value| value.text.clone()).collect();
     let pure = values.iter().all(|value| value.pure);
+    let runtime = |function: &str, with_order: bool| {
+        let mut arguments = Vec::new();
+        if with_order {
+            arguments.push(order.to_string());
+        }
+        arguments.extend(texts.iter().cloned());
+        Code::call(format!("rt.{function}({})", arguments.join(", ")), pure)
+    };
     match (name, texts.as_slice()) {
+        ("setOf", items) if items.len() > MAX_SPREAD => {
+            Code::call(format!("rt.setFrom({order}, [{}])", items.join(", ")), pure)
+        }
+        ("setOf", _) => runtime("setOf", true),
+        ("emptySet", []) => atom("rt.emptySet()"),
+        ("insert", [_, _]) => runtime("setInsert", true),
+        ("remove", [_, _]) => runtime("setRemove", true),
+        ("contains", [_, _]) => runtime("setContains", true),
+        ("setSize", [_]) => runtime("setSize", false),
+        ("toList", [_]) => runtime("setToList", false),
+        ("emptyMap", []) => atom("rt.emptyMap()"),
+        ("put", [_, _, _]) => runtime("mapPut", true),
+        ("lookup", [_, _]) => runtime("mapLookup", true),
+        ("removeKey", [_, _]) => runtime("mapRemoveKey", true),
+        ("keys", [_]) => runtime("mapKeys", false),
+        ("values", [_]) => runtime("mapValues", false),
+        ("mapSize", [_]) => runtime("mapSize", false),
         ("listOf", items) if items.len() > MAX_SPREAD => {
             Code::call(format!("rt.listFrom([{}])", items.join(", ")), pure)
         }
@@ -1073,13 +1120,13 @@ fn builtin_call(name: &str, values: Vec<Code>) -> Code {
 }
 
 /// A builtin used as a value: an async function that applies it (without entering a level).
-fn builtin_value(name: &str, ty: &Type) -> Code {
+fn builtin_value(name: &str, order: &str, ty: &Type) -> Code {
     let Type::Fun(params, _, _) = ty else {
-        return builtin_call(name, Vec::new());
+        return builtin_call(name, order, Vec::new());
     };
     let names: Vec<String> = (0..params.len()).map(|index| format!("a{index}")).collect();
     let values: Vec<Code> = names.iter().map(atom).collect();
-    let call = builtin_call(name, values);
+    let call = builtin_call(name, order, values);
     let call = call
         .text
         .strip_prefix("await ")
@@ -1148,6 +1195,40 @@ mod tests {
             assert!(text.contains(" === "), "{text}");
             assert!(!text.contains("rt.compare("), "{text}");
         }
+    }
+
+    #[test]
+    fn collection_builtins_take_the_key_order() {
+        let program = crate::core::lower::tests::compile(
+            "enum class Cor { Z, A, M }\nfun aplica(f: (Set<Cor>, Cor) -> Set<Cor>): Set<Cor> = f(setOf(M), Z)\nfun f(): Set<Cor> = aplica(insert)\nfun g(m: Map<Decimal, Int>, k: Decimal): Int? = lookup(put(m, k, mapSize(m)), k)\n",
+        );
+        let function = |name: &str| {
+            let function = program
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .expect("function");
+            super::function(function, &program)
+        };
+        let f = function("f");
+        assert!(
+            f.contains("async (ctx, a0, a1) => rt.setInsert(ord0, a0, a1)"),
+            "{f}"
+        );
+        assert!(
+            f.contains("const ord0 = rt.variantOrder([\"Z\", \"A\", \"M\"]);"),
+            "{f}"
+        );
+        let aplica = function("aplica");
+        assert!(
+            aplica.contains("rt.setOf(ord0, rt.variant(\"M\", []))"),
+            "{aplica}"
+        );
+        let g = function("g");
+        assert!(
+            g.contains("rt.mapLookup(rt.decimalCompare, rt.mapPut(rt.decimalCompare, u_m_0, u_k_1, rt.mapSize(u_m_0)), u_k_1)"),
+            "{g}"
+        );
     }
 
     #[test]

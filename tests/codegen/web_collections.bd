@@ -1,0 +1,116 @@
+// `Set`/`Map` builtins and rich wire types in the JS backend: Decimal keys of different
+// scales (Review Focus 1), an enum declared out of alphabetical order (Review Focus 3), a
+// generic record instantiated twice in one signature (Review Focus 4), malformed collections
+// from the server (Review Focus 5), `Result` and a sealed class with fields.
+enum class Cor { Z, A, M }
+
+distinct type Tom = Cor
+
+distinct type CustomerId = Int
+
+data class Customer(val id: CustomerId, val name: String)
+
+data class Pagina<T>(val itens: List<T>, val total: Int)
+
+sealed class Evento {
+    data class Criado(val em: Instant, val por: Customer)
+    data class Removido(val motivo: String)
+    data object Nenhum
+}
+
+fun nome(c: Cor): String = when (c) {
+    Z -> "z"
+    A -> "a"
+    M -> "m"
+}
+
+fun nomes(cs: List<Cor>): String = fold(cs, "", { s, c -> s + nome(c) })
+
+fun numeros(xs: List<Int>): Int = fold(xs, 0, { s, x -> s * 100 + x })
+
+fun descreve(e: Evento): String = when (e) {
+    Criado(_, por) -> por.name
+    Removido(motivo) -> "-" + motivo
+    Nenhum -> "nada"
+}
+
+fun momento(e: Evento, d: Instant): Instant = when (e) {
+    Criado(em, _) -> em
+    _ -> d
+}
+
+fun tabela(): Map<Cor, Int> = put(put(put(emptyMap(), M, 1), Z, 2), M, 3)
+
+fun tons(): Set<Tom> = setOf(Tom(M), Tom(Z), Tom(A))
+
+fun probeCores(): String = nomes(toList(setOf(M, A, Z, A)))
+
+fun probeChaves(): String = nomes(keys(tabela()))
+
+fun probeValores(): Int = numeros(values(tabela()))
+
+fun probeTamanhos(): Int = mapSize(tabela()) * 10 + setSize(tons())
+
+fun probeConjunto(): Int = numeros(toList(remove(insert(insert(setOf(5, 1, 3), 2), 3), 9)))
+
+fun probeContem(): Boolean = contains(setOf(1, 2), 2) && removeKey(tabela(), M) != tabela() && !contains(setOf(1), 2)
+
+fun probeIguais(): Boolean = setOf(3, 1, 2) == insert(setOf(2, 1), 3)
+
+fun probeProcura(): String = lookup(put(emptyMap(), "a", "x"), "a") ?: "nenhum"
+
+fun vazio(): Set<Int> = emptySet()
+
+fun probeVazio(): Int = setSize(vazio()) + mapSize(removeKey(put(emptyMap(), 1, 1), 1))
+
+fun probeTamanhosDeLista(): Int = numeros(map(listOf(setOf(1, 2), vazio()), setSize))
+
+fun aplica(f: (Set<Int>, Int) -> Set<Int>): Set<Int> = f(setOf(1), 2)
+
+fun probeComoValor(): Int = setSize(aplica(insert))
+
+server fun precos(m: Map<Decimal, String>): Map<Decimal, String> = m
+
+server fun ecoCores(s: Set<Cor>): Set<Cor> = s
+
+server fun agrupa(paginas: Map<CustomerId, Pagina<Customer>>, numeros: Pagina<Int>): Pagina<Customer> =
+    Pagina(listOf(), numeros.total)
+
+server fun contagem(numeros: Pagina<Int>): Pagina<Int> = numeros
+
+server fun resultado(x: Int): Result<Set<Int>, String> = if (x > 0) Ok(setOf(x)) else Err("negativo")
+
+server fun evento(e: Evento): Evento = e
+
+client component Colecoes(d: Decimal, n: Int) {
+    val precos = server.precos(put(put(emptyMap(), d, "x"), d, "y"))
+    val cores = server.ecoCores(setOf(M, A, Z, A))
+    UI {
+        Text(lookup(precos, d) ?: "nenhum")
+        Text(mapSize(precos))
+        Text(nomes(toList(cores)))
+        Text(probeCores())
+        Text(probeChaves())
+        Text(probeConjunto())
+        Text(contains(cores, A))
+    }
+}
+
+client component Paginas(n: Int, quando: Instant) {
+    val dono = Customer(CustomerId(n), "Ana")
+    val pagina = server.agrupa(put(emptyMap(), CustomerId(n), Pagina(listOf(dono), 1)), Pagina(listOf(n, 2), 2))
+    val contada = server.contagem(Pagina(listOf(n), 1))
+    val r = server.resultado(n)
+    val e = server.evento(Criado(quando, dono))
+    UI {
+        Text(length(pagina.itens))
+        Text(pagina.total)
+        Text(numeros(contada.itens))
+        Text(when (r) {
+            Ok(s) -> numeros(toList(s))
+            Err(m) -> -1
+        })
+        Text(descreve(e))
+        Text(momento(e, quando))
+    }
+}

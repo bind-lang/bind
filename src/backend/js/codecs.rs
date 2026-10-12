@@ -6,8 +6,10 @@
 //! `certified::lower_camel(variant)`, a variant with fields is `{lowerCamel: {fields}}`;
 //! `Result` is `{"Ok": v}` / `{"Err": e}`; a distinct value is its underlying value; `Int`,
 //! `Decimal` and `Money` are strings; `Long` is a number; `Unit` and `None` are `null`;
-//! `Option<Option<T>>` is just as serde writes it (`Some(None)` is `null`); `List`/`Set` are
-//! arrays and `Map` an array of `[key, value]` pairs.
+//! `Option<Option<T>>` is just as serde writes it (`Some(None)` is `null`); `List` is an array,
+//! `Set` an array in canonical order and `Map` an array of `[key, value]` pairs in canonical key
+//! order (decoders accept any order, normalize it and reject duplicates by the key order, see
+//! [`Codecs::key_order`]).
 //!
 //! In memory, record and variant fields live under their escaped names (`names::js_value`),
 //! so a field named `tag`, `__proto__` or `constructor` is an ordinary property of a
@@ -45,6 +47,8 @@ pub struct Codecs<'p> {
     program: &'p CoreProgram,
     /// Helper name of each `(kind, instance)` already defined.
     helpers: BTreeMap<(Kind, String), String>,
+    /// Name of the order helper (`ord<n>`) of each enum instance already defined.
+    orders: BTreeMap<String, String>,
     definitions: Vec<String>,
 }
 
@@ -66,6 +70,7 @@ impl<'p> Codecs<'p> {
         Codecs {
             program,
             helpers: BTreeMap::new(),
+            orders: BTreeMap::new(),
             definitions: Vec::new(),
         }
     }
@@ -106,11 +111,18 @@ impl<'p> Codecs<'p> {
             (name, []) if is_text(name) => "rt.decodeString".into(),
             // JSON null is `None`; any other value is `Some` (`{some: v}` in memory).
             ("Option", [inner]) => format!("rt.decodeOptional({})", self.decoder(inner)),
-            ("List" | "Set", [item]) => format!("rt.decodeList({})", self.decoder(item)),
+            ("List", [item]) => format!("rt.decodeList({})", self.decoder(item)),
+            // Any order on the wire, normalized; duplicates (by the key order) rejected.
+            ("Set", [item]) => {
+                let decoder = self.decoder(item);
+                let order = self.key_order(item);
+                format!("rt.decodeSet({decoder}, {order})")
+            }
             ("Map", [key, value]) => {
+                let order = self.key_order(key);
                 let key = self.decoder(key);
                 let value = self.decoder(value);
-                format!("rt.decodeList(rt.decodePair({key}, {value}))")
+                format!("rt.decodeMap({key}, {value}, {order})")
             }
             ("Result", [ok, err]) => {
                 let ok = self.decoder(ok);
@@ -145,6 +157,7 @@ impl<'p> Codecs<'p> {
                 let inner = self.encode_at(inner, &format!("{value}.some"), depth);
                 format!("({value} === null ? null : {inner})")
             }
+            // A set's array and a map's pairs are already in canonical order.
             ("List" | "Set", [item]) => {
                 let x = format!("x{depth}");
                 let item = self.encode_at(item, &x, depth + 1);
@@ -165,6 +178,54 @@ impl<'p> Codecs<'p> {
             }
             _ => no_encoding(ty),
         }
+    }
+
+    /// A JS expression evaluating to the canonical order (the runtime's key comparator) of
+    /// the `Key` type `ty`: `rt.compare` for `Int`, the text types (code point order) and
+    /// `Boolean`; `rt.decimalCompare` for `Decimal`/`Money` (by value); the typed temporal
+    /// comparators; the order of the underlying type for a distinct type; for an enum class (or
+    /// a sealed class of data objects) a helper `ord<n>`, `rt.variantOrder` of its variant tags
+    /// in declaration order.
+    pub fn key_order(&mut self, ty: &Type) -> String {
+        let mut current = ty.clone();
+        for _ in 0..16 {
+            let Type::Con(name, args) = &current else {
+                break;
+            };
+            match self.user_type(name, args) {
+                Some(UserType::Distinct(underlying)) => current = underlying,
+                Some(UserType::Sum(variants)) => return self.variant_order(&current, &variants),
+                Some(UserType::Record(_)) => break,
+                None => {
+                    return match name.as_str() {
+                        "Decimal" | "Money" => "rt.decimalCompare",
+                        "Date" => "rt.compareDate",
+                        "DateTime" => "rt.compareDateTime",
+                        "Instant" => "rt.compareInstant",
+                        _ => "rt.compare",
+                    }
+                    .into();
+                }
+            }
+        }
+        // Not a `Key` type (the checker keeps these out); structural order keeps the module valid.
+        "rt.compare".into()
+    }
+
+    fn variant_order(&mut self, ty: &Type, variants: &[(String, Vec<(String, Type)>)]) -> String {
+        let key = format!("{ty:?}");
+        if let Some(name) = self.orders.get(&key) {
+            return name.clone();
+        }
+        let name = format!("ord{}", self.orders.len());
+        self.orders.insert(key, name.clone());
+        let tags: Vec<String> = variants.iter().map(|(tag, _)| js_string(tag)).collect();
+        self.definitions.push(format!(
+            "// Canonical order of {}: declaration order.\nconst {name} = rt.variantOrder([{}]);\n",
+            display(ty),
+            tags.join(", ")
+        ));
+        name
     }
 
     /// The named helper of a user type instance, defined on first use.
@@ -429,6 +490,41 @@ mod tests {
         assert_eq!(
             encoder(&Type::option(Type::option(ty("Decimal"))), &program),
             "(v) => (v === null ? null : (v.some === null ? null : v.some.some.toString()))"
+        );
+    }
+
+    #[test]
+    fn sets_and_maps_decode_with_the_key_order() {
+        let program = program(
+            "enum class Cor { Z, A, M }\ndistinct type Tom = Cor\ndistinct type Nota = Decimal\nfun f() = 1\n",
+        );
+        let set = |item: Type| Type::Con("Set".into(), vec![item]);
+        let map = |key: Type, value: Type| Type::Con("Map".into(), vec![key, value]);
+        assert_eq!(
+            decoder(&set(Type::con("Int")), &program),
+            "rt.decodeSet(rt.decodeInt, rt.compare)"
+        );
+        assert_eq!(
+            decoder(&map(Type::con("Nota"), Type::con("String")), &program),
+            "(() => {\n// Decoder of Nota.\nlet dec0_ = null;\nfunction dec0(json) {\nreturn (dec0_ ??= rt.decodeDecimal)(json);\n}\n\nreturn rt.decodeMap(dec0, rt.decodeString, rt.decimalCompare);\n})()"
+        );
+        assert_eq!(
+            decoder(&set(Type::con("Instant")), &program),
+            "rt.decodeSet(rt.decodeString, rt.compareInstant)"
+        );
+        // An enum (directly or through a distinct type) is ordered by declaration, once per module.
+        let mut codecs = Codecs::new(&program);
+        assert_eq!(codecs.key_order(&Type::con("Cor")), "ord0");
+        assert_eq!(codecs.key_order(&Type::con("Tom")), "ord0");
+        assert_eq!(codecs.key_order(&Type::con("Money")), "rt.decimalCompare");
+        assert_eq!(codecs.key_order(&Type::con("Boolean")), "rt.compare");
+        assert_eq!(
+            codecs.definitions(),
+            "// Canonical order of Cor: declaration order.\nconst ord0 = rt.variantOrder([\"Z\", \"A\", \"M\"]);\n"
+        );
+        assert_eq!(
+            encoder(&map(Type::con("Int"), set(Type::con("Int"))), &program),
+            "(v) => v.map((x0) => [x0[0].toString(), x0[1].map((x1) => x1.toString())])"
         );
     }
 

@@ -15,7 +15,9 @@
 //   information and Some(None) stays distinct from None (the wire form is unchanged: JSON
 //   null or the value); records -> frozen null-prototype objects
 //   (record()); sealed/enum -> frozen {tag, ...fields} (variant()); Result -> variant("Ok" |
-//   "Err", [["value", v]]); List<T> -> frozen array; Decimal/Money -> Decimal; functions ->
+//   "Err", [["value", v]]); List<T> -> frozen array; Set<T> -> frozen array in canonical order;
+//   Map<K, V> -> frozen array of frozen [k, v] pairs in canonical key order (see "Set / Map");
+//   Decimal/Money -> Decimal; functions ->
 //   async (ctx, ...args) => ...; Unit -> undefined; Long -> BigInt; distinct -> the underlying
 //   value. Generated code stores record and variant fields under escaped property names
 //   (`u_<name>`), so no field meets `tag`, `some` or an Object.prototype name.
@@ -476,6 +478,156 @@ export async function fold(ctx, xs, init, f) {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Set / Map (frozen arrays in canonical order)
+// ---------------------------------------------------------------------------------------------
+//
+// A Set<T> is a frozen array of its elements in canonical order, without two equal elements; a
+// Map<K, V> is a frozen array of frozen [key, value] pairs in canonical key order, without two
+// equal keys. So `equals` compares them structurally, the wire form is the array itself (pairs
+// for a map) and toList needs no copy. Every operation takes the key comparator
+// `(a, b) => -1 | 0 | 1` of the element / key type, which bindc passes (bindc's reference
+// evaluator is the oracle of this order): `compare` for Int, String (code point order), Email, Url, UUID and
+// Boolean (false < true); `decimalCompare` for Decimal and Money (by value: 1.0 = 1.00, -0 = 0);
+// compareDate / compareDateTime / compareInstant for temporal values (by time, never by text);
+// `variantOrder(tags)` for an enum class or a sealed class of data objects (declaration order);
+// the comparator of the underlying type for a distinct type. Updates never change their input:
+// they return a new frozen array, or the input itself when nothing changes (Ruling A: inserting
+// an element equal to a present one, or putting a key equal to a present one, keeps the present
+// element / key; a put replaces only the value). Not counted by `enter`.
+
+/**
+ * The comparator of an enum class (or of a sealed class of data objects) whose variant tags are
+ * `tags`, in declaration order: variants compare by their index in `tags`.
+ */
+export function variantOrder(tags) {
+  const index = new Map(tags.map((tag, i) => [tag, i]));
+  return (a, b) => {
+    const x = index.get(a.tag);
+    const y = index.get(b.tag);
+    return x < y ? -1 : x > y ? 1 : 0;
+  };
+}
+
+/** The index of `key` in the sorted `items` (read through `keyOf`): [found, index]. */
+function search(compareKeys, items, key, keyOf) {
+  let low = 0;
+  let high = items.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const order = compareKeys(keyOf(items[middle]), key);
+    if (order === 0) return [true, middle];
+    if (order < 0) low = middle + 1;
+    else high = middle;
+  }
+  return [false, low];
+}
+
+const element = (x) => x;
+const pairKey = (pair) => pair[0];
+
+/** A frozen copy of `items` with `item` at `index` (replacing one element when `replace`). */
+function spliced(items, index, replace, ...item) {
+  const copy = Array.from(items);
+  copy.splice(index, replace ? 1 : 0, ...item);
+  return Object.freeze(copy);
+}
+
+/**
+ * `items` in canonical order (read through `keyOf`), frozen: of equal keys the first stays, or
+ * a DecodeError when `strict`.
+ */
+function canonical(compareKeys, items, keyOf, strict) {
+  // Array.prototype.sort is stable, so the first of equal keys comes first in its run.
+  const sorted = Array.from(items).sort((a, b) => compareKeys(keyOf(a), keyOf(b)));
+  const out = [];
+  for (const item of sorted) {
+    if (out.length > 0 && compareKeys(keyOf(out[out.length - 1]), keyOf(item)) === 0) {
+      if (strict) fail("no duplicate element or key");
+      continue;
+    }
+    out.push(item);
+  }
+  return Object.freeze(out);
+}
+
+const EMPTY_COLLECTION = Object.freeze([]);
+
+export function emptySet() {
+  return EMPTY_COLLECTION;
+}
+
+/** `setOf(a, b, …)`: the elements inserted left to right (of two equal ones the first stays). */
+export function setOf(compareKeys, ...xs) {
+  return canonical(compareKeys, xs, element, false);
+}
+
+/** `setOf` of an array (generated code uses it for long literals). */
+export function setFrom(compareKeys, array) {
+  return canonical(compareKeys, array, element, false);
+}
+
+/** `insert(s, x)`: `s` itself when an equal element is present (it stays), else a new set. */
+export function setInsert(compareKeys, s, x) {
+  const [found, index] = search(compareKeys, s, x, element);
+  return found ? s : spliced(s, index, false, x);
+}
+
+/** `remove(s, x)`: `s` itself when no equal element is present. */
+export function setRemove(compareKeys, s, x) {
+  const [found, index] = search(compareKeys, s, x, element);
+  return found ? spliced(s, index, true) : s;
+}
+
+export function setContains(compareKeys, s, x) {
+  return search(compareKeys, s, x, element)[0];
+}
+
+export function setSize(s) {
+  return BigInt(s.length);
+}
+
+/** The elements in canonical order (the set's own frozen array). */
+export function setToList(s) {
+  return s;
+}
+
+export function emptyMap() {
+  return EMPTY_COLLECTION;
+}
+
+/** `put(m, k, v)`: an equal key present stays (with its text) and gets the value `v`. */
+export function mapPut(compareKeys, m, k, v) {
+  const [found, index] = search(compareKeys, m, k, pairKey);
+  return spliced(m, index, found, Object.freeze([found ? m[index][0] : k, v]));
+}
+
+/** `lookup(m, k)` as a V?: some(value), or null when no equal key is present. */
+export function mapLookup(compareKeys, m, k) {
+  const [found, index] = search(compareKeys, m, k, pairKey);
+  return found ? some(m[index][1]) : null;
+}
+
+/** `removeKey(m, k)`: `m` itself when no equal key is present. */
+export function mapRemoveKey(compareKeys, m, k) {
+  const [found, index] = search(compareKeys, m, k, pairKey);
+  return found ? spliced(m, index, true) : m;
+}
+
+/** The keys in canonical order. */
+export function mapKeys(m) {
+  return Object.freeze(m.map(pairKey));
+}
+
+/** The values in the order of their keys. */
+export function mapValues(m) {
+  return Object.freeze(m.map((pair) => pair[1]));
+}
+
+export function mapSize(m) {
+  return BigInt(m.length);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Records and variants (no prototype pollution)
 // ---------------------------------------------------------------------------------------------
 
@@ -582,6 +734,30 @@ export function decodeList(item) {
     const out = [];
     for (const value of json) out.push(item(value));
     return Object.freeze(out);
+  };
+}
+
+/**
+ * Set<T>: an array in any order, decoded item by item and put in canonical order by
+ * `compareKeys` (see "Set / Map"); two equal elements (by the comparator: "1.0" and "1.00" are
+ * equal Decimals) are a DecodeError, as in the server.
+ */
+export function decodeSet(item, compareKeys) {
+  return (json) => {
+    if (!Array.isArray(json)) fail("an array");
+    return canonical(compareKeys, json.map(item), element, true);
+  };
+}
+
+/**
+ * Map<K, V>: an array of [key, value] pairs (exactly two elements each) in any order, put in
+ * canonical key order; two equal keys are a DecodeError.
+ */
+export function decodeMap(key, value, compareKeys) {
+  const pair = decodePair(key, value);
+  return (json) => {
+    if (!Array.isArray(json)) fail("an array");
+    return canonical(compareKeys, json.map(pair), pairKey, true);
   };
 }
 
