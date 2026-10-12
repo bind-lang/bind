@@ -10,10 +10,11 @@ use crate::diagnostic::Span;
 use crate::parser::expr::parse_type_text;
 use crate::syntax::expr::TypeExpr;
 
-const PROFILE_VERSION: &str = "rust-web-v3";
+const PROFILE_VERSION: &str = "rust-web-v4";
 /// JSON contract of the profile: `Int`, `Decimal` and `Money` travel as strings (the format of
-/// `bind-json-v2`; the frontend accepts any canonical `Int` of up to 1000 digits).
-const WIRE_VERSION: &str = "bind-json-v3";
+/// `bind-json-v2`; the frontend accepts any canonical `Int` of up to 1000 digits); sums,
+/// `Result`, `Set` and `Map` travel in the shapes of `docs/certified-profile-v0.4.md`.
+const WIRE_VERSION: &str = "bind-json-v4";
 // Dependencies of the generated server, pinned with `=`. They match the runtime's
 // `runtime/bind-runtime/Cargo.toml`, whose source the generated crate compiles.
 const SERDE: &str = "1.0.229";
@@ -333,7 +334,7 @@ fn cargo_toml(app: &VerifiedApplication, target: &TargetConfig, layout: &Layout)
     )
 }
 
-/// The procedures of the `bind-json-v3` contract: for each input field and the output, the
+/// The procedures of the `bind-json-v4` contract: for each input field and the output, the
 /// Bind type and its JSON encoding (`Int`, `Decimal` and `Money` are strings).
 fn contract_schema(app: &VerifiedApplication) -> String {
     let describe = |type_ref: &TypeRef| {

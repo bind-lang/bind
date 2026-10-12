@@ -2,7 +2,7 @@
 
 [bind]
 language = "0.1.0"
-profile = "rust-web-v3"
+profile = "rust-web-v4"
 
 [toolchain]
 rust = "1.98.0"

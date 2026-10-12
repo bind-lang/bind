@@ -28,7 +28,7 @@
 //!   result, a 1001-digit `Int` argument and a 1001-digit `Int` result give the same page in
 //!   the `ssr` mode (server calls through the wire codecs in memory) as in the `split` mode
 //!   (real RPCs from node): "Bad request" with serde's message for the arguments, "Request
-//!   failed" for the results. (A `Long` cannot cross the wire in rust-web-v3, E8309: the
+//!   failed" for the results. (A `Long` cannot cross the wire in rust-web-v4, E8309: the
 //!   runtime's unit tests cover its ±(2^53 − 1) rule.)
 //! - collections and rich types (`RICH_PAGE`, both modes of a fifth project): an endpoint that
 //!   receives a `Map<CustomerId, Int>` and returns a sealed class with fields holding a

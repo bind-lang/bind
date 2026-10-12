@@ -2,6 +2,8 @@
 
 Profile identifier: `rust-web-v3`.
 
+> Nota: este perfil foi substituído pelo [v0.4](certified-profile-v0.4.md) (`rust-web-v4`, contrato `bind-json-v4`: análise tipada sobre a IR no lugar da análise por tokens, `sealed` com campos, genéricos, `Result`, `Set` e `Map` no fio, builtins de coleção e a restrição `Key`). Mantido como referência histórica.
+
 Este documento define a superfície finita para a qual `bind certify` emite uma atestação no perfil v3. O v3 substitui o v2 ([v0.2](certified-profile-v0.2.md)) no cliente: o cliente Elm foi removido e o frontend passa a ser HTML, CSS e JavaScript nativos, mais um renderizador SSR em Rust, ambos gerados da mesma IR tipada (`CoreProgram`) que já gerava o servidor. A pilha é única: Bind, HTML/CSS/JS e Rust. Semântica não suportada continua sendo erro de compilação; o compilador nunca a substitui por um comportamento mais fraco.
 
 ## Execution model

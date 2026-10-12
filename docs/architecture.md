@@ -14,14 +14,25 @@ whole-application verification
     ↓
 VerifiedApplication
     │   (types::check → core::lower → core::validate: CoreProgram, IR tipada)
+    ├── core::analysis: grafo da aplicação, operações de banco, diagnósticos tipados
     ├── Rust core ──→ AWS Lambda adapter
     │            └─→ Vercel Rust adapters
     ├── Rust SSR (page rendering, same runtime)
-    ├── bind-json-v3 schema and vectors
+    ├── bind-json-v4 schema and vectors
     └── JS frontend (web/index.html, app.js, bind-runtime.js)
 ```
 
 Generation receives `VerifiedApplication`, not raw source; o backend Rust lê somente a `CoreProgram` (IR tipada produzida por `types::check → core::lower → core::validate`), nunca tokens. Uma IR inconsistente é o erro interno E9001. If verification emits an error, no target generator is called.
+
+Os tokens ficam no lexer e no parser: o AST não guarda o corpo das funções em tokens (`Function.body` não existe mais), e nenhuma análise posterior lê tokens.
+
+## Análise sobre a IR (`core::analysis`)
+
+`src/core/analysis.rs` percorre a `CoreProgram` (com `specialize::children`, o mesmo percurso dos backends) e produz, em ordem determinística:
+
+- **o grafo da aplicação** (`application_graph`): arestas de quem usa para o que é usado (função → função, inclusive funções passadas como valor; cliente → endpoint; função → tabela e campos do modelo; função → `environment.X`). Alimenta `bind graph`, `bind impact`, `application.graph.txt` e o caminho dos diagnósticos; as ligações `environment.X -> env.VAR` vêm das declarações do AST;
+- **as operações de banco** (`database_operations` e `operations`): os nós `Db` da IR, lambdas incluídas. O backend Rust e o `VerifiedApplication` usam o mesmo código, e a E8307 decide por elas;
+- **os diagnósticos tipados** (`typed_diagnostics`), calculados logo depois do `core::lower` e antes do `core::validate`: E4102 (segredo alcançável por código cliente, por busca em largura a partir das funções `Client`, com o caminho), E5303 (`insert` sem coluna obrigatória), E5204 e E5201 (campos do modelo contra as colunas, pelo mesmo `Env::column_type` do verificador) e E2301 (função sem corpo com retorno diferente de `Unit`). O AST só fornece spans, as declarações do `environment` e os campos declarados do modelo.
 
 Os três geradores (servidor Rust, SSR e frontend JS) leem a mesma `CoreProgram`. Na biblioteca Rust gerada, os tipos e funções do programa ficam no módulo `app` e os itens do gerador (banco, requisições, roteador, testes) na raiz, para que nomes do usuário nunca colidam com eles.
 
@@ -30,7 +41,8 @@ Os três geradores (servidor Rust, SSR e frontend JS) leem a mesma `CoreProgram`
 - **Backend Rust** (`src/backend/rust`): biblioteca com módulo `app`, banco, roteador e testes. O runtime (`runtime/bind-runtime`) é copiado como `src/bind_runtime.rs` e fornece `Int`, `Ctx`, `AppError`, transação, limite de profundidade, exibição, HTML e leitura dos parâmetros da URL.
 - **SSR** (`mode = "ssr"`): `handle_page`/`serve` avaliam o componente com as mesmas funções do servidor. Todas as chamadas `server.f` da página compartilham uma transação (commit em sucesso, rollback em erro; nenhuma se não há chamada) e cada uma passa pelos codecs do fio em memória (`ssr_call_<f>`: argumentos escritos como o `JSON.stringify` do frontend e decodificados como pela rota RPC, resultado serializado e relido com o rigor dos decodificadores JS), de modo que os dois modos mostram a mesma página para todo programa e entrada; GET/HEAD `/`, parâmetros estritos, status 200/400/404/500. Componentes estáticos são pré-renderizados na geração (`core::eval` com orçamento, `PRERENDER_BUDGET`: trabalho da avaliação, tamanhos e o HTML do resultado, 1 MiB) em `web/index.html`; fora do orçamento voltam a ser renderizados em tempo de execução. Os renderizadores e a liberação das árvores de UI são iterativos nas três implementações.
 - **Backend JS** (`src/backend/js`): `plan.rs` decide a página e as regras de E8311, `expr.rs`/`page.rs` emitem `web/app.js` (módulos ES2022, sem npm nem bundler) sobre `runtime/bind-runtime-js` (`web/bind-runtime.js`): `BigInt` para `Int`, `Math.fround` para `Float`, `Option` uniforme `{ some: v }`, nomes de propriedade escapados, `enter` com `await`, renderização sem `innerHTML`. No modo `split` cada RPC tem sua transação; no `ssr` a página não envia JS.
-- **Vetores compartilhados** (`runtime/vectors/`): `html-trees.json`, `numbers.json`, `pages.json`, `params.json` e `temporal-order.json` (ordem de `Date`/`DateTime`/`Instant`, conferida contra `chrono`) são lidos pelos testes de `bindc` (`core::display`, canônico), do runtime Rust e do runtime JS, o que mantém as três implementações idênticas. O avaliador `src/core/eval.rs` serve ao teste diferencial a três vias (avaliador × Rust × JS) e à pré-renderização.
+- **Coleções e tipos ricos no fio**: `Set`/`Map` são `BindSet`/`BindMap` (newtypes sobre `Arc<BTreeSet>`/`Arc<BTreeMap>`, com serde estrito) no Rust, arrays congelados em ordem canônica no JS (com o comparador da chave escolhido na geração) e `Value::Set`/`Value::Map` no avaliador, que é o oráculo da ordem canônica (ver [perfil v0.4](certified-profile-v0.4.md)). `sealed` com campos, genéricos instanciados e `Result` usam o formato do serde, com `deny_unknown_fields` no Rust e decodificadores equivalentes no JS.
+- **Vetores compartilhados** (`runtime/vectors/`): `html-trees.json`, `numbers.json`, `pages.json`, `params.json`, `temporal-order.json` (ordem de `Date`/`DateTime`/`Instant`, conferida contra `chrono`), `collections.json` (ordem canônica e builtins de coleção) e `wire-rich.json` (JSON dos tipos ricos, válidos e inválidos) são lidos pelos testes de `bindc` (`core::display`, canônico), do runtime Rust e do runtime JS, o que mantém as três implementações idênticas. O avaliador `src/core/eval.rs` serve ao teste diferencial a três vias (avaliador × Rust × JS) e à pré-renderização.
 
 The compiler-owned Rust library is the semantic center of both deployment targets. It defines domain representations, strict request structures, SQL generated from database IR, row decoding, status mapping, and JSON responses. AWS and Vercel adapters are thin transport layers.
 

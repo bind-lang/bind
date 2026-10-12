@@ -8,14 +8,14 @@ Repository: <https://github.com/bind-lang/bind>
 
 ## Certified profiles
 
-The current profile is `rust-web-v3` ([certified profile v0.3](docs/certified-profile-v0.3.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. The Elm client is gone. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), the wire contract is `bind-json-v3`, and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input: the SSR's server calls go through the same wire codecs as the split mode's RPCs, `Date`/`DateTime`/`Instant` compare by value everywhere, UI trees of any depth render iteratively, and the compile-time pre-render of static pages is bounded (work and HTML size) with a run-time fallback. Previous profiles are kept in docs: [v0.2](docs/certified-profile-v0.2.md) (`rust-elm-web-v2`) and [v0.1](docs/certified-profile-v0.1.md) (`rust-elm-web-v1`).
+The current profile is `rust-web-v4` ([certified profile v0.4](docs/certified-profile-v0.4.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. Every analysis after parsing works on that IR too: the application graph, the database operations and the secret-flow, insert, column-type and return checks are computed by `core::analysis`, and no token is read outside the lexer and the parser. Sealed classes with fields, instantiated generics, `Result`, `Set` and `Map` cross the wire (`bind-json-v4`); `Set` and `Map` have immutable builtins (`setOf`, `insert`, `put`, `lookup`, …) over `Key` types, with the same canonical order in the evaluator, Rust and JS. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input. Previous profiles are kept in docs: [v0.3](docs/certified-profile-v0.3.md) (`rust-web-v3`), [v0.2](docs/certified-profile-v0.2.md) (`rust-elm-web-v2`) and [v0.1](docs/certified-profile-v0.1.md) (`rust-elm-web-v1`).
 
 The overall shape is:
 
 ```text
 Bind source (.bind or .bd)
         │
-        ├── Rust server + PostgreSQL + bind-json-v3 RPC
+        ├── Rust server + PostgreSQL + bind-json-v4 RPC
         │       ├── AWS Lambda / provided.al2023
         │       └── Vercel Rust Functions
         │
@@ -133,12 +133,12 @@ Neither command is run automatically because both require the user's cloud accou
 - declared function returns and argument compatibility;
 - effect declarations and client/server domain rules;
 - effects (`db.read`, `db.write`, `server.call`) and deployment domains in the type system, with exact `effects [...]` contracts (see [type system](docs/type-system.md));
-- typed environment declarations and secret-to-client rejection;
+- typed environment declarations and secret-to-client rejection, followed through helper functions and lambdas;
 - database table, field, type, nullability, and required-insert checks against a deterministic schema snapshot;
-- compiler-owned RPC paths (`bind-json-v3`), strict request decoding, response codecs, and generated malformed-contract tests;
+- compiler-owned RPC paths (`bind-json-v4`, including sealed classes with fields, generics, `Result`, `Set` and `Map`), strict request decoding, response codecs, and generated malformed-contract tests;
 - target capability negotiation before generation;
 - deterministic SHA-256 source, schema, lockfile, and artifact attestations.
 
 No compiler can prove database availability, future uniqueness conflicts, network availability, or a cloud provider's uptime. `certified-host` in the manifest means the generated project passed the local certified toolchain; the cloud-native builders still produce the final Linux deployment artifact.
 
-The exact supported subset and rejection policy are specified in the [certified profile v0.3](docs/certified-profile-v0.3.md) (previous: [v0.2](docs/certified-profile-v0.2.md), [v0.1](docs/certified-profile-v0.1.md)). The implementation architecture is described in [architecture](docs/architecture.md).
+The exact supported subset and rejection policy are specified in the [certified profile v0.4](docs/certified-profile-v0.4.md) (previous: [v0.3](docs/certified-profile-v0.3.md), [v0.2](docs/certified-profile-v0.2.md), [v0.1](docs/certified-profile-v0.1.md)). The implementation architecture is described in [architecture](docs/architecture.md).

@@ -152,6 +152,10 @@ satisfy `Key`):
 the set keeps the existing one (and the set); `put` with a key equal to one already in the map
 replaces the value and keeps the existing key (putting the `Decimal` key `1.00` into a map that holds
 `1.0` keeps the key `1.0`); `remove` and `removeKey` of an absent element return the collection unchanged.
+The collection builtins can be passed as values (`map(xss, setSize)`, `fold(xs, s, insert)`) and,
+like the other builtins, do not count toward the recursion depth limit. `Set` and `Map` cross the wire
+as arrays in canonical order (a `Map` as `[k, v]` pairs) and have no database mapping; see the
+[certified profile v0.4](certified-profile-v0.4.md).
 
 Without mutation the value restriction is unnecessary: every `val` is generalized.
 

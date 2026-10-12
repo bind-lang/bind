@@ -1384,35 +1384,35 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         let cases = [
             (
                 "server fun f(x: Int): (Int) -> Int effects [] = { y -> y }\n",
-                "Endpoint `f` uses `(Int) -> Int`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `f` uses `(Int) -> Int`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "server fun g(d: Duration): Int = 1\n",
-                "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `g` uses `Duration`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "server fun h(n: Long): Int = 1\n",
-                "Endpoint `h` uses `Long`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `h` uses `Long`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "server fun r(): Result<Int, Long> = Ok(1)\n",
-                "Endpoint `r` uses `Result<Int, Long>`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `r` uses `Result<Int, Long>`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "data class Caixa<T>(val x: T)\nserver fun c(x: Caixa<Duration>): Int = 1\n",
-                "Endpoint `c` uses `Caixa<Duration>`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `c` uses `Caixa<Duration>`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "sealed class S { data class A(val f: (Int) -> Int)\n data object B }\nserver fun e(): S = B\n",
-                "Endpoint `e` uses `S`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `e` uses `S`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "server fun m(x: Map<String, Duration>): Int = 1\n",
-                "Endpoint `m` uses `Map<String, Duration>`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `m` uses `Map<String, Duration>`, which cannot cross the wire in profile rust-web-v4.",
             ),
             (
                 "server fun s(xs: List<Duration>?): Int = 1\n",
-                "Endpoint `s` uses `List<Duration>?`, which cannot cross the wire in profile rust-web-v3.",
+                "Endpoint `s` uses `List<Duration>?`, which cannot cross the wire in profile rust-web-v4.",
             ),
         ];
         for (source, message) in cases {
@@ -1474,8 +1474,8 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             found,
             vec![
-                "Entity field `Tarefa.prazo` uses `Duration`, which has no database mapping in profile rust-web-v3.",
-                "Column `tarefas.prazo` uses `Duration`, which has no database mapping in profile rust-web-v3.",
+                "Entity field `Tarefa.prazo` uses `Duration`, which has no database mapping in profile rust-web-v4.",
+                "Column `tarefas.prazo` uses `Duration`, which has no database mapping in profile rust-web-v4.",
             ],
             "{:?}",
             result.diagnostics
@@ -1522,8 +1522,8 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Endpoint `b` has no body, so the generated server cannot run it in profile rust-web-v3.",
-                "Function `registra` is reachable from endpoint `a` but has no body, so the generated server cannot run it in profile rust-web-v3.",
+                "Endpoint `b` has no body, so the generated server cannot run it in profile rust-web-v4.",
+                "Function `registra` is reachable from endpoint `a` but has no body, so the generated server cannot run it in profile rust-web-v4.",
             ]
         );
     }
@@ -1534,7 +1534,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Function `nome` is reachable from endpoint `a` but uses an `environment` value, which the generated server does not support in profile rust-web-v3."
+                "Function `nome` is reachable from endpoint `a` but uses an `environment` value, which the generated server does not support in profile rust-web-v4."
             ]
         );
     }
@@ -1545,7 +1545,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Function `tela` is reachable from endpoint `f` but uses a UI tree, which the generated server does not support in profile rust-web-v3."
+                "Function `tela` is reachable from endpoint `f` but uses a UI tree, which the generated server does not support in profile rust-web-v4."
             ]
         );
     }
@@ -1559,7 +1559,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, &schema),
             vec![
-                "Column `itens.cor` has type `Cor`, which has no database mapping in profile rust-web-v3."
+                "Column `itens.cor` has type `Cor`, which has no database mapping in profile rust-web-v4."
             ]
         );
         // A table no endpoint uses does not matter.
@@ -1576,7 +1576,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, &schema),
             vec![
-                "Column `customers.extra` is assigned by an insert, but model `Customer` declares no field `extra`, so the generated server cannot use it in profile rust-web-v3."
+                "Column `customers.extra` is assigned by an insert, but model `Customer` declares no field `extra`, so the generated server cannot use it in profile rust-web-v4."
             ]
         );
         // (b) A primary key the model does not declare.
@@ -1584,7 +1584,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, SCHEMA),
             vec![
-                "Column `customers.id` is the primary key of the table, but model `Customer` declares no field `id`, so the generated server cannot use it in profile rust-web-v3."
+                "Column `customers.id` is the primary key of the table, but model `Customer` declares no field `id`, so the generated server cannot use it in profile rust-web-v4."
             ]
         );
     }
@@ -1595,7 +1595,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             e8310(source, EMPTY_SCHEMA),
             vec![
-                "Endpoint `a` uses an `environment` value, which the generated server does not support in profile rust-web-v3."
+                "Endpoint `a` uses an `environment` value, which the generated server does not support in profile rust-web-v4."
             ]
         );
     }
@@ -1725,8 +1725,8 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         assert_eq!(
             messages,
             vec![
-                "Function `dobro` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
-                "Function `metade` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
+                "Function `dobro` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v4.".to_string(),
+                "Function `metade` is reachable from component `Pagina` but multiplies or divides `Decimal`/`Money` values, which the web frontend does not support in profile rust-web-v4.".to_string(),
             ]
         );
         // The same in the split mode: changing modes never changes which programs are accepted.
@@ -1736,7 +1736,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
     #[test]
     fn component_parameters_must_fit_in_a_url() {
         let source = "distinct type Codigo = UUID\ndistinct type Nome = String\nclient component Pagina(a: String, b: Email, c: Url, d: Int, e: Codigo, f: Date, g: DateTime, h: Instant, i: Nome, j: Boolean, k: Decimal, l: Int?, m: List<Int>) {\n    UI {\n        Text(a)\n    }\n}\n";
-        let suffix = ", which a page URL cannot carry in profile rust-web-v3 (allowed: String, Email, Url, Int, UUID, Date, DateTime, Instant and distinct types over them).";
+        let suffix = ", which a page URL cannot carry in profile rust-web-v4 (allowed: String, Email, Url, Int, UUID, Date, DateTime, Instant and distinct types over them).";
         assert_eq!(
             e8311(source, WEB_SPLIT),
             ["j: Boolean", "k: Decimal", "l: Int?", "m: List<Int>"]
@@ -1977,9 +1977,9 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
     fn client_code_the_server_cannot_render_is_rejected_in_both_modes() {
         let source = "environment development {\n    public val nome: String = env(\"APP_NAME\", default = \"x\")\n}\nfun mais(a: Duration, b: Duration): Duration = a + b\nfun registra(x: Int): Unit\nfun usa(): String {\n    registra(1)\n    return nome\n}\nclient component Pagina() {\n    val f = mais\n    UI {\n        Text(usa())\n    }\n}\n";
         let expected = vec![
-            "Function `mais` is reachable from component `Pagina` but does arithmetic on `Duration` values, which the web frontend does not support in profile rust-web-v3.".to_string(),
-            "Function `registra` is reachable from component `Pagina` but has no body, so the web frontend cannot run it in profile rust-web-v3.".to_string(),
-            "Function `usa` is reachable from component `Pagina` but uses an `environment` value, which the web frontend does not support in profile rust-web-v3.".to_string(),
+            "Function `mais` is reachable from component `Pagina` but does arithmetic on `Duration` values, which the web frontend does not support in profile rust-web-v4.".to_string(),
+            "Function `registra` is reachable from component `Pagina` but has no body, so the web frontend cannot run it in profile rust-web-v4.".to_string(),
+            "Function `usa` is reachable from component `Pagina` but uses an `environment` value, which the web frontend does not support in profile rust-web-v4.".to_string(),
         ];
         assert_eq!(e8311(source, WEB_SSR), expected);
         assert_eq!(e8311(source, WEB_SPLIT), expected);
@@ -1987,7 +1987,7 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
         let source = "environment development {\n    public val nome: String = env(\"APP_NAME\", default = \"x\")\n}\nclient component Pagina() {\n    UI {\n        Text(nome)\n    }\n}\n";
         assert_eq!(
             e8311(source, WEB_SPLIT),
-            vec!["Component `Pagina` uses an `environment` value, which the web frontend does not support in profile rust-web-v3.".to_string()]
+            vec!["Component `Pagina` uses an `environment` value, which the web frontend does not support in profile rust-web-v4.".to_string()]
         );
     }
 
