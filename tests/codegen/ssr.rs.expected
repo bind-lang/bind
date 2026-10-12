@@ -309,7 +309,7 @@ async fn ssr_call_getCustomer(ctx: crate::bind_runtime::Ctx, a0: crate::app::Cus
     let mut request = crate::bind_runtime::WireRequest::new();
     request.field("id", &a0)?;
     let input: GetCustomerInput = crate::bind_runtime::wire_decode_request(&request.finish())?;
-    let value = app::bind_getCustomer(ctx, input.id).await?;
+    let value = crate::bind_runtime::server_task(app::bind_getCustomer(ctx, input.id)).await?;
     crate::bind_runtime::wire_response(value)
 }
 

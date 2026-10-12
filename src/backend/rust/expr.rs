@@ -568,7 +568,8 @@ impl Generator<'_, '_> {
             }
             // Only in the component's code (SSR; `server_problems` rejects them in endpoint
             // code, E8310): the crate's `ssr_call_<name>`, the separate RPC of the JS frontend
-            // (depth 0) through the same wire codecs, in memory (`endpoints::server_calls`).
+            // (depth 0, on its own task) through the same wire codecs, in memory
+            // (`endpoints::server_calls`).
             ExprKind::ServerCall { function, args } => {
                 let mut values = vec!["ctx.server_call()".to_string()];
                 values.extend(self.owned_args(args));

@@ -131,7 +131,9 @@ impl Ctx {
     }
 
     /// Context of a server function called by the SSR: the same transaction, depth 0, as the
-    /// separate RPC the JS frontend makes.
+    /// separate RPC the JS frontend makes. The call must run through [`server_task`], on a
+    /// stack of its own: depth 0 below the page's calls would let one stack hold up to twice
+    /// `MAX_DEPTH` nested calls.
     pub fn server_call(&self) -> Ctx {
         Ctx {
             transaction: self.transaction.clone(),
@@ -187,6 +189,29 @@ impl Ctx {
             let taken = shared.lock_owned().await.take();
             taken.ok_or_else(no_transaction)
         }
+    }
+}
+
+/// Runs `call`, a server function called by the SSR with [`Ctx::server_call`], as its own
+/// task: the scheduler polls it from the top of a worker stack, not from inside the page's
+/// nested calls. So the page and the server function each nest at most `MAX_DEPTH` calls on
+/// one stack, as in the `split` mode, where the call is a separate request; run inline, a
+/// server call at the bottom of a page `MAX_DEPTH` calls deep would add `MAX_DEPTH` more to the
+/// same stack (its depth restarts at 0), past what the worker stack is sized for, and overflow
+/// it (an abort of the whole process). The task is aborted if the page is dropped first.
+pub async fn server_task<T: Send + 'static>(call: BoxFuture<T>) -> Result<T, AppError> {
+    struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+    impl<T> Drop for AbortOnDrop<T> {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let mut task = AbortOnDrop(tokio::spawn(call));
+    match (&mut task.0).await {
+        Ok(result) => result,
+        Err(_) => Err(AppError::Internal(
+            "the server call's task failed".to_string(),
+        )),
     }
 }
 
@@ -2448,6 +2473,108 @@ mod tests {
                 recurse(ctx, n.sub(&Int::from_i64(1))).await
             }
         })
+    }
+
+    /// The address of a local of this call: where the stack currently is.
+    #[inline(never)]
+    fn stack_address() -> usize {
+        let marker = 0_u8;
+        std::hint::black_box(&marker) as *const u8 as usize
+    }
+
+    /// A server function `n` calls deep; the stack address at its bottom.
+    fn server_recurse(ctx: Ctx, n: u32) -> BoxFuture<usize> {
+        Box::pin(async move {
+            let ctx = ctx.enter()?;
+            if n <= 1 {
+                Ok(stack_address())
+            } else {
+                server_recurse(ctx, n - 1).await
+            }
+        })
+    }
+
+    /// A page `n` calls deep whose bottom calls a server function `server` calls deep, as the
+    /// SSR does: the stack addresses at the page's bottom and at the server function's.
+    fn page_recurse(ctx: Ctx, n: u32, server: u32) -> BoxFuture<(usize, usize)> {
+        Box::pin(async move {
+            let ctx = ctx.enter()?;
+            if n <= 1 {
+                let page_bottom = stack_address();
+                let server_bottom = server_task(server_recurse(ctx.server_call(), server)).await?;
+                Ok((page_bottom, server_bottom))
+            } else {
+                page_recurse(ctx, n - 1, server).await
+            }
+        })
+    }
+
+    /// A server call from the bottom of a page `MAX_DEPTH` calls deep runs its own
+    /// `MAX_DEPTH` calls from the top of the stack, not below the page's: one stack never holds
+    /// more than `MAX_DEPTH` nested calls, which is what the worker stack is sized for.
+    #[test]
+    fn server_calls_nest_on_a_stack_of_their_own() {
+        let thread = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                // One thread: the page and the server call's task share its stack.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async {
+                    let top = stack_address();
+                    let (page_bottom, server_bottom) =
+                        page_recurse(Ctx::pure(), MAX_DEPTH, MAX_DEPTH)
+                            .await
+                            .unwrap();
+                    (top, page_bottom, server_bottom)
+                })
+            })
+            .unwrap();
+        let (top, page_bottom, server_bottom) = thread.join().unwrap();
+        let page_depth = top.abs_diff(page_bottom);
+        let server_depth = top.abs_diff(server_bottom);
+        assert!(page_depth > 1024 * 1024, "{page_depth}");
+        assert!(
+            server_depth < page_depth + page_depth / 10,
+            "the server call nested below the page: {server_depth} vs {page_depth}"
+        );
+        // Past the limit, the page and the server call each stop at `MAX_DEPTH`.
+        let rt = runtime();
+        let page =
+            rt.block_on(async { tokio::spawn(page_recurse(Ctx::pure(), MAX_DEPTH + 1, 1)).await });
+        assert!(matches!(page.unwrap(), Err(AppError::RecursionLimit)));
+        let server =
+            rt.block_on(async { tokio::spawn(page_recurse(Ctx::pure(), 1, MAX_DEPTH + 1)).await });
+        assert!(matches!(server.unwrap(), Err(AppError::RecursionLimit)));
+    }
+
+    /// A server call's task that fails (a panic in tests; `panic = "abort"` in release) is an
+    /// `Internal` error of the page, and a dropped page aborts it.
+    #[test]
+    fn server_tasks_fail_and_abort_with_the_page() {
+        let rt = runtime();
+        let failed = rt.block_on(server_task::<i64>(Box::pin(async {
+            std::panic::resume_unwind(Box::new("boom"))
+        })));
+        assert!(matches!(failed, Err(AppError::Internal(_))));
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = finished.clone();
+        rt.block_on(async move {
+            let slow = server_task::<()>(Box::pin(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(10), slow)
+                    .await
+                    .is_err()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        });
+        assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[test]

@@ -372,7 +372,9 @@ HttpResponse {{ status: result.status, content_type: RPC_CONTENT_TYPE, body: res
 /// arguments written exactly as the JS frontend's `JSON.stringify` writes them and decoded
 /// into `<Name>Input` as the RPC route does, the result serialized as the route does and read
 /// back as strictly as the JS decoders read it. So for every program and input both modes show
-/// the same page (NaN, an `Int` of more than 1000 digits, a `Long` beyond ±(2^53 − 1)).
+/// the same page (NaN, an `Int` of more than 1000 digits, a `Long` beyond ±(2^53 − 1)). The
+/// call itself runs as its own task (the runtime's `server_task`): its depth restarts at 0, so
+/// it must not nest below the page's calls on the same stack.
 pub fn server_calls(
     endpoints: &[&CoreFunction],
     names: &BTreeMap<String, String>,
@@ -396,7 +398,7 @@ async fn ssr_call_{name}({params}) -> ::std::result::Result<{result}, {RUNTIME}:
 #[allow(unused_mut)]
 let mut request = {RUNTIME}::WireRequest::new();
 {fields}let input: {input} = {RUNTIME}::wire_decode_request(&request.finish())?;
-let value = {module}::bind_{name}({arguments}).await?;
+let value = {RUNTIME}::server_task({module}::bind_{name}({arguments})).await?;
 {RUNTIME}::wire_response(value)
 }}
 
