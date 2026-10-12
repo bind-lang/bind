@@ -101,7 +101,7 @@ pub(crate) enum Ty {
     Double,
     Float,
     Ui,
-    // Collections and rich types, only in the three-way test's programs too.
+    // Collections and rich types, also only in the three-way test's programs.
     Cor,
     SetInt,
     SetStr,
@@ -2631,7 +2631,7 @@ fn temporal_text(ty: &str, year: i64, month: u32, day: u32, seconds: u32, nanos:
 /// The three-way test's temporal calls: every pair of `runtime/vectors/temporal-order.json`,
 /// then random pairs of each type (extended and negative years, fractions of 0, 3, 6 or 9
 /// digits, leap seconds; `b` often equal to `a` or one field away from it), each pair through
-/// `ordem<T>` and `tela<T>`.
+/// every function of [`TEMPORAL_FUNCTIONS`].
 pub(crate) fn temporal_calls() -> Vec<Call> {
     let mut pairs: Vec<(String, String, String)> = Vec::new();
     let vectors = include_str!("../../../runtime/vectors/temporal-order.json");
@@ -2766,7 +2766,7 @@ pub(crate) fn decimal_calls() -> Vec<Call> {
     calls
 }
 
-/// `t<k>=<render>` for every temporal call, by the reference evaluator (the values are their
+/// `t<k>=<render>` (temporal) or `d<k>=<render>` (Decimal) for every call, by the reference evaluator (the values are their
 /// wire texts).
 pub(crate) fn calls_expected(program: &CoreProgram, calls: &[Call]) -> Vec<String> {
     use crate::core::eval::Value;
@@ -2869,7 +2869,7 @@ fn main_rs(programs: &[(String, Ty, String)]) -> String {
 
 /// `src/main.rs` of a differential crate named `krate`: the renderer plus `extra` items, and
 /// `encode`, the body of `fn encode(line: String) -> String` (what is printed after `p<i>=`).
-/// The `calls` (see [`TemporalCall`]) follow the programs, their arguments read from their
+/// The `calls` (see [`Call`]) follow the programs, their arguments read from their
 /// wire texts.
 pub(crate) fn main_rs_with(
     programs: &[(String, Ty, String)],
