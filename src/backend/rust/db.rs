@@ -13,36 +13,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::core::ir::{CoreFunction, CoreProgram, CoreType, DbOp, Expr, ExprKind};
+pub use crate::core::analysis::{DbKey, operations};
+use crate::core::ir::{CoreProgram, CoreType};
 use crate::schema::DatabaseSchema;
 use crate::types::ty::Type;
 
 use super::types::{DISTINCT_FIELD, Layout, RUNTIME, STRING};
-
-/// One database operation used by the generated code.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DbKey {
-    Require(String),
-    Find(String),
-    /// Table and the assigned columns, in source order.
-    Insert(String, Vec<String>),
-}
-
-impl DbKey {
-    pub fn of(op: &DbOp, table: &str) -> DbKey {
-        match op {
-            DbOp::Require => DbKey::Require(table.to_string()),
-            DbOp::Find => DbKey::Find(table.to_string()),
-            DbOp::Insert { columns } => DbKey::Insert(table.to_string(), columns.clone()),
-        }
-    }
-
-    fn table(&self) -> &str {
-        match self {
-            DbKey::Require(table) | DbKey::Find(table) | DbKey::Insert(table, _) => table,
-        }
-    }
-}
 
 /// What a call site needs: the function's name and its parameter types.
 #[derive(Clone, Debug)]
@@ -56,23 +32,6 @@ pub struct DbPlan {
     pub functions: BTreeMap<DbKey, DbFunction>,
     /// Tables whose rows are decoded.
     tables: BTreeSet<String>,
-}
-
-/// The database operations in `functions` (lambdas included).
-pub fn operations(functions: &[&CoreFunction]) -> BTreeSet<DbKey> {
-    fn walk(expr: &Expr, output: &mut BTreeSet<DbKey>) {
-        if let ExprKind::Db { op, table, .. } = &expr.kind {
-            output.insert(DbKey::of(op, table));
-        }
-        super::children(expr)
-            .into_iter()
-            .for_each(|child| walk(child, output));
-    }
-    let mut output = BTreeSet::new();
-    for function in functions {
-        walk(&function.body, &mut output);
-    }
-    output
 }
 
 /// A table's model: its name and fields (`entity` declarations are records).
@@ -500,7 +459,7 @@ mod tests {
         let source = "distinct type TId = UUID\nentity T(val id: TId, val a: String, val b: String?)\ndistinct type UId = UUID\nentity U(val id: UId, val a: String)\nserver fun f(): TId effects [db.write] {\n    val x = db.t.insert {\n        a = \"1\"\n    }\n    val y = db.t.insert {\n        a = \"2\"\n        b = null\n    }\n    val z = db.t_1.insert {\n        a = \"4\"\n    }\n    return x.id\n}\n";
         let schema = schema(csv);
         let program = compile_with(source, &schema);
-        let functions: Vec<&CoreFunction> = program.functions.iter().collect();
+        let functions: Vec<&crate::core::ir::CoreFunction> = program.functions.iter().collect();
         let plan = DbPlan::new(&operations(&functions), &program, &schema).unwrap();
         let names: BTreeSet<&str> = plan
             .functions

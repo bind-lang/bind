@@ -105,17 +105,13 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
             let root =
                 positional(&args, 1).ok_or_else(|| "Usage: bind graph <symbol>".to_string())?;
             let app = verified(&config, &args)?;
-            println!("{}", app.graph.tree(&root));
+            println!("{}", graph_output(&app, &root));
         }
         "impact" => {
             let resource =
                 positional(&args, 1).ok_or_else(|| "Usage: bind impact <resource>".to_string())?;
             let app = verified(&config, &args)?;
-            let impacted = app.graph.impact(&resource);
-            println!("Affected by {resource}:\n");
-            for item in impacted {
-                println!("  {item}");
-            }
+            print!("{}", impact_output(&app, &resource));
         }
         "target" => target_command(&args, &config)?,
         "db" if args.get(1).map(String::as_str) == Some("inspect") => {
@@ -225,6 +221,20 @@ fn print_diagnostics(items: &[crate::diagnostic::Diagnostic]) {
         eprintln!("{item}");
     }
 }
+/// What `bind graph <symbol>` prints: the tree of what `root` uses.
+fn graph_output(app: &crate::compiler::VerifiedApplication, root: &str) -> String {
+    app.graph.tree(root)
+}
+
+/// What `bind impact <resource>` prints: everything that depends on `resource`.
+fn impact_output(app: &crate::compiler::VerifiedApplication, resource: &str) -> String {
+    let mut output = format!("Affected by {resource}:\n\n");
+    for item in app.graph.impact(resource) {
+        output.push_str(&format!("  {item}\n"));
+    }
+    output
+}
+
 fn graph_text(graph: &crate::compiler::ApplicationGraph) -> String {
     graph
         .edges
@@ -262,4 +272,69 @@ Options:
   --out <path>       Override generated workspace path
 "#
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `examples/commerce` verified for its SSR target (the repository's `bind.toml`).
+    fn commerce() -> crate::compiler::VerifiedApplication {
+        if std::env::var_os("DATABASE_URL").is_none() {
+            // SAFETY: read only through `std::env`, whose accesses take the same lock.
+            unsafe { std::env::set_var("DATABASE_URL", "postgresql://bind:bind@localhost/bind") };
+        }
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let config = ProjectConfig::load(&root.join("bind.toml")).unwrap();
+        let result = verify(&config, "aws-lambda-ssr");
+        result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics))
+    }
+
+    #[test]
+    fn commerce_graph_is_computed_from_the_ir() {
+        let app = commerce();
+        assert_eq!(
+            graph_text(&app.graph),
+            include_str!("../tests/analysis/commerce.graph.expected")
+        );
+        let mut from_ir = crate::core::analysis::application_graph(&app.core);
+        from_ir.add_edge("environment.applicationName", "env.APP_NAME");
+        from_ir.add_edge("environment.databaseUrl", "env.DATABASE_URL");
+        assert_eq!(app.graph, from_ir);
+    }
+
+    #[test]
+    fn commerce_graph_and_impact_commands() {
+        let app = commerce();
+        assert_eq!(
+            graph_output(&app, "CustomerPage"),
+            "CustomerPage\n\
+             └── getCustomer\n\
+             \x20   ├── database.main.customers\n\
+             \x20   ├── database.main.customers.balance\n\
+             \x20   ├── database.main.customers.email\n\
+             \x20   ├── database.main.customers.id\n\
+             \x20   └── database.main.customers.name\n"
+        );
+        assert_eq!(
+            graph_output(&app, "cadastrar"),
+            "cadastrar\n\
+             ├── database.main.customers\n\
+             ├── database.main.customers.balance\n\
+             ├── database.main.customers.email\n\
+             ├── database.main.customers.id\n\
+             ├── database.main.customers.name\n\
+             └── normalizar\n"
+        );
+        assert_eq!(
+            impact_output(&app, "database.main.customers.name"),
+            "Affected by database.main.customers.name:\n\n  CustomerPage\n  cadastrar\n  getCustomer\n"
+        );
+        assert_eq!(
+            impact_output(&app, "env.DATABASE_URL"),
+            "Affected by env.DATABASE_URL:\n\n  environment.databaseUrl\n"
+        );
+    }
 }

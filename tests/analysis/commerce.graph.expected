@@ -1,0 +1,6 @@
+CustomerPage: getCustomer
+cadastrar: database.main.customers, database.main.customers.balance, database.main.customers.email, database.main.customers.id, database.main.customers.name, normalizar
+environment.applicationName: env.APP_NAME
+environment.databaseUrl: env.DATABASE_URL
+getCustomer: database.main.customers, database.main.customers.balance, database.main.customers.email, database.main.customers.id, database.main.customers.name
+normalizar: 

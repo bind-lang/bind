@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,185 +32,7 @@ pub struct RpcContract {
     pub path: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct DatabaseOperation {
-    pub function: String,
-    pub table: String,
-    pub method: String,
-    pub effect: String,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct ApplicationGraph {
-    pub edges: BTreeMap<String, BTreeSet<String>>,
-}
-
-impl ApplicationGraph {
-    pub fn add_node(&mut self, node: impl Into<String>) {
-        self.edges.entry(node.into()).or_default();
-    }
-    pub fn add_edge(&mut self, from: impl Into<String>, to: impl Into<String>) {
-        self.edges.entry(from.into()).or_default().insert(to.into());
-    }
-
-    pub fn tree(&self, root: &str) -> String {
-        let mut output = String::new();
-        let mut seen = BTreeSet::new();
-        self.render(root, "", true, &mut seen, &mut output);
-        output
-    }
-
-    fn render(
-        &self,
-        node: &str,
-        prefix: &str,
-        last: bool,
-        seen: &mut BTreeSet<String>,
-        output: &mut String,
-    ) {
-        if prefix.is_empty() {
-            output.push_str(node);
-            output.push('\n');
-        } else {
-            output.push_str(prefix);
-            output.push_str(if last { "└── " } else { "├── " });
-            output.push_str(node);
-            output.push('\n');
-        }
-        if !seen.insert(node.to_string()) {
-            return;
-        }
-        let children: Vec<_> = self
-            .edges
-            .get(node)
-            .into_iter()
-            .flat_map(|items| items.iter())
-            .collect();
-        for (index, child) in children.iter().enumerate() {
-            let next = if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}{}", if last { "    " } else { "│   " })
-            };
-            let child_prefix = if prefix.is_empty() {
-                String::new()
-            } else {
-                next
-            };
-            if prefix.is_empty() {
-                let marker = if index + 1 == children.len() {
-                    "└── "
-                } else {
-                    "├── "
-                };
-                output.push_str(marker);
-                output.push_str(child);
-                output.push('\n');
-                if seen.insert((*child).clone()) {
-                    self.render_children(
-                        child,
-                        if index + 1 == children.len() {
-                            "    "
-                        } else {
-                            "│   "
-                        },
-                        seen,
-                        output,
-                    );
-                }
-            } else {
-                self.render(
-                    child,
-                    &child_prefix,
-                    index + 1 == children.len(),
-                    seen,
-                    output,
-                );
-            }
-        }
-    }
-
-    fn render_children(
-        &self,
-        node: &str,
-        prefix: &str,
-        seen: &mut BTreeSet<String>,
-        output: &mut String,
-    ) {
-        let children: Vec<_> = self
-            .edges
-            .get(node)
-            .into_iter()
-            .flat_map(|items| items.iter())
-            .collect();
-        for (index, child) in children.iter().enumerate() {
-            output.push_str(prefix);
-            output.push_str(if index + 1 == children.len() {
-                "└── "
-            } else {
-                "├── "
-            });
-            output.push_str(child);
-            output.push('\n');
-            if seen.insert((*child).clone()) {
-                let next = format!(
-                    "{prefix}{}",
-                    if index + 1 == children.len() {
-                        "    "
-                    } else {
-                        "│   "
-                    }
-                );
-                self.render_children(child, &next, seen, output);
-            }
-        }
-    }
-
-    pub fn path_to(&self, target: &str) -> Vec<String> {
-        let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (from, targets) in &self.edges {
-            for to in targets {
-                reverse.entry(to).or_default().push(from);
-            }
-        }
-        let mut queue = VecDeque::from([(target, vec![target.to_string()])]);
-        let mut seen = BTreeSet::new();
-        while let Some((node, path)) = queue.pop_front() {
-            if !seen.insert(node) {
-                continue;
-            }
-            let parents = reverse.get(node).cloned().unwrap_or_default();
-            if parents.is_empty() {
-                return path.into_iter().rev().collect();
-            }
-            for parent in parents {
-                let mut next = path.clone();
-                next.push(parent.to_string());
-                queue.push_back((parent, next));
-            }
-        }
-        vec![target.into()]
-    }
-
-    pub fn impact(&self, target: &str) -> Vec<String> {
-        let mut reverse: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (from, targets) in &self.edges {
-            for to in targets {
-                reverse.entry(to).or_default().push(from);
-            }
-        }
-        let mut queue = VecDeque::from([target]);
-        let mut found = BTreeSet::new();
-        while let Some(node) = queue.pop_front() {
-            for parent in reverse.get(node).cloned().unwrap_or_default() {
-                if found.insert(parent.to_string()) {
-                    queue.push_back(parent);
-                }
-            }
-        }
-        found.into_iter().collect()
-    }
-}
+pub use crate::core::analysis::{ApplicationGraph, DatabaseOperation};
 
 #[derive(Clone, Debug)]
 pub struct VerifiedApplication {
@@ -336,7 +158,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             module_count: files.len(),
         };
     }
-    let mut graph = ApplicationGraph::default();
+    // Token-based graph and database operations, still used by the checks below that run before
+    // lowering (diagnostic paths, the tables in use, E8307). The graph and operations of the
+    // verified application are computed from the IR (`core::analysis`) after lowering.
+    let mut token_graph = ApplicationGraph::default();
     let type_map: BTreeMap<_, _> = program
         .types
         .iter()
@@ -350,10 +175,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     validate_declarations(&program, &type_map, &function_map, &mut diagnostics);
 
     let mut required_capabilities = BTreeSet::new();
-    let mut database_operations = Vec::new();
+    let mut token_operations = Vec::new();
     let mut pending_database_errors = Vec::new();
     for function in &program.functions {
-        graph.add_node(function.name.clone());
+        token_graph.add_node(function.name.clone());
         match function.domain {
             Domain::Client => {
                 required_capabilities.insert("ui.dom".into());
@@ -374,8 +199,8 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             &type_map,
             &function_map,
             &database,
-            &mut graph,
-            &mut database_operations,
+            &mut token_graph,
+            &mut token_operations,
             &mut diagnostics,
             &mut pending_database_errors,
         );
@@ -388,7 +213,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     let mut environment = validate_environment(&program, config, &mut diagnostics);
     environment.sort_by(|a, b| a.variable.cmp(&b.variable));
     for declaration in &program.environment {
-        graph.add_edge(
+        token_graph.add_edge(
             format!("environment.{}", declaration.name),
             format!("env.{}", declaration.variable),
         );
@@ -422,8 +247,8 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
     }
 
     for (function, resource, mut diagnostic) in pending_database_errors {
-        graph.add_edge(function.clone(), resource.clone());
-        diagnostic.path = graph.path_to(&function);
+        token_graph.add_edge(function.clone(), resource.clone());
+        diagnostic.path = token_graph.path_to(&function);
         diagnostic.path.push(resource);
         diagnostics.push(diagnostic);
     }
@@ -482,10 +307,10 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         }
     }
     if target_config.server == "rust" {
-        validate_rust_server_surface(&program, &database, &database_operations, &mut diagnostics);
+        validate_rust_server_surface(&program, &database, &token_operations, &mut diagnostics);
     }
     if target_config.certified {
-        validate_certified_surface(&program, &database_operations, config, &mut diagnostics);
+        validate_certified_surface(&program, &token_operations, config, &mut diagnostics);
     }
 
     if config.warnings_as_errors {
@@ -539,20 +364,31 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
             None
         }
     };
-    let application = core.map(|core| VerifiedApplication {
-        project_name: config.name.clone(),
-        project_version: config.version.clone(),
-        target: target.into(),
-        source_hash: stable_hash(&source_canonical),
-        program,
-        graph,
-        environment,
-        database,
-        database_operations,
-        rpc_contracts,
-        required_capabilities,
-        unsafe_operations: Vec::new(),
-        core,
+    let application = core.map(|core| {
+        let mut graph = crate::core::analysis::application_graph(&core);
+        // The IR does not carry the declarations: each value's variable comes from the AST.
+        for declaration in &program.environment {
+            graph.add_edge(
+                format!("environment.{}", declaration.name),
+                format!("env.{}", declaration.variable),
+            );
+        }
+        let database_operations = crate::core::analysis::database_operations(&core);
+        VerifiedApplication {
+            project_name: config.name.clone(),
+            project_version: config.version.clone(),
+            target: target.into(),
+            source_hash: stable_hash(&source_canonical),
+            program,
+            graph,
+            environment,
+            database,
+            database_operations,
+            rpc_contracts,
+            required_capabilities,
+            unsafe_operations: Vec::new(),
+            core,
+        }
     });
     CompileResult {
         application,
@@ -2612,5 +2448,110 @@ capabilities = ["ui.dom", "server.http", "db.read", "db.write"]
                 result.diagnostics
             );
         }
+    }
+
+    fn operation(function: &str, table: &str, method: &str, effect: &str) -> DatabaseOperation {
+        DatabaseOperation {
+            function: function.into(),
+            table: table.into(),
+            method: method.into(),
+            effect: effect.into(),
+        }
+    }
+
+    /// The database operations computed from the IR are the ones the token scan extracted for
+    /// every database test program (same functions, order and repetitions), and they are the
+    /// ones `verify` reports.
+    #[test]
+    fn database_operations_from_the_ir_match_the_token_scan() {
+        let cases = [
+            (
+                ENDPOINT_SOURCE,
+                ENDPOINT_SCHEMA,
+                vec![
+                    operation("cadastrar", "customers", "insert", "db.write"),
+                    operation("cadastrar", "customers", "require", "db.read"),
+                    operation("procurar", "customers", "find", "db.read"),
+                    operation("falha", "customers", "insert", "db.write"),
+                    operation("falha", "customers", "require", "db.read"),
+                ],
+            ),
+            (
+                include_str!("../tests/codegen/client_int.bd"),
+                include_str!("../tests/codegen/client_int.csv"),
+                vec![operation("reservar", "items", "require", "db.read")],
+            ),
+            (
+                include_str!("../tests/codegen/names.bd"),
+                include_str!("../tests/codegen/names.csv"),
+                vec![operation("procura", "things", "find", "db.read")],
+            ),
+            (
+                include_str!("../tests/codegen/lints.bd"),
+                include_str!("../tests/codegen/lints.csv"),
+                vec![
+                    operation("largo", "wide", "insert", "db.write"),
+                    operation("largo", "wide", "require", "db.read"),
+                ],
+            ),
+            (
+                include_str!("../tests/codegen/ssr.bd"),
+                include_str!("../tests/codegen/ssr.csv"),
+                vec![operation("getCustomer", "customers", "require", "db.read")],
+            ),
+            (
+                SOURCE,
+                SCHEMA,
+                vec![operation("getCustomer", "customers", "require", "db.read")],
+            ),
+        ];
+        for (source, schema, expected) in cases {
+            let (root, config) = fixture(source, schema);
+            let result = verify(&config, "aws-lambda");
+            let app = result
+                .application
+                .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+            assert_eq!(
+                crate::core::analysis::database_operations(&app.core),
+                expected
+            );
+            assert_eq!(app.database_operations, expected);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// The graph `verify` reports is the one computed from the IR (this program declares no
+    /// `environment`, so there are no `environment.X -> env.VAR` bindings to add).
+    #[test]
+    fn application_graph_comes_from_the_ir() {
+        let (root, config) = fixture(ENDPOINT_SOURCE, ENDPOINT_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert_eq!(
+            app.graph,
+            crate::core::analysis::application_graph(&app.core)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// An edge the token scan missed: a function passed as a value (no `(` after its name),
+    /// which `impact` follows up to the component. (Environment reads are covered in
+    /// `core::analysis`: neither the generated server nor the web frontend accepts one yet.)
+    #[test]
+    fn application_graph_follows_function_values() {
+        let source = "pure fun dobro(x: Int): Int = x * 2\npure fun aplica(f: (Int) -> Int, x: Int): Int = f(x)\npure fun usa(): Int = aplica(dobro, 1)\nclient component Pagina() {\n    UI {\n        Text(usa())\n    }\n}\n";
+        let (root, config) = fixture(source, EMPTY_SCHEMA);
+        let result = verify(&config, "aws-lambda");
+        let app = result
+            .application
+            .unwrap_or_else(|| panic!("{:?}", result.diagnostics));
+        assert_eq!(
+            app.graph.edges["usa"],
+            BTreeSet::from(["aplica".to_string(), "dobro".to_string()])
+        );
+        assert_eq!(app.graph.impact("dobro"), vec!["Pagina", "usa"]);
+        fs::remove_dir_all(root).unwrap();
     }
 }
