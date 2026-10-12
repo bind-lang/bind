@@ -101,6 +101,17 @@ pub(crate) enum Ty {
     Double,
     Float,
     Ui,
+    // Collections and rich types, only in the three-way test's programs too.
+    Cor,
+    SetInt,
+    SetStr,
+    SetCor,
+    MapIntStr,
+    MapCorInt,
+    Evento,
+    CaixaInt,
+    CaixaCores,
+    ResInt,
 }
 
 impl Ty {
@@ -115,6 +126,16 @@ impl Ty {
             Ty::Double => "Double",
             Ty::Float => "Float",
             Ty::Ui => "Ui",
+            Ty::Cor => "Cor",
+            Ty::SetInt => "Set<Int>",
+            Ty::SetStr => "Set<String>",
+            Ty::SetCor => "Set<Cor>",
+            Ty::MapIntStr => "Map<Int, String>",
+            Ty::MapCorInt => "Map<Cor, Int>",
+            Ty::Evento => "Evento",
+            Ty::CaixaInt => "Caixa<Int>",
+            Ty::CaixaCores => "Caixa<Set<Cor>>",
+            Ty::ResInt => "Result<Int, String>",
         }
     }
 }
@@ -122,8 +143,10 @@ impl Ty {
 const RESULT_TYPES: [Ty; 5] = [Ty::Int, Ty::Bool, Ty::Str, Ty::List, Ty::OptInt];
 const VALUE_TYPES: [Ty; 6] = [Ty::Int, Ty::Bool, Ty::Str, Ty::List, Ty::OptInt, Ty::Forma];
 /// Result types of the three-way test's programs: the server's, the sum type, `Double`,
-/// `Float` and `Ui` (twice, so UI trees are the most frequent result).
-const WEB_RESULT_TYPES: [Ty; 10] = [
+/// `Float` and `Ui` (twice, so UI trees are the most frequent result), then the collections
+/// and rich types: an `enum class` declared out of alphabetical order, `Set`s and `Map`s over
+/// `Key` types, a sealed class with fields, a generic record at two instances and `Result`.
+const WEB_RESULT_TYPES: [Ty; 20] = [
     Ty::Int,
     Ty::Bool,
     Ty::Str,
@@ -134,8 +157,18 @@ const WEB_RESULT_TYPES: [Ty; 10] = [
     Ty::Float,
     Ty::Ui,
     Ty::Ui,
+    Ty::Cor,
+    Ty::SetInt,
+    Ty::SetStr,
+    Ty::SetCor,
+    Ty::MapIntStr,
+    Ty::MapCorInt,
+    Ty::Evento,
+    Ty::CaixaInt,
+    Ty::CaixaCores,
+    Ty::ResInt,
 ];
-const WEB_VALUE_TYPES: [Ty; 9] = [
+const WEB_VALUE_TYPES: [Ty; 19] = [
     Ty::Int,
     Ty::Bool,
     Ty::Str,
@@ -145,6 +178,16 @@ const WEB_VALUE_TYPES: [Ty; 9] = [
     Ty::Double,
     Ty::Float,
     Ty::Ui,
+    Ty::Cor,
+    Ty::SetInt,
+    Ty::SetStr,
+    Ty::SetCor,
+    Ty::MapIntStr,
+    Ty::MapCorInt,
+    Ty::Evento,
+    Ty::CaixaInt,
+    Ty::CaixaCores,
+    Ty::ResInt,
 ];
 
 /// Pieces of string literals: (Bind source, value).
@@ -432,6 +475,12 @@ impl Gen {
             Ty::Double => self.double(d, scope),
             Ty::Float => self.float(d, scope),
             Ty::Ui => self.ui(d, scope),
+            Ty::Cor => self.cor(d, scope),
+            Ty::SetInt | Ty::SetStr | Ty::SetCor => self.set(ty, d, scope),
+            Ty::MapIntStr | Ty::MapCorInt => self.map(ty, d, scope),
+            Ty::Evento => self.evento(d, scope),
+            Ty::CaixaInt | Ty::CaixaCores => self.caixa(ty, d, scope),
+            Ty::ResInt => self.res_int(d, scope),
         }
     }
 
@@ -475,6 +524,55 @@ impl Gen {
                     0 => format!("Text({})", self.leaf(Ty::Int)),
                     1 => format!("Text({})", self.string_literal().0),
                     _ => format!("Rule({})", self.string_literal().0),
+                }
+            }
+            Ty::Cor => {
+                self.count("enum constructor");
+                self.rng.pick(&["Z", "A", "M"]).to_string()
+            }
+            Ty::SetInt | Ty::SetStr | Ty::SetCor => {
+                if self.rng.chance(25) {
+                    self.count("emptySet");
+                    "emptySet()".into()
+                } else {
+                    self.count("setOf");
+                    let element = set_element(ty);
+                    let items: Vec<String> = (0..self.rng.range(1, 4))
+                        .map(|_| self.leaf(element))
+                        .collect();
+                    format!("setOf({})", items.join(", "))
+                }
+            }
+            Ty::MapIntStr | Ty::MapCorInt => {
+                self.count("emptyMap");
+                if self.rng.chance(30) {
+                    "emptyMap()".into()
+                } else {
+                    self.count("put");
+                    let (key, value) = map_entry(ty);
+                    format!("put(emptyMap(), {}, {})", self.leaf(key), self.leaf(value))
+                }
+            }
+            Ty::Evento => {
+                self.count("sealed with fields constructor");
+                if self.rng.chance(30) {
+                    "Nada".into()
+                } else {
+                    format!("Marcado({}, {})", self.leaf(Ty::Cor), self.leaf(Ty::Int))
+                }
+            }
+            Ty::CaixaInt | Ty::CaixaCores => {
+                self.count_caixa(ty);
+                let inner = self.leaf(caixa_content(ty));
+                format!("Caixa({inner}, {})", self.string_literal().0)
+            }
+            Ty::ResInt => {
+                if self.rng.chance(50) {
+                    self.count("Ok");
+                    format!("Ok({})", self.leaf(Ty::Int))
+                } else {
+                    self.count("Err");
+                    format!("Err({})", self.string_literal().0)
                 }
             }
         }
@@ -601,6 +699,9 @@ impl Gen {
     }
 
     fn int(&mut self, d: u32, scope: &Scope) -> String {
+        if self.web && self.rng.chance(20) {
+            return self.web_int(d, scope);
+        }
         match self.rng.below(24) {
             0 | 1 => self.int_literal().0,
             2 | 3 => {
@@ -720,6 +821,9 @@ impl Gen {
                 self.expr(ty, d, scope)
             );
         }
+        if self.web && self.rng.chance(20) {
+            return self.web_bool(d, scope);
+        }
         match self.rng.below(14) {
             0 => self.leaf(Ty::Bool),
             1..=3 => {
@@ -801,6 +905,9 @@ impl Gen {
     }
 
     fn string(&mut self, d: u32, scope: &Scope) -> String {
+        if self.web && self.rng.chance(20) {
+            return self.web_string(d, scope);
+        }
         match self.rng.below(10) {
             0 | 1 => self.string_literal().0,
             2 | 3 => {
@@ -828,6 +935,9 @@ impl Gen {
     }
 
     fn list(&mut self, d: u32, scope: &Scope) -> String {
+        if self.web && self.rng.chance(25) {
+            return self.web_list(d, scope);
+        }
         match self.rng.below(9) {
             0 | 1 => {
                 self.count("listOf");
@@ -860,6 +970,9 @@ impl Gen {
     }
 
     fn opt_int(&mut self, d: u32, scope: &Scope) -> String {
+        if self.web && self.rng.chance(20) {
+            return self.web_opt_int(d, scope);
+        }
         match self.rng.below(9) {
             0 => self.leaf(Ty::OptInt),
             1 | 2 => {
@@ -1492,6 +1605,708 @@ impl Gen {
         self.when(scrutinee, arms)
     }
 
+    fn count_caixa(&mut self, ty: Ty) {
+        self.count(if ty == Ty::CaixaInt {
+            "generic record at Int"
+        } else {
+            "generic record at Set<Cor>"
+        });
+    }
+
+    /// `escolhe(c, a, b)`: the prelude's generic function, at the type `ty`.
+    fn generic_choice(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        self.count("generic function");
+        format!(
+            "escolhe({}, {}, {})",
+            self.expr(Ty::Bool, d, scope),
+            self.expr(ty, d, scope),
+            self.expr(ty, d, scope)
+        )
+    }
+
+    /// A `Set` expression whose own subterms fix its element type (`emptySet()` alone would
+    /// stay ambiguous where nothing else fixes it, e.g. `setSize(emptySet())`).
+    fn anchored_set(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        if self.rng.chance(20)
+            && let Some(name) = self.var(ty, scope)
+        {
+            self.count("variable");
+            return name;
+        }
+        let element = set_element(ty);
+        match self.rng.below(4) {
+            0 => {
+                self.count("insert");
+                format!(
+                    "insert({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(element, d, scope)
+                )
+            }
+            1 => {
+                self.count("remove");
+                format!(
+                    "remove({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(element, d, scope)
+                )
+            }
+            _ => {
+                self.count("setOf");
+                let items: Vec<String> = (0..self.rng.range(1, 4))
+                    .map(|_| self.expr(element, d, scope))
+                    .collect();
+                format!("setOf({})", items.join(", "))
+            }
+        }
+    }
+
+    /// A `Map` expression whose own subterms fix its key and value types.
+    fn anchored_map(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        if self.rng.chance(20)
+            && let Some(name) = self.var(ty, scope)
+        {
+            self.count("variable");
+            return name;
+        }
+        let (key, value) = map_entry(ty);
+        match self.rng.below(4) {
+            0 => {
+                self.count("put");
+                format!(
+                    "put({}, {}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(key, d, scope),
+                    self.expr(value, d, scope)
+                )
+            }
+            1 if d > 0 => {
+                self.count("removeKey");
+                format!(
+                    "removeKey({}, {})",
+                    self.anchored_map(ty, d - 1, scope),
+                    self.expr(key, d - 1, scope)
+                )
+            }
+            _ => {
+                self.count("emptyMap");
+                self.count("put");
+                format!(
+                    "put(emptyMap(), {}, {})",
+                    self.expr(key, d, scope),
+                    self.expr(value, d, scope)
+                )
+            }
+        }
+    }
+
+    /// `Int` from the collections and rich types.
+    fn web_int(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(12) {
+            0 => {
+                self.count("setSize");
+                let ty = *self.rng.pick(&[Ty::SetInt, Ty::SetStr, Ty::SetCor]);
+                format!("setSize({})", self.anchored_set(ty, d, scope))
+            }
+            1 => {
+                self.count("mapSize");
+                let ty = *self.rng.pick(&[Ty::MapIntStr, Ty::MapCorInt]);
+                format!("mapSize({})", self.anchored_map(ty, d, scope))
+            }
+            2 => {
+                self.count("lookup");
+                format!(
+                    "(lookup({}, {}) ?: {})",
+                    self.expr(Ty::MapCorInt, d, scope),
+                    self.expr(Ty::Cor, d, scope),
+                    self.expr(Ty::Int, d, scope)
+                )
+            }
+            3 => {
+                self.count("setSize as value");
+                format!("usaMedeSet(setSize, {})", self.expr(Ty::SetStr, d, scope))
+            }
+            4 => {
+                self.count("mapSize as value");
+                format!(
+                    "usaMedeMapa(mapSize, {})",
+                    self.expr(Ty::MapCorInt, d, scope)
+                )
+            }
+            5 => {
+                self.count("toList");
+                format!("ordem(toList({}))", self.anchored_set(Ty::SetCor, d, scope))
+            }
+            6 => {
+                self.count("keys");
+                format!(
+                    "ordem(keys({}))",
+                    self.anchored_map(Ty::MapCorInt, d, scope)
+                )
+            }
+            7 => {
+                self.count("generic record field");
+                format!("({}).valor", self.expr(Ty::CaixaInt, d, scope))
+            }
+            8 => self.when_cor(Ty::Int, d, scope),
+            9 => self.when_evento(Ty::Int, d, scope),
+            10 => self.when_res(Ty::Int, d, scope),
+            _ => {
+                self.count("enum argument");
+                format!("indice({})", self.expr(Ty::Cor, d, scope))
+            }
+        }
+    }
+
+    /// `Boolean` from the collections and rich types.
+    fn web_bool(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(10) {
+            0..=2 => {
+                self.count("contains");
+                let ty = *self.rng.pick(&[Ty::SetInt, Ty::SetStr, Ty::SetCor]);
+                format!(
+                    "contains({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(set_element(ty), d, scope)
+                )
+            }
+            3 => {
+                self.count("contains as value");
+                format!(
+                    "usaTem(contains, {}, {})",
+                    self.expr(Ty::SetInt, d, scope),
+                    self.expr(Ty::Int, d, scope)
+                )
+            }
+            4 => {
+                self.count("set equality");
+                let ty = *self.rng.pick(&[Ty::SetInt, Ty::SetStr, Ty::SetCor]);
+                let op = *self.rng.pick(&["==", "!="]);
+                format!(
+                    "({} {op} {})",
+                    self.anchored_set(ty, d, scope),
+                    self.expr(ty, d, scope)
+                )
+            }
+            5 => {
+                self.count("map equality");
+                let ty = *self.rng.pick(&[Ty::MapIntStr, Ty::MapCorInt]);
+                let op = *self.rng.pick(&["==", "!="]);
+                format!(
+                    "({} {op} {})",
+                    self.anchored_map(ty, d, scope),
+                    self.expr(ty, d, scope)
+                )
+            }
+            6 => {
+                self.count("enum equality");
+                let op = *self.rng.pick(&["==", "!="]);
+                format!(
+                    "({} {op} {})",
+                    self.expr(Ty::Cor, d, scope),
+                    self.expr(Ty::Cor, d, scope)
+                )
+            }
+            7 => self.when_cor(Ty::Bool, d, scope),
+            8 => self.when_evento(Ty::Bool, d, scope),
+            _ => self.when_res(Ty::Bool, d, scope),
+        }
+    }
+
+    /// `String` from the collections and rich types.
+    fn web_string(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(7) {
+            0 | 1 => {
+                self.count("lookup");
+                format!(
+                    "(lookup({}, {}) ?: {})",
+                    self.expr(Ty::MapIntStr, d, scope),
+                    self.expr(Ty::Int, d, scope),
+                    self.expr(Ty::Str, d, scope)
+                )
+            }
+            2 => {
+                self.count("lookup as value");
+                format!(
+                    "(usaBusca(lookup, {}, {}) ?: {})",
+                    self.expr(Ty::MapIntStr, d, scope),
+                    self.expr(Ty::Int, d, scope),
+                    self.expr(Ty::Str, d, scope)
+                )
+            }
+            3 => {
+                self.count("generic record field");
+                if self.rng.chance(50) {
+                    format!("({}).rotulo", self.expr(Ty::CaixaInt, d, scope))
+                } else {
+                    // The content fixes the instance (`Caixa(emptySet(), …)` would not).
+                    self.count("generic record at Set<Cor>");
+                    format!(
+                        "Caixa({}, {}).rotulo",
+                        self.anchored_set(Ty::SetCor, d, scope),
+                        self.expr(Ty::Str, d.min(1), scope)
+                    )
+                }
+            }
+            4 => self.when_cor(Ty::Str, d, scope),
+            5 => self.when_evento(Ty::Str, d, scope),
+            _ => self.when_res(Ty::Str, d, scope),
+        }
+    }
+
+    /// `List<Int>` from the collections.
+    fn web_list(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(7) {
+            0 => {
+                self.count("toList");
+                format!("toList({})", self.anchored_set(Ty::SetInt, d, scope))
+            }
+            1 => {
+                self.count("keys");
+                format!("keys({})", self.anchored_map(Ty::MapIntStr, d, scope))
+            }
+            2 => {
+                self.count("values");
+                format!("values({})", self.anchored_map(Ty::MapCorInt, d, scope))
+            }
+            3 => {
+                self.count("toList as value");
+                format!("usaListaSet(toList, {})", self.expr(Ty::SetInt, d, scope))
+            }
+            4 => {
+                self.count("keys as value");
+                format!("usaChaves(keys, {})", self.expr(Ty::MapIntStr, d, scope))
+            }
+            5 => {
+                self.count("values as value");
+                format!("usaValores(values, {})", self.expr(Ty::MapCorInt, d, scope))
+            }
+            _ => {
+                self.count("setSize as value");
+                format!(
+                    "map(listOf({}, {}), setSize)",
+                    self.anchored_set(Ty::SetInt, d, scope),
+                    self.expr(Ty::SetInt, d, scope)
+                )
+            }
+        }
+    }
+
+    /// `Int?` from the collections.
+    fn web_opt_int(&mut self, d: u32, scope: &Scope) -> String {
+        if self.rng.chance(70) {
+            self.count("lookup");
+            format!(
+                "lookup({}, {})",
+                self.expr(Ty::MapCorInt, d, scope),
+                self.expr(Ty::Cor, d, scope)
+            )
+        } else {
+            self.count("toList");
+            format!("first(toList({}))", self.anchored_set(Ty::SetInt, d, scope))
+        }
+    }
+
+    fn cor(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(7) {
+            0 | 1 => self.leaf(Ty::Cor),
+            2 => self.if_expr(Ty::Cor, d, scope),
+            3 => self.when_cor(Ty::Cor, d, scope),
+            4 => self.when_evento(Ty::Cor, d, scope),
+            5 => {
+                self.count("keys");
+                format!(
+                    "(first(keys({})) ?: {})",
+                    self.anchored_map(Ty::MapCorInt, d, scope),
+                    self.expr(Ty::Cor, d, scope)
+                )
+            }
+            _ => self.generic_choice(Ty::Cor, d, scope),
+        }
+    }
+
+    /// `Set<Int>`, `Set<String>` or `Set<Cor>`.
+    fn set(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        let element = set_element(ty);
+        match self.rng.below(13) {
+            0 => self.leaf(ty),
+            1 | 2 => {
+                self.count("setOf");
+                let items: Vec<String> = (0..self.rng.range(1, 4))
+                    .map(|_| self.expr(element, d, scope))
+                    .collect();
+                format!("setOf({})", items.join(", "))
+            }
+            3 | 4 => {
+                self.count("insert");
+                format!(
+                    "insert({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(element, d, scope)
+                )
+            }
+            5 => {
+                self.count("remove");
+                format!(
+                    "remove({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(element, d, scope)
+                )
+            }
+            6 => self.if_expr(ty, d, scope),
+            7 => self.fold(ty, d, scope),
+            8 => self.generic_choice(ty, d, scope),
+            9 => {
+                if self.rng.chance(50) {
+                    self.when_cor(ty, d, scope)
+                } else {
+                    self.when_res(ty, d, scope)
+                }
+            }
+            10 => self.when_evento(ty, d, scope),
+            11 if ty == Ty::SetInt => match self.rng.below(3) {
+                0 => {
+                    let name = *self.rng.pick(&["insert", "remove"]);
+                    self.count("builtin as fold function");
+                    self.count(if name == "insert" {
+                        "insert as value"
+                    } else {
+                        "remove as value"
+                    });
+                    format!(
+                        "fold({}, {}, {name})",
+                        self.anchored_list(d, scope),
+                        self.expr(Ty::SetInt, d, scope)
+                    )
+                }
+                1 => {
+                    let name = *self.rng.pick(&["insert", "remove"]);
+                    self.count(if name == "insert" {
+                        "insert as value"
+                    } else {
+                        "remove as value"
+                    });
+                    format!(
+                        "usaSet({name}, {}, {})",
+                        self.expr(Ty::SetInt, d, scope),
+                        self.expr(Ty::Int, d, scope)
+                    )
+                }
+                _ => {
+                    self.count("emptySet as value");
+                    "usaVazio(emptySet)".into()
+                }
+            },
+            11 if ty == Ty::SetCor => {
+                self.count("generic record field");
+                format!("({}).valor", self.expr(Ty::CaixaCores, d, scope))
+            }
+            _ => self.leaf(ty),
+        }
+    }
+
+    /// `Map<Int, String>` or `Map<Cor, Int>`.
+    fn map(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        let (key, value) = map_entry(ty);
+        match self.rng.below(12) {
+            0 => self.leaf(ty),
+            1..=3 => {
+                self.count("put");
+                format!(
+                    "put({}, {}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(key, d, scope),
+                    self.expr(value, d, scope)
+                )
+            }
+            4 => {
+                self.count("removeKey");
+                format!(
+                    "removeKey({}, {})",
+                    self.expr(ty, d, scope),
+                    self.expr(key, d, scope)
+                )
+            }
+            5 => self.if_expr(ty, d, scope),
+            6 => self.fold(ty, d, scope),
+            7 => self.generic_choice(ty, d, scope),
+            8 => {
+                if self.rng.chance(50) {
+                    self.when_cor(ty, d, scope)
+                } else {
+                    self.when_res(ty, d, scope)
+                }
+            }
+            9 => self.when_evento(ty, d, scope),
+            10 if ty == Ty::MapIntStr => {
+                if self.rng.chance(60) {
+                    self.count("removeKey as value");
+                    format!(
+                        "usaTira(removeKey, {}, {})",
+                        self.expr(Ty::MapIntStr, d, scope),
+                        self.expr(Ty::Int, d, scope)
+                    )
+                } else {
+                    self.count("emptyMap as value");
+                    "usaMapaVazio(emptyMap)".into()
+                }
+            }
+            10 => {
+                self.count("put as value");
+                format!(
+                    "usaPoe(put, {}, {}, {})",
+                    self.expr(Ty::MapCorInt, d, scope),
+                    self.expr(Ty::Cor, d, scope),
+                    self.expr(Ty::Int, d, scope)
+                )
+            }
+            _ => self.leaf(ty),
+        }
+    }
+
+    fn evento(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(9) {
+            0 => self.leaf(Ty::Evento),
+            1 | 2 => {
+                self.count("sealed with fields constructor");
+                format!(
+                    "Marcado({}, {})",
+                    self.expr(Ty::Cor, d, scope),
+                    self.expr(Ty::Int, d, scope)
+                )
+            }
+            3 | 4 => {
+                self.count("sealed with fields constructor");
+                format!(
+                    "Agrupado({}, {})",
+                    self.expr(Ty::SetInt, d, scope),
+                    self.expr(Ty::MapIntStr, d, scope)
+                )
+            }
+            5 => {
+                self.count("sealed with fields constructor");
+                format!("Embrulhado({})", self.expr(Ty::CaixaInt, d, scope))
+            }
+            6 => {
+                self.count("sealed with fields constructor");
+                "Nada".into()
+            }
+            7 => self.if_expr(Ty::Evento, d, scope),
+            _ => {
+                if self.rng.chance(50) {
+                    self.when_res(Ty::Evento, d, scope)
+                } else {
+                    self.generic_choice(Ty::Evento, d, scope)
+                }
+            }
+        }
+    }
+
+    /// `Caixa<Int>` or `Caixa<Set<Cor>>`.
+    fn caixa(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        let content = caixa_content(ty);
+        match self.rng.below(7) {
+            0 => self.leaf(ty),
+            1 | 2 => {
+                self.count_caixa(ty);
+                format!(
+                    "Caixa({}, {})",
+                    self.expr(content, d, scope),
+                    self.expr(Ty::Str, d.min(1), scope)
+                )
+            }
+            3 => {
+                self.count_caixa(ty);
+                self.count("generic function");
+                format!(
+                    "embrulha({}, {})",
+                    self.expr(content, d, scope),
+                    self.expr(Ty::Str, d.min(1), scope)
+                )
+            }
+            4 => self.if_expr(ty, d, scope),
+            5 => self.when_evento(ty, d, scope),
+            _ => self.generic_choice(ty, d, scope),
+        }
+    }
+
+    fn res_int(&mut self, d: u32, scope: &Scope) -> String {
+        match self.rng.below(7) {
+            0 => self.leaf(Ty::ResInt),
+            1 | 2 => {
+                self.count("Ok");
+                format!("Ok({})", self.expr(Ty::Int, d, scope))
+            }
+            3 => {
+                self.count("Err");
+                format!("Err({})", self.expr(Ty::Str, d, scope))
+            }
+            4 => self.if_expr(Ty::ResInt, d, scope),
+            5 => self.when_cor(Ty::ResInt, d, scope),
+            _ => self.generic_choice(Ty::ResInt, d, scope),
+        }
+    }
+
+    /// A `Result<Int, String>` expression whose own subterms fix both of its types (`Ok(1)`
+    /// alone leaves the error type open where nothing else fixes it, e.g. as a `when` subject).
+    fn anchored_res(&mut self, d: u32, scope: &Scope) -> String {
+        if self.rng.chance(20)
+            && let Some(name) = self.var(Ty::ResInt, scope)
+        {
+            self.count("variable");
+            return name;
+        }
+        if self.rng.chance(50) {
+            self.count("named function call");
+            format!(
+                "divide({}, {})",
+                self.expr(Ty::Int, d, scope),
+                self.expr(Ty::Int, d.min(1), scope)
+            )
+        } else {
+            self.count("named function call");
+            format!("confere({})", self.expr(Ty::ResInt, d, scope))
+        }
+    }
+
+    /// A sub-pattern of type `ty`: a fresh variable or `_`.
+    fn bind_subpattern(&mut self, ty: Ty, bound: &mut Vec<(String, Ty)>) -> String {
+        if self.rng.chance(60) {
+            let name = self.fresh();
+            bound.push((name.clone(), ty));
+            name
+        } else {
+            "_".into()
+        }
+    }
+
+    /// A final `_` or variable arm of type `ty` (the variable bound to `scrutinee`).
+    fn catch_all_arm(&mut self, ty: Ty, scrutinee: Ty, d: u32, scope: &Scope) -> (String, String) {
+        let mut bound = Vec::new();
+        let pattern = self.bind_subpattern(scrutinee, &mut bound);
+        let body = self.arm(ty, d, scope, bound);
+        (pattern, body)
+    }
+
+    /// `when` over a `Cor`: the variants in random order, each maybe left out, then `_` or a
+    /// variable unless all three are there.
+    fn when_cor(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        self.count("when over enum");
+        let scrutinee = self.expr(Ty::Cor, d, scope);
+        let mut order = vec!["Z", "A", "M"];
+        for i in (1..order.len()).rev() {
+            order.swap(i, self.rng.below(i + 1));
+        }
+        let mut arms = Vec::new();
+        let mut complete = true;
+        for variant in order {
+            if self.rng.chance(75) {
+                let body = self.arm(ty, d, scope, vec![]);
+                arms.push((variant.to_string(), body));
+            } else {
+                complete = false;
+            }
+        }
+        if !complete {
+            arms.push(self.catch_all_arm(ty, Ty::Cor, d, scope));
+        }
+        self.when(scrutinee, arms)
+    }
+
+    /// `when` over an `Evento` (a sealed class whose variants hold an enum, a `Set`, a `Map`
+    /// and a generic record): per variant in random order maybe one refutable arm (`Marcado`
+    /// with a variant or a literal inside), then maybe an irrefutable one; `_` or a variable
+    /// last unless every variant has an irrefutable arm.
+    fn when_evento(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        self.count("when over sealed with fields");
+        let scrutinee = self.expr(Ty::Evento, d, scope);
+        let mut order = vec![0, 1, 2, 3];
+        for i in (1..order.len()).rev() {
+            order.swap(i, self.rng.below(i + 1));
+        }
+        let mut arms = Vec::new();
+        let mut complete = true;
+        for variant in order {
+            if variant == 0 && self.rng.chance(35) {
+                let mut bound = Vec::new();
+                let pattern = if self.rng.chance(50) {
+                    self.count("nested enum pattern");
+                    let cor = *self.rng.pick(&["Z", "A", "M"]);
+                    format!(
+                        "Marcado({cor}, {})",
+                        self.bind_subpattern(Ty::Int, &mut bound)
+                    )
+                } else {
+                    let cor = self.bind_subpattern(Ty::Cor, &mut bound);
+                    format!("Marcado({cor}, {})", self.int_literal_text().0)
+                };
+                let body = self.arm(ty, d, scope, bound);
+                arms.push((pattern, body));
+            }
+            if self.rng.chance(70) {
+                let mut bound = Vec::new();
+                let pattern = match variant {
+                    0 => {
+                        let cor = self.bind_subpattern(Ty::Cor, &mut bound);
+                        let peso = self.bind_subpattern(Ty::Int, &mut bound);
+                        format!("Marcado({cor}, {peso})")
+                    }
+                    1 => {
+                        let itens = self.bind_subpattern(Ty::SetInt, &mut bound);
+                        let nomes = self.bind_subpattern(Ty::MapIntStr, &mut bound);
+                        format!("Agrupado({itens}, {nomes})")
+                    }
+                    2 => {
+                        let caixa = self.bind_subpattern(Ty::CaixaInt, &mut bound);
+                        format!("Embrulhado({caixa})")
+                    }
+                    _ => "Nada".into(),
+                };
+                let body = self.arm(ty, d, scope, bound);
+                arms.push((pattern, body));
+            } else {
+                complete = false;
+            }
+        }
+        if !complete {
+            arms.push(self.catch_all_arm(ty, Ty::Evento, d, scope));
+        }
+        self.when(scrutinee, arms)
+    }
+
+    /// `when` over a `Result<Int, String>`: maybe `Ok(<literal>)` first, then `Ok` and `Err`
+    /// in random order (each maybe left out), then `_` or a variable if one is missing.
+    fn when_res(&mut self, ty: Ty, d: u32, scope: &Scope) -> String {
+        self.count("when over Result");
+        let scrutinee = self.anchored_res(d, scope);
+        let mut arms = Vec::new();
+        if self.rng.chance(35) {
+            self.count("Result literal pattern");
+            let pattern = format!("Ok({})", self.int_literal_text().0);
+            let body = self.arm(ty, d, scope, vec![]);
+            arms.push((pattern, body));
+        }
+        let mut variants = vec![("Ok", Ty::Int), ("Err", Ty::Str)];
+        if self.rng.chance(50) {
+            variants.reverse();
+        }
+        let mut complete = true;
+        for (variant, field) in variants {
+            if self.rng.chance(80) {
+                let mut bound = Vec::new();
+                let pattern = format!("{variant}({})", self.bind_subpattern(field, &mut bound));
+                let body = self.arm(ty, d, scope, bound);
+                arms.push((pattern, body));
+            } else {
+                complete = false;
+            }
+        }
+        if !complete {
+            arms.push(self.catch_all_arm(ty, Ty::ResInt, d, scope));
+        }
+        self.when(scrutinee, arms)
+    }
+
     fn catch_all(&mut self, ty: Ty) -> (String, Vec<(String, Ty)>) {
         if self.rng.chance(50) {
             let name = self.fresh();
@@ -1499,6 +2314,31 @@ impl Gen {
         } else {
             ("_".into(), vec![])
         }
+    }
+}
+
+/// The element type of a `Set` type.
+fn set_element(ty: Ty) -> Ty {
+    match ty {
+        Ty::SetStr => Ty::Str,
+        Ty::SetCor => Ty::Cor,
+        _ => Ty::Int,
+    }
+}
+
+/// The key and value types of a `Map` type.
+fn map_entry(ty: Ty) -> (Ty, Ty) {
+    match ty {
+        Ty::MapCorInt => (Ty::Cor, Ty::Int),
+        _ => (Ty::Int, Ty::Str),
+    }
+}
+
+/// The content type of a `Caixa` instance.
+fn caixa_content(ty: Ty) -> Ty {
+    match ty {
+        Ty::CaixaCores => Ty::SetCor,
+        _ => Ty::Int,
     }
 }
 
@@ -1557,6 +2397,62 @@ fun desenho(f: Forma): Ui = UI {
     }
 }
 
+enum class Cor { Z, A, M }
+
+distinct type Nota = Decimal
+
+data class Caixa<T>(val valor: T, val rotulo: String)
+
+sealed class Evento {
+    data class Marcado(val cor: Cor, val peso: Int)
+    data class Agrupado(val itens: Set<Int>, val nomes: Map<Int, String>)
+    data class Embrulhado(val caixa: Caixa<Int>)
+    data object Nada
+}
+
+fun indice(c: Cor): Int = when (c) {
+    Z -> 1
+    A -> 2
+    M -> 3
+}
+
+fun ordem(cs: List<Cor>): Int = fold(cs, 0, { acc, c -> acc * 10 + indice(c) })
+
+fun divide(a: Int, b: Int): Result<Int, String> = when (a / b) {
+    null -> Err(\"divisão por zero\")
+    q -> Ok(q)
+}
+
+fun confere(r: Result<Int, String>): Result<Int, String> = r
+
+fun <T> escolhe(c: Boolean, a: T, b: T): T = if (c) a else b
+
+fun <T> embrulha(x: T, r: String): Caixa<T> = Caixa(x, r)
+
+fun usaSet(g: (Set<Int>, Int) -> Set<Int>, s: Set<Int>, x: Int): Set<Int> = g(s, x)
+
+fun usaTem(g: (Set<Int>, Int) -> Boolean, s: Set<Int>, x: Int): Boolean = g(s, x)
+
+fun usaMedeSet(g: (Set<String>) -> Int, s: Set<String>): Int = g(s)
+
+fun usaListaSet(g: (Set<Int>) -> List<Int>, s: Set<Int>): List<Int> = g(s)
+
+fun usaVazio(g: () -> Set<Int>): Set<Int> = g()
+
+fun usaPoe(g: (Map<Cor, Int>, Cor, Int) -> Map<Cor, Int>, m: Map<Cor, Int>, c: Cor, n: Int): Map<Cor, Int> = g(m, c, n)
+
+fun usaBusca(g: (Map<Int, String>, Int) -> String?, m: Map<Int, String>, k: Int): String? = g(m, k)
+
+fun usaTira(g: (Map<Int, String>, Int) -> Map<Int, String>, m: Map<Int, String>, k: Int): Map<Int, String> = g(m, k)
+
+fun usaChaves(g: (Map<Int, String>) -> List<Int>, m: Map<Int, String>): List<Int> = g(m)
+
+fun usaValores(g: (Map<Cor, Int>) -> List<Int>, m: Map<Cor, Int>): List<Int> = g(m)
+
+fun usaMedeMapa(g: (Map<Cor, Int>) -> Int, m: Map<Cor, Int>): Int = g(m)
+
+fun usaMapaVazio(g: () -> Map<Int, String>): Map<Int, String> = g()
+
 fun profundo(n: Int): Ui = if (n == 0) UI { Text(\"fim\") } else UI { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { Div { profundo(n - 1) } } } } } } } } } } } } } } } } } } } } }
 ";
 
@@ -1609,17 +2505,21 @@ const WEB_FIXED: &[(Ty, &str)] = &[
     (Ty::Ui, "fun {name}(): Ui = profundo(9990)"),
 ];
 
-/// The three-way test's programs (`PROGRAMS` random ones, then [`WEB_FIXED`]) and how many
+/// Number of random programs of the three-way test (twice the server's: it has twice as many
+/// result types).
+pub(crate) const WEB_PROGRAMS: usize = 2 * PROGRAMS;
+
+/// The three-way test's programs (`WEB_PROGRAMS` random ones, then [`WEB_FIXED`]) and how many
 /// times each construct occurs in them.
 pub(crate) fn web_programs() -> (Programs, BTreeMap<&'static str, usize>) {
     let mut generator = Gen::web(WEB_SEED);
     let mut out = Vec::new();
-    for index in 0..PROGRAMS {
+    for index in 0..WEB_PROGRAMS {
         let (ty, source) = generator.program(index);
         out.push((format!("p{index}"), ty, source));
     }
     for (offset, (ty, template)) in WEB_FIXED.iter().enumerate() {
-        let name = format!("p{}", PROGRAMS + offset);
+        let name = format!("p{}", WEB_PROGRAMS + offset);
         let source = format!("{}\n", template.replace("{name}", &name));
         out.push((name, *ty, source));
     }
@@ -1628,7 +2528,8 @@ pub(crate) fn web_programs() -> (Programs, BTreeMap<&'static str, usize>) {
 
 /// The three-way test's functions of `Date`, `DateTime` and `Instant` parameters (Bind has no
 /// literal of these types, so they are called with arguments, [`temporal_calls`]): every
-/// comparison operator, and the values shown in a UI tree with the result of `<`.
+/// comparison operator, the values shown in a UI tree with the result of `<`, and the values
+/// as `Set` elements and `Map` keys (typed temporal order, never the text order).
 pub(crate) const TEMPORAL_PRELUDE: &str = "
 fun ordemDate(a: Date, b: Date): List<Boolean> = listOf(a < b, a <= b, a > b, a >= b, a == b, a != b)
 fun ordemDateTime(a: DateTime, b: DateTime): List<Boolean> = listOf(a < b, a <= b, a > b, a >= b, a == b, a != b)
@@ -1636,18 +2537,61 @@ fun ordemInstant(a: Instant, b: Instant): List<Boolean> = listOf(a < b, a <= b, 
 fun telaDate(a: Date, b: Date): Ui = UI { Span { Text(a); if (a < b) Text(\" < \") else Text(\" >= \"); Text(b) } }
 fun telaDateTime(a: DateTime, b: DateTime): Ui = UI { Span { Text(a); if (a >= b) Text(\" >= \") else Text(\" < \"); Text(b) } }
 fun telaInstant(a: Instant, b: Instant): Ui = UI { Span { Text(a); if (a > b) Text(\" > \") else Text(\" <= \"); Text(b) } }
+fun conjuntoDate(a: Date, b: Date): Set<Date> = setOf(b, a, b)
+fun conjuntoDateTime(a: DateTime, b: DateTime): Set<DateTime> = setOf(b, a, b)
+fun conjuntoInstant(a: Instant, b: Instant): Set<Instant> = setOf(b, a, b)
+fun mapaDate(a: Date, b: Date): Map<Date, Int> = put(put(put(emptyMap(), b, 1), a, 2), b, 3)
+fun mapaDateTime(a: DateTime, b: DateTime): Map<DateTime, Int> = put(put(put(emptyMap(), b, 1), a, 2), b, 3)
+fun mapaInstant(a: Instant, b: Instant): Map<Instant, Int> = put(put(put(emptyMap(), b, 1), a, 2), b, 3)
 ";
 
-/// A call of a [`TEMPORAL_PRELUDE`] function on two canonical wire texts, printed as the line
-/// `line` (`t<k>=<render>`).
+/// The temporal functions called on each pair, by name prefix (`ordem<T>` first).
+const TEMPORAL_FUNCTIONS: [&str; 4] = ["ordem", "tela", "conjunto", "mapa"];
+
+/// The three-way test's functions of two `Decimal` parameters (Bind has no `Decimal` literal,
+/// so they are called with arguments, [`decimal_calls`]): every `Set`/`Map` builtin over
+/// `Decimal` elements and keys (by value: `1.0` and `1.00` are one key, and the first text
+/// stays, Ruling A), a distinct type over `Decimal` as a key, equality, and `Boolean` keys and
+/// elements (`false < true`).
+pub(crate) const DECIMAL_PRELUDE: &str = "
+fun decConjunto(a: Decimal, b: Decimal): Set<Decimal> = insert(setOf(a), b)
+fun decLista(a: Decimal, b: Decimal): List<Decimal> = toList(setOf(b, a, b))
+fun decMapa(a: Decimal, b: Decimal): Map<Decimal, Int> = put(put(emptyMap(), a, 1), b, 2)
+fun decNotasMapa(a: Decimal, b: Decimal): Map<Nota, Int> = put(put(emptyMap(), Nota(b), 1), Nota(a), 2)
+fun decContagem(a: Decimal, b: Decimal): List<Int> = listOf(setSize(setOf(a, b)), mapSize(put(put(emptyMap(), a, \"x\"), b, \"y\")), lookup(put(emptyMap(), a, 7), b) ?: (-1), if (contains(setOf(a), b)) 1 else 0)
+fun decRemove(a: Decimal, b: Decimal): Set<Decimal> = remove(setOf(a, b), b)
+fun decChaves(a: Decimal, b: Decimal): List<Decimal> = keys(removeKey(put(put(emptyMap(), b, \"y\"), a, \"x\"), b))
+fun decValores(a: Decimal, b: Decimal): List<String> = values(put(put(emptyMap(), b, \"b\"), a, \"a\"))
+fun decNotas(a: Decimal, b: Decimal): Set<Nota> = setOf(Nota(b), Nota(a))
+fun decIguais(a: Decimal, b: Decimal): List<Boolean> = listOf(a == b, setOf(a) == setOf(b), put(emptyMap(), a, 1) == put(emptyMap(), b, 1), Nota(a) == Nota(b))
+fun decBooleanos(a: Decimal, b: Decimal): Map<Boolean, Set<Boolean>> = put(put(emptyMap(), b <= a, setOf(a == b)), a < b, setOf(a != b, a >= b))
+";
+
+/// The Decimal functions called on each pair.
+const DECIMAL_FUNCTIONS: [&str; 11] = [
+    "decConjunto",
+    "decLista",
+    "decMapa",
+    "decNotasMapa",
+    "decContagem",
+    "decRemove",
+    "decChaves",
+    "decValores",
+    "decNotas",
+    "decIguais",
+    "decBooleanos",
+];
+
+/// A call of a [`TEMPORAL_PRELUDE`] or [`DECIMAL_PRELUDE`] function on two canonical wire
+/// texts, printed as the line `line` (`t<k>=<render>` or `d<k>=<render>`).
 #[derive(Clone, Debug)]
-pub(crate) struct TemporalCall {
+pub(crate) struct Call {
     pub line: String,
     pub function: String,
-    /// `List` (the comparisons) or `Ui`.
-    pub result: Ty,
     pub a: String,
     pub b: String,
+    /// The arguments are `Decimal`s (else text values: dates).
+    pub decimal: bool,
 }
 
 /// The canonical wire text (chrono's serde) of a date with signed `year` (`YYYY` for
@@ -1688,7 +2632,7 @@ fn temporal_text(ty: &str, year: i64, month: u32, day: u32, seconds: u32, nanos:
 /// then random pairs of each type (extended and negative years, fractions of 0, 3, 6 or 9
 /// digits, leap seconds; `b` often equal to `a` or one field away from it), each pair through
 /// `ordem<T>` and `tela<T>`.
-pub(crate) fn temporal_calls() -> Vec<TemporalCall> {
+pub(crate) fn temporal_calls() -> Vec<Call> {
     let mut pairs: Vec<(String, String, String)> = Vec::new();
     let vectors = include_str!("../../../runtime/vectors/temporal-order.json");
     for line in vectors.lines().filter(|line| line.contains("\"type\"")) {
@@ -1746,13 +2690,76 @@ pub(crate) fn temporal_calls() -> Vec<TemporalCall> {
     }
     let mut calls = Vec::new();
     for (ty, a, b) in pairs {
-        for (prefix, result) in [("ordem", Ty::List), ("tela", Ty::Ui)] {
-            calls.push(TemporalCall {
+        for prefix in TEMPORAL_FUNCTIONS {
+            calls.push(Call {
                 line: format!("t{}", calls.len()),
                 function: format!("{prefix}{ty}"),
-                result,
                 a: a.clone(),
                 b: b.clone(),
+                decimal: false,
+            });
+        }
+    }
+    calls
+}
+
+/// Canonical `Decimal` texts (`rust_decimal`'s `Display` of themselves): equal values at
+/// different scales, the 96-bit extremes and the smallest scale-28 value. No negative zero:
+/// both runtimes read `-0` as `0`, while the evaluator keeps the text it is given.
+const DECIMALS: &[&str] = &[
+    "0",
+    "0.0",
+    "0.00",
+    "1",
+    "1.0",
+    "1.00",
+    "2.5",
+    "2.50",
+    "-1.5",
+    "-1.50",
+    "10",
+    "10.000",
+    "0.1",
+    "0.10",
+    "-0.001",
+    "3.14159",
+    "100",
+    "79228162514264337593543950335",
+    "-79228162514264337593543950335",
+    "7.9228162514264337593543950335",
+    "0.0000000000000000000000000001",
+];
+
+/// The three-way test's Decimal calls: every pair of equal values at different scales (both
+/// ways, `1.0`/`1.00` first), then random pairs, each through every [`DECIMAL_FUNCTIONS`].
+pub(crate) fn decimal_calls() -> Vec<Call> {
+    let equal = |a: &str, b: &str| {
+        matches!(
+            crate::core::eval::decimal_order(a, b),
+            Ok(std::cmp::Ordering::Equal)
+        )
+    };
+    let mut pairs: Vec<(&str, &str)> = vec![("1.0", "1.00"), ("1.00", "1.0")];
+    for a in DECIMALS {
+        for b in DECIMALS {
+            if a != b && equal(a, b) && !pairs.contains(&(*a, *b)) {
+                pairs.push((a, b));
+            }
+        }
+    }
+    let mut rng = Rng(0x00B1_4D00_DEC1_2026);
+    for _ in 0..60 {
+        pairs.push((*rng.pick(DECIMALS), *rng.pick(DECIMALS)));
+    }
+    let mut calls = Vec::new();
+    for (a, b) in pairs {
+        for function in DECIMAL_FUNCTIONS {
+            calls.push(Call {
+                line: format!("d{}", calls.len()),
+                function: function.to_string(),
+                a: a.to_string(),
+                b: b.to_string(),
+                decimal: true,
             });
         }
     }
@@ -1761,14 +2768,19 @@ pub(crate) fn temporal_calls() -> Vec<TemporalCall> {
 
 /// `t<k>=<render>` for every temporal call, by the reference evaluator (the values are their
 /// wire texts).
-pub(crate) fn temporal_expected(program: &CoreProgram, calls: &[TemporalCall]) -> Vec<String> {
+pub(crate) fn calls_expected(program: &CoreProgram, calls: &[Call]) -> Vec<String> {
+    use crate::core::eval::Value;
     calls
         .iter()
         .map(|call| {
-            let args = vec![
-                crate::core::eval::Value::Str(call.a.as_str().into()),
-                crate::core::eval::Value::Str(call.b.as_str().into()),
-            ];
+            let value = |text: &str| {
+                if call.decimal {
+                    Value::Decimal(text.into())
+                } else {
+                    Value::Str(text.into())
+                }
+            };
+            let args = vec![value(&call.a), value(&call.b)];
             let rendered = match eval_function(program, &call.function, args) {
                 Ok(value) => value.render(),
                 Err(error) => panic!("{}: {error:?}", call.line),
@@ -1861,7 +2873,7 @@ fn main_rs(programs: &[(String, Ty, String)]) -> String {
 /// wire texts.
 pub(crate) fn main_rs_with(
     programs: &[(String, Ty, String)],
-    calls: &[TemporalCall],
+    calls: &[Call],
     krate: &str,
     extra: &str,
     encode: &str,
@@ -2114,7 +3126,7 @@ fn web_generator_is_deterministic_and_well_typed() {
         first.iter().map(|p| &p.2).collect::<Vec<_>>(),
         second.iter().map(|p| &p.2).collect::<Vec<_>>()
     );
-    assert_eq!(first.len(), PROGRAMS + WEB_FIXED.len());
+    assert_eq!(first.len(), WEB_PROGRAMS + WEB_FIXED.len());
     for construct in WEB_CONSTRUCTS {
         assert!(
             counts.get(construct).copied().unwrap_or(0) > 0,
@@ -2123,16 +3135,19 @@ fn web_generator_is_deterministic_and_well_typed() {
     }
     for ty in WEB_RESULT_TYPES {
         assert!(
-            first[..PROGRAMS].iter().filter(|p| p.1 == ty).count() >= 50,
+            first[..WEB_PROGRAMS].iter().filter(|p| p.1 == ty).count() >= 50,
             "{ty:?}"
         );
     }
     let program = compile(&source_with(WEB_PRELUDE, &first));
     let lines = expected(&program, &first);
-    assert_eq!(lines[PROGRAMS], format!("p{PROGRAMS}=!RecursionLimit"));
     assert_eq!(
-        lines[PROGRAMS + 3],
-        format!("p{}=!RecursionLimit", PROGRAMS + 3)
+        lines[WEB_PROGRAMS],
+        format!("p{WEB_PROGRAMS}=!RecursionLimit")
+    );
+    assert_eq!(
+        lines[WEB_PROGRAMS + 3],
+        format!("p{}=!RecursionLimit", WEB_PROGRAMS + 3)
     );
     // The deep tree: 199,800 nested `<div>`s around `fim`.
     let deep = lines.last().unwrap();
@@ -2141,9 +3156,9 @@ fn web_generator_is_deterministic_and_well_typed() {
         format!("{}fim{}", "<div>".repeat(199_800), "</div>".repeat(199_800))
     );
     // NaN and Infinity are frequent random results, not only fixed ones.
-    let numbers: Vec<&String> = lines[..PROGRAMS]
+    let numbers: Vec<&String> = lines[..WEB_PROGRAMS]
         .iter()
-        .zip(&first[..PROGRAMS])
+        .zip(&first[..WEB_PROGRAMS])
         .filter(|(_, p)| matches!(p.1, Ty::Double | Ty::Float))
         .map(|(line, _)| line)
         .collect();
@@ -2158,12 +3173,13 @@ fn web_generator_is_deterministic_and_well_typed() {
 }
 
 /// The temporal calls compile with the three-way test's programs and the evaluator orders the
-/// vector pairs as the vectors say; the random pairs include many whose text order is wrong.
+/// vector pairs as the vectors say (comparisons, `Set` elements and `Map` keys); the random
+/// pairs include many whose text order is wrong.
 #[test]
 fn temporal_calls_are_well_typed_and_ordered_by_value() {
     let calls = temporal_calls();
     let program = compile(&source_with(TEMPORAL_PRELUDE, &[]));
-    let lines = temporal_expected(&program, &calls);
+    let lines = calls_expected(&program, &calls);
     assert_eq!(lines.len(), calls.len());
     let vectors = include_str!("../../../runtime/vectors/temporal-order.json");
     let orders: Vec<&str> = vectors
@@ -2177,14 +3193,29 @@ fn temporal_calls_are_well_typed_and_ordered_by_value() {
             "=" => "[false, true, false, true, true, false]",
             _ => "[false, false, true, true, false, true]",
         };
-        assert_eq!(lines[2 * index], format!("t{}={comparisons}", 2 * index));
-        assert!(lines[2 * index + 1].starts_with(&format!("t{}=<span>", 2 * index + 1)));
+        let first = TEMPORAL_FUNCTIONS.len() * index;
+        let (a, b) = (&calls[first].a, &calls[first].b);
+        let (set, map) = match *order {
+            "<" => (
+                format!("Set[\"{a}\", \"{b}\"]"),
+                format!("Map[\"{a}\": 2, \"{b}\": 3]"),
+            ),
+            "=" => (format!("Set[\"{b}\"]"), format!("Map[\"{b}\": 3]")),
+            _ => (
+                format!("Set[\"{b}\", \"{a}\"]"),
+                format!("Map[\"{b}\": 3, \"{a}\": 2]"),
+            ),
+        };
+        assert_eq!(lines[first], format!("t{first}={comparisons}"));
+        assert!(lines[first + 1].starts_with(&format!("t{}=<span>", first + 1)));
+        assert_eq!(lines[first + 2], format!("t{}={set}", first + 2));
+        assert_eq!(lines[first + 3], format!("t{}={map}", first + 3));
     }
     let wrong_by_text = calls
         .iter()
         .zip(&lines)
         .filter(|(call, line)| {
-            call.result == Ty::List
+            call.function.starts_with("ordem")
                 && line.ends_with(if call.a < call.b {
                     "=[false, false, true, true, false, true]"
                 } else {
@@ -2196,6 +3227,47 @@ fn temporal_calls_are_well_typed_and_ordered_by_value() {
     assert!(calls.iter().any(|call| call.a.contains(":60")));
     assert!(calls.iter().any(|call| call.a.starts_with('+')));
     assert!(calls.iter().any(|call| call.a.starts_with('-')));
+}
+
+/// The Decimal calls compile with the three-way test's prelude; equal values at different
+/// scales are one element or key, and the first text stays (Ruling A).
+#[test]
+fn decimal_calls_are_well_typed_and_compare_by_value() {
+    let calls = decimal_calls();
+    let program = compile(&source_with(
+        &format!("{WEB_PRELUDE}{DECIMAL_PRELUDE}"),
+        &[],
+    ));
+    let lines = calls_expected(&program, &calls);
+    // The first pair is (1.0, 1.00).
+    let expected = [
+        "Set[1.0]",
+        "[1.00]",
+        "Map[1.0: 2]",
+        "Map[Nota(1.00): 2]",
+        "[1, 1, 7, 1]",
+        "Set[]",
+        "[]",
+        "[\"a\"]",
+        "Set[Nota(1.00)]",
+        "[true, true, true, true]",
+        "Map[false: Set[false, true], true: Set[true]]",
+    ];
+    for (index, want) in expected.iter().enumerate() {
+        assert_eq!(lines[index], format!("d{index}={want}"));
+    }
+    let pairs = calls.len() / DECIMAL_FUNCTIONS.len();
+    assert!(pairs >= 70, "{pairs} pairs");
+    let equal_scales = calls
+        .iter()
+        .zip(&lines)
+        .filter(|(call, line)| {
+            call.function == "decIguais"
+                && call.a != call.b
+                && line.ends_with("=[true, true, true, true]")
+        })
+        .count();
+    assert!(equal_scales >= 10, "{equal_scales}");
 }
 
 /// Constructs every three-way run must contain.
@@ -2234,6 +3306,54 @@ pub(crate) const WEB_CONSTRUCTS: &[&str] = &[
     "when over Int?",
     "fold",
     "if",
+    // Collections and rich types: all 14 builtins (13 of them also passed as values; `setOf`
+    // is variadic and only called), the enum declared out of alphabetical order, the sealed
+    // class with fields, the generic record and function, and `Result`.
+    "setOf",
+    "emptySet",
+    "insert",
+    "remove",
+    "contains",
+    "setSize",
+    "toList",
+    "emptyMap",
+    "put",
+    "lookup",
+    "removeKey",
+    "keys",
+    "values",
+    "mapSize",
+    "emptySet as value",
+    "insert as value",
+    "remove as value",
+    "contains as value",
+    "setSize as value",
+    "toList as value",
+    "emptyMap as value",
+    "put as value",
+    "lookup as value",
+    "removeKey as value",
+    "keys as value",
+    "values as value",
+    "mapSize as value",
+    "builtin as fold function",
+    "set equality",
+    "map equality",
+    "enum constructor",
+    "enum equality",
+    "enum argument",
+    "when over enum",
+    "sealed with fields constructor",
+    "when over sealed with fields",
+    "nested enum pattern",
+    "generic record at Int",
+    "generic record at Set<Cor>",
+    "generic record field",
+    "generic function",
+    "Ok",
+    "Err",
+    "when over Result",
+    "Result literal pattern",
 ];
 
 /// Builds the generated crate and compares its output with the evaluator, line by line.

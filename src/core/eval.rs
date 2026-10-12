@@ -1150,7 +1150,7 @@ fn parse_decimal(text: &str) -> Option<(BigInt, usize)> {
 
 /// The order of two `Decimal` (or `Money`) texts by value: `1.0` equals `1.00` and `-0`
 /// equals `0`, as `rust_decimal` compares them.
-fn decimal_order(a: &str, b: &str) -> Result<Ordering, EvalError> {
+pub(crate) fn decimal_order(a: &str, b: &str) -> Result<Ordering, EvalError> {
     let invalid = |text: &str| unsupported(&format!("invalid Decimal `{text}`"));
     let (mut x, x_scale) = parse_decimal(a).ok_or_else(|| invalid(a))?;
     let (mut y, y_scale) = parse_decimal(b).ok_or_else(|| invalid(b))?;

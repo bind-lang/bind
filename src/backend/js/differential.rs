@@ -27,9 +27,12 @@ use std::process::Command;
 use std::time::Instant;
 
 use crate::backend::rust::differential::{
-    PROGRAMS, TEMPORAL_PRELUDE, WEB_CONSTRUCTS, WEB_PRELUDE, build_and_run, compile, expected,
-    main_rs_with, source_with, temporal_calls, temporal_expected, web_programs,
+    DECIMAL_PRELUDE, TEMPORAL_PRELUDE, WEB_CONSTRUCTS, WEB_PRELUDE, WEB_PROGRAMS, build_and_run,
+    calls_expected, compile, decimal_calls, expected, main_rs_with, source_with, temporal_calls,
+    web_programs,
 };
+use crate::core::ir::{CoreProgram, CoreType};
+use crate::types::ty::Type;
 
 /// The line-safe form of a render: `\` → `\\`, LF → `\n`, CR → `\r` (injective).
 fn line_safe(text: &str) -> String {
@@ -97,6 +100,196 @@ impl Render for programs::Forma {
 }
 "#;
 
+/// The renderer of the collections and rich types in the Rust crate's `main`, as
+/// `Value::render` shows them: `Set[…]` and `Map[k: v, …]` in the runtime's canonical order,
+/// a `Decimal` as its text, a date as its wire text, `Result`, records and variants as
+/// constructors, a distinct value as its type name around the value.
+const RUST_RICH: &str = r#"
+use bind_differential_web::bind_runtime::{BindMap, BindResult, BindSet};
+
+impl Render for rust_decimal::Decimal {
+    fn render(&self) -> String {
+        self.to_string()
+    }
+}
+
+/// Dates, date-times and instants: their canonical wire text as a JSON string (chrono's serde,
+/// as the evaluator holds the texts it is given).
+fn temporal<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).unwrap_or_else(|error| format!("!Serialize({error})"))
+}
+
+impl Render for chrono::NaiveDate {
+    fn render(&self) -> String {
+        temporal(self)
+    }
+}
+
+impl Render for chrono::NaiveDateTime {
+    fn render(&self) -> String {
+        temporal(self)
+    }
+}
+
+impl Render for chrono::DateTime<chrono::Utc> {
+    fn render(&self) -> String {
+        temporal(self)
+    }
+}
+
+impl<T: Render> Render for BindSet<T> {
+    fn render(&self) -> String {
+        let items: Vec<String> = self.0.iter().map(Render::render).collect();
+        format!("Set[{}]", items.join(", "))
+    }
+}
+
+impl<K: Render, V: Render> Render for BindMap<K, V> {
+    fn render(&self) -> String {
+        let entries: Vec<String> = self
+            .0
+            .iter()
+            .map(|(key, value)| format!("{}: {}", key.render(), value.render()))
+            .collect();
+        format!("Map[{}]", entries.join(", "))
+    }
+}
+
+impl<T: Render, E: Render> Render for BindResult<T, E> {
+    fn render(&self) -> String {
+        match self {
+            BindResult::Ok(value) => format!("Ok({})", value.render()),
+            BindResult::Err(error) => format!("Err({})", error.render()),
+        }
+    }
+}
+
+impl Render for programs::Cor {
+    fn render(&self) -> String {
+        match self {
+            programs::Cor::Z => "Z",
+            programs::Cor::A => "A",
+            programs::Cor::M => "M",
+        }
+        .to_string()
+    }
+}
+
+impl Render for programs::Nota {
+    fn render(&self) -> String {
+        format!("Nota({})", self.value.render())
+    }
+}
+
+impl<T: Render> Render for programs::Caixa<T> {
+    fn render(&self) -> String {
+        format!("Caixa({}, {})", self.valor.render(), self.rotulo.render())
+    }
+}
+
+impl Render for programs::Evento {
+    fn render(&self) -> String {
+        match self {
+            programs::Evento::Marcado { cor, peso } => {
+                format!("Marcado({}, {})", cor.render(), peso.render())
+            }
+            programs::Evento::Agrupado { itens, nomes } => {
+                format!("Agrupado({}, {})", itens.render(), nomes.render())
+            }
+            programs::Evento::Embrulhado { caixa } => format!("Embrulhado({})", caixa.render()),
+            programs::Evento::Nada => "Nada".to_string(),
+        }
+    }
+}
+"#;
+
+/// The JSON descriptor of a concrete type for the JS printer: `[name, ...arguments]`; a type
+/// parameter of a declaration is its `'P` marker.
+fn type_json(ty: &Type) -> String {
+    match ty {
+        Type::Con(name, args) => {
+            let mut parts = vec![super::names::js_string(name)];
+            parts.extend(args.iter().map(type_json));
+            format!("[{}]", parts.join(", "))
+        }
+        other => panic!("no descriptor for {other:?}"),
+    }
+}
+
+/// `[[property, type], ...]`: fields under their escaped JS names.
+fn fields_json(fields: &[(String, Type)]) -> String {
+    let fields: Vec<String> = fields
+        .iter()
+        .map(|(name, ty)| {
+            format!(
+                "[{}, {}]",
+                super::names::js_string(&super::names::js_value(name)),
+                type_json(ty)
+            )
+        })
+        .collect();
+    format!("[{}]", fields.join(", "))
+}
+
+/// The declarations of the program for the JS printer: name → `{kind, params, fields}` (a
+/// record), `{kind, params, variants: {tag: fields}}` (a sum type) or `{kind, underlying}` (a
+/// distinct type).
+fn types_json(program: &CoreProgram) -> String {
+    let js = super::names::js_string;
+    let params = |params: &[String]| {
+        let markers: Vec<String> = params.iter().map(|p| js(&format!("'{p}"))).collect();
+        format!("[{}]", markers.join(", "))
+    };
+    let entries: Vec<String> = program
+        .types
+        .iter()
+        .map(|declaration| match declaration {
+            CoreType::Record {
+                name,
+                params: names,
+                fields,
+            } => format!(
+                "{}: {{\"kind\": \"record\", \"params\": {}, \"fields\": {}}}",
+                js(name),
+                params(names),
+                fields_json(fields)
+            ),
+            CoreType::Sum {
+                name,
+                params: names,
+                variants,
+            } => {
+                let variants: Vec<String> = variants
+                    .iter()
+                    .map(|(tag, fields)| format!("{}: {}", js(tag), fields_json(fields)))
+                    .collect();
+                format!(
+                    "{}: {{\"kind\": \"sum\", \"params\": {}, \"variants\": {{{}}}}}",
+                    js(name),
+                    params(names),
+                    variants.join(", ")
+                )
+            }
+            CoreType::Distinct { name, underlying } => format!(
+                "{}: {{\"kind\": \"distinct\", \"underlying\": {}}}",
+                js(name),
+                type_json(underlying)
+            ),
+        })
+        .collect();
+    format!("{{\n{}\n}}\n", entries.join(",\n"))
+}
+
+/// The result type descriptor of the function `name`.
+fn result_json(program: &CoreProgram, name: &str) -> String {
+    let function = program
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("no function {name}"));
+    type_json(&function.result)
+}
+
 /// The body of the Rust crate's `encode`: [`line_safe`].
 const RUST_ENCODE: &str = r#"let mut out = String::with_capacity(line.len());
     for c in line.chars() {
@@ -138,12 +331,16 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
     for construct in WEB_CONSTRUCTS {
         assert!(counts.contains_key(construct), "{construct} not generated");
     }
-    let calls = temporal_calls();
-    let source = source_with(&format!("{WEB_PRELUDE}{TEMPORAL_PRELUDE}"), &programs);
+    let mut calls = temporal_calls();
+    calls.extend(decimal_calls());
+    let source = source_with(
+        &format!("{WEB_PRELUDE}{TEMPORAL_PRELUDE}{DECIMAL_PRELUDE}"),
+        &programs,
+    );
     let program = compile(&source);
     let expected: Vec<String> = expected(&program, &programs)
         .iter()
-        .chain(&temporal_expected(&program, &calls))
+        .chain(&calls_expected(&program, &calls))
         .map(|line| line_safe_entry(line))
         .collect();
     let evaluated = started.elapsed();
@@ -159,7 +356,7 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         &programs,
         &calls,
         "bind_differential_web",
-        RUST_EXTRA,
+        &format!("{RUST_EXTRA}{RUST_RICH}"),
         RUST_ENCODE,
     );
     let rust_stdout = build_and_run("bind-differential-web", &source, &module, &main);
@@ -192,18 +389,24 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         include_str!("tests/differential.mjs"),
     )
     .unwrap();
+    fs::write(folder.join("types.json"), types_json(&program)).unwrap();
     let js = super::names::js_string;
     let list: Vec<String> = programs
         .iter()
-        .map(|(name, ty, _)| format!("[{}, {}]", js(name), js(ty.bind())))
+        .map(|(name, _, _)| format!("[{}, {}]", js(name), result_json(&program, name)))
         .chain(calls.iter().map(|call| {
             format!(
-                "[{}, {}, {}, [{}, {}]]",
+                "[{}, {}, {}, [{}, {}], {}]",
                 js(&call.line),
-                js(call.result.bind()),
+                result_json(&program, &call.function),
                 js(&call.function),
                 js(&call.a),
-                js(&call.b)
+                js(&call.b),
+                if call.decimal {
+                    "\"decimal\""
+                } else {
+                    "\"text\""
+                }
             )
         }))
         .collect();
@@ -247,11 +450,11 @@ fn differential_evaluator_vs_generated_rust_vs_generated_js() {
         }
     }
     let mut by_type = std::collections::BTreeMap::new();
-    for (_, ty, _) in &programs[..PROGRAMS] {
+    for (_, ty, _) in &programs[..WEB_PROGRAMS] {
         *by_type.entry(ty.bind()).or_insert(0) += 1;
     }
     eprintln!(
-        "three-way differential: {} programs (result types {by_type:?}) and {} temporal calls, evaluator+front end {:.1?}, rust {:.1?}, js {:.1?}, total {:.1?}\nconstructs {counts:?}",
+        "three-way differential: {} programs (result types {by_type:?}) and {} temporal and Decimal calls, evaluator+front end {:.1?}, rust {:.1?}, js {:.1?}, total {:.1?}\nconstructs {counts:?}",
         programs.len(),
         calls.len(),
         evaluated,
