@@ -5,7 +5,6 @@ source = "examples/commerce/src"
 output = ".bind/generated"
 
 [compiler]
-strict = true
 warnings_as_errors = true
 
 [database.main]

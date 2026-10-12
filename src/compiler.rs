@@ -275,7 +275,7 @@ pub fn verify(config: &ProjectConfig, target: &str) -> CompileResult {
         {
             validate_database_credential(&program, config, &mut diagnostics);
         }
-        // Diagnostics computed from types (E4102, E5303, E5204, E2301) come before validation:
+        // Diagnostics computed from types (E4102, E5201, E5303, E5204, E2301) come before validation:
         // a body-less function with a non-`Unit` result (E2301) is lowered with a `Unit` body,
         // which validation would report as a compiler bug.
         let typed_problems = crate::core::analysis::typed_diagnostics(&core, &program, &database);

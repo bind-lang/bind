@@ -491,9 +491,10 @@ export async function fold(ctx, xs, init, f) {
 // compareDate / compareDateTime / compareInstant for temporal values (by time, never by text);
 // `variantOrder(tags)` for an enum class or a sealed class of data objects (declaration order);
 // the comparator of the underlying type for a distinct type. Updates never change their input:
-// they return a new frozen array, or the input itself when nothing changes (Ruling A: inserting
-// an element equal to a present one, or putting a key equal to a present one, keeps the present
-// element / key; a put replaces only the value). Not counted by `enter`.
+// they return a new frozen array, or the input itself when nothing changes (inserting a present
+// element, removing an absent one). Ruling A: inserting an element equal to a present one, or
+// putting a key equal to a present one, keeps the present element / key; a put replaces only the
+// value. Not counted by `enter`.
 
 /**
  * The comparator of an enum class (or of a sealed class of data objects) whose variant tags are

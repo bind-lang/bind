@@ -43,7 +43,7 @@ A chave `strict` de `[compiler]` não tem mais efeito: era lida apenas pelo avis
 
 ## Tipos de fio (`bind-json-v4`)
 
-A E8309 passa a recusar no fio apenas **funções, `Duration` e `Long`** (diretos ou dentro de qualquer outro tipo). Todo o resto cruza:
+A E8309 passa a recusar no fio apenas **funções, `Duration` e `Long`** (diretos ou dentro de qualquer outro tipo), além dos tipos de configuração (`DatabaseUrl`, `Port`, `Secret`) e de `Ui`. Todo o resto cruza:
 
 - os escalares do v0.3, `T?` e `List<T>`;
 - `Set<T>`, `Map<K, V>` e `Result<T, E>` de tipos de fio;
@@ -71,7 +71,7 @@ Os decodificadores continuam estritos, nos dois runtimes:
 
 Cada instância de um genérico tem seu próprio codec: um endpoint que recebe `Pagina<Customer>` e `Pagina<Int>` decodifica cada uma com o seu e recusa o JSON da outra. No servidor, um JSON recusado dá 400 antes de abrir a transação; no frontend, uma resposta recusada dá a tela "Request failed".
 
-Os vetores `runtime/vectors/wire-rich.json` (56 casos, válidos com a forma canônica e inválidos) são lidos pelos testes do runtime Rust, do runtime JS e dos codecs que o `bindc` gera.
+Os vetores `runtime/vectors/wire-rich.json` (57 casos, válidos com a forma canônica e inválidos) são lidos pelos testes do runtime Rust, do runtime JS e dos codecs que o `bindc` gera.
 
 ## Restrição `Key` e ordem canônica
 
@@ -160,16 +160,16 @@ Cada código removido tem um teste (`compiler::tests::coverage_*`) que mostra o 
 |---|---|---|
 | E5200 tabela desconhecida | `db.custmers.require(id)` | E7104 "Unknown database table `custmers`" |
 | E5201 coluna inexistente num `insert` | `db.customers.insert { nme = n }` | E7104 "Table `customers` has no column `nme`" |
-| E5201 heurística `it.` | `db.customers.require(id).nme` | E7104 "`Customer` has no field `nme`" |
+| E5201 heurística `it.` | `map(listOf(db.customers.require(id)), { it -> it.nme })` | E7104 "`Customer` has no field `nme`" |
 | E5202 tabela com modelo desconhecido | schema com modelo `Cliente` não declarado | E7103 "Table `customers` maps to `Cliente`, which is not a declared entity" |
-| E8204 operação de tabela | `.count(id)`, `.delete(id)`, `.upsert(c)`, `.update { }` | E7004 "Unsupported table operation" |
+| E8204 operação de tabela | `.count(id)`, `.delete(id)`, `.upsert(c)`, `.update { }` | E7004 "Unsupported table operation" (`.update { }`: "`{ field = value }` blocks are only supported on `db.<table>.insert`") |
 | W2101 `!!` | `x!!` | E7001 "`!!` was removed" (parser) |
 | E8303 campo de modelo que não é de fio | `Caixa(val n: Long)` como parâmetro de endpoint; entidade com campo `Set<Int>` | E8309 no endpoint; E8310 na coluna |
 | E8308 campo mutável | `var` em `data class`, `entity` ou variante | E7002 (verificador) |
 | E2001, E2002 declaração duplicada | tipo ou função declarados duas vezes, `data class String` | E7110 |
 | E2003 tipo desconhecido | `Nope` em campo, parâmetro, retorno, `distinct`, `Map`/`Result` | E7103 "Unknown type `Nope`" |
 
-Continuam: E5201 só para campo de modelo sem coluna, E8302 (`sealed` vazio em alvo certificado, que nem o parser nem o verificador recusam), E8204 "no built-in generator for target" (outra regra) e E8307.
+Continuam: E5201 só para campo de modelo sem coluna, E8302 (`sealed` vazio em alvo certificado, que nem o parser nem o verificador recusam), E8204 "No built-in generator can preserve the semantics of target …" (outra regra) e E8307.
 
 ## Diagnostics
 
@@ -224,11 +224,13 @@ A certificação **não** garante:
 - `*` e `/` de `Decimal`/`Money` no cliente: só existem no servidor (E8311 no componente);
 - `Set`/`Map` como colunas do banco (E8310);
 - chaves de tipos genéricos: um parâmetro de tipo nunca é `Key`, então não há funções genéricas sobre `Set<T>`;
-- rigor idêntico em dois casos limite do fio:
+- rigor idêntico nestes casos limite do fio:
   - o servidor Rust aceita `{"vazia": null}` para uma variante sem campos, que o JS recusa;
-  - o JS decodifica `Date`, `DateTime` e `Instant` como texto, sem validar o formato (como no v3), inclusive em elementos de `Set` e chaves de `Map`.
+  - o servidor Rust aceita um registro ou uma variante com campos escritos como array JSON (`["1", "1"]` para `Pagina<Int>`, com tipos e aridade conferidos), que o JS recusa;
+  - o JS decodifica `UUID`, `Date`, `DateTime` e `Instant` como texto, sem validar o formato (como no v3), inclusive em elementos de `Set` e chaves de `Map`: aceita um `UUID` como `"abc"`, e `"A…"` e `"a…"` são chaves distintas no JS, enquanto o Rust recusa o primeiro e normaliza os dois;
+  - o JS aceita um objeto JSON com chave repetida (fica a última), que o Rust recusa.
 
-  Os dois só afetam JSON que nenhum codec gerado produz;
+  Todos só afetam JSON que nenhum codec gerado produz;
 - eventos, estado ou hidratação; página pesada pré-renderizada; terminação; arredondamento de `Money` em colunas `numeric(p,s)`; erros de faixa inteira do banco; reprodutibilidade do `Cargo.lock` transitivo ao longo do tempo; autenticação; registro em log de erros de banco; credenciais, rede ou disponibilidade do provedor (como no v0.3).
 
 ## Migração do v3
