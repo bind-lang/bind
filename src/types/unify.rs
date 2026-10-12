@@ -256,9 +256,9 @@ pub fn constrain(
             Ok(())
         }
         Type::Con(name, args) => {
-            if !constraint.accepts(&name)
-                || (constraint == Constraint::Eq && table.is_non_equatable(&name))
-            {
+            let accepted = constraint.accepts(&name)
+                || (constraint == Constraint::Key && table.is_key_type(&name));
+            if !accepted || (constraint == Constraint::Eq && table.is_non_equatable(&name)) {
                 return Err(fail(table));
             }
             if constraint == Constraint::Eq {
@@ -294,6 +294,33 @@ mod tests {
 
     fn write() -> Label {
         Label::new("db", "write")
+    }
+
+    #[test]
+    fn key_meets_operator_constraints_as_their_intersection() {
+        assert_eq!(Constraint::Key.meet(Constraint::Eq), Constraint::Key);
+        assert_eq!(Constraint::Ord.meet(Constraint::Key), Constraint::KeyOrd);
+        assert_eq!(Constraint::KeyAdd.meet(Constraint::Num), Constraint::KeyNum);
+        assert_eq!(Constraint::KeySub.meet(Constraint::Ord), Constraint::KeySub);
+        assert_eq!(Constraint::Add.meet(Constraint::Sub), Constraint::Sub);
+        let mut table = TypeTable::default();
+        table.set_key_types(["Cor".to_string()].into());
+        assert!(constrain(&mut table, Constraint::Key, &Type::con("Cor")).is_ok());
+        assert!(constrain(&mut table, Constraint::Key, &Type::con("Double")).is_err());
+        assert!(constrain(&mut table, Constraint::KeyOrd, &Type::con("Cor")).is_err());
+        assert!(constrain(&mut table, Constraint::Key, &Type::option(int())).is_err());
+        let a = table.fresh(1);
+        constrain(&mut table, Constraint::Key, &a).unwrap();
+        constrain(&mut table, Constraint::Ord, &a).unwrap();
+        assert!(unify(&mut table, &a, &Type::con("Double")).is_err());
+        let b = table.fresh(1);
+        constrain(&mut table, Constraint::Add, &b).unwrap();
+        constrain(&mut table, Constraint::Key, &b).unwrap();
+        assert!(unify(&mut table, &b, &Type::con("String")).is_ok());
+        let c = table.fresh(1);
+        constrain(&mut table, Constraint::Num, &c).unwrap();
+        constrain(&mut table, Constraint::Key, &c).unwrap();
+        assert!(unify(&mut table, &c, &Type::con("Money")).is_err());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use crate::syntax::expr::TypeExpr;
 
 use super::effects::{Label, Row};
 use super::exhaustive::{CtorSig, Signatures};
-use super::ty::{Type, TypeTable};
+use super::ty::{Constraint, KEY_SCALARS, Type, TypeTable, display};
 
 /// Built-in types without type arguments.
 pub const SCALARS: &[&str] = &[
@@ -69,15 +69,38 @@ pub const UI_NODES: &[&str] = &[
     "Text",
 ];
 
-/// Builtin functions with a fixed signature. `listOf` is variadic and checked on its own.
-pub const BUILTINS: &[&str] = &["first", "get", "length", "map", "fold", "emptyList"];
+/// Builtin functions with a fixed signature. `listOf` and `setOf` are variadic and checked on
+/// their own.
+pub const BUILTINS: &[&str] = &[
+    "first",
+    "get",
+    "length",
+    "map",
+    "fold",
+    "emptyList",
+    "emptySet",
+    "insert",
+    "remove",
+    "contains",
+    "setSize",
+    "toList",
+    "emptyMap",
+    "put",
+    "lookup",
+    "removeKey",
+    "keys",
+    "values",
+    "mapSize",
+];
 
-/// A builtin's type scheme, numbered locally: type variables `0..vars`, row variables `0..rows`.
-/// The single source for the checker (which instantiates it) and the core lowering (which
-/// matches it against use sites).
+/// A builtin's type scheme, numbered locally: type variables `0..vars` (in order of first
+/// appearance), row variables `0..rows`. The single source for the checker (which instantiates
+/// it) and the core lowering (which matches it against use sites).
 pub struct BuiltinScheme {
     pub vars: usize,
     pub rows: usize,
+    /// Whether type variable 0 must satisfy `Key` (the element of a `Set`, the key of a `Map`).
+    pub key: bool,
     pub ty: Type,
 }
 
@@ -110,9 +133,56 @@ pub fn builtin_scheme(name: &str) -> Option<BuiltinScheme> {
             ),
         ),
         "emptyList" => (1, 0, pure(Vec::new(), list(var(0)))),
+        _ => {
+            let ty = collection_builtin(name)?;
+            let vars = if ty_mentions_map(&ty) { 2 } else { 1 };
+            return Some(BuiltinScheme {
+                vars,
+                rows: 0,
+                key: true,
+                ty,
+            });
+        }
+    };
+    Some(BuiltinScheme {
+        vars,
+        rows,
+        key: false,
+        ty,
+    })
+}
+
+/// The pure type of a `Set`/`Map` builtin: element or key `0`, map value `1`.
+fn collection_builtin(name: &str) -> Option<Type> {
+    let var = Type::Var;
+    let set = || Type::Con("Set".into(), vec![var(0)]);
+    let map = || Type::Con("Map".into(), vec![var(0), var(1)]);
+    let (params, result) = match name {
+        "emptySet" => (Vec::new(), set()),
+        "insert" | "remove" => (vec![set(), var(0)], set()),
+        "contains" => (vec![set(), var(0)], Type::con("Boolean")),
+        "setSize" => (vec![set()], Type::con("Int")),
+        "toList" => (vec![set()], Type::list(var(0))),
+        "emptyMap" => (Vec::new(), map()),
+        "put" => (vec![map(), var(0), var(1)], map()),
+        "lookup" => (vec![map(), var(0)], Type::option(var(1))),
+        "removeKey" => (vec![map(), var(0)], map()),
+        "keys" => (vec![map()], Type::list(var(0))),
+        "values" => (vec![map()], Type::list(var(1))),
+        "mapSize" => (vec![map()], Type::con("Int")),
         _ => return None,
     };
-    Some(BuiltinScheme { vars, rows, ty })
+    Some(Type::Fun(params, Box::new(result), Row::empty()))
+}
+
+fn ty_mentions_map(ty: &Type) -> bool {
+    match ty {
+        Type::Con(name, args) => name == "Map" || args.iter().any(ty_mentions_map),
+        Type::Fun(params, result, _) => {
+            params.iter().any(ty_mentions_map) || ty_mentions_map(result)
+        }
+        Type::Var(_) | Type::Error => false,
+    }
 }
 
 /// Types `Text(...)` can display, besides distinct types over them.
@@ -147,6 +217,8 @@ pub struct Env {
     pub ctors: BTreeMap<String, CtorInfo>,
     /// `Ui` and the user types that cannot support equality (see `non_equatable_types`).
     pub non_equatable: BTreeSet<String>,
+    /// The user types that satisfy `Key` (see `key_types`).
+    pub key_types: BTreeSet<String>,
 }
 
 impl Env {
@@ -273,7 +345,75 @@ impl Env {
             }
         }
         env.non_equatable = env.non_equatable_types();
+        env.key_types = env.key_types();
+        env.check_collection_fields(diagnostics);
         env
+    }
+
+    /// `enum class` types (variants without fields) and distinct types over a `Key` type,
+    /// directly or through other distinct types (a fixpoint).
+    fn key_types(&self) -> BTreeSet<String> {
+        let mut set: BTreeSet<String> = self
+            .types
+            .iter()
+            .filter(|(_, info)| {
+                info.kind == TypeKind::Enum
+                    && info.params.is_empty()
+                    && info
+                        .ctors
+                        .iter()
+                        .all(|ctor| self.ctors.get(ctor).is_some_and(|c| c.fields.is_empty()))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        loop {
+            let mut changed = false;
+            for (name, info) in &self.types {
+                if info.kind != TypeKind::Distinct || set.contains(name) {
+                    continue;
+                }
+                if let Some(TypeExpr::Named {
+                    name: under, args, ..
+                }) = &info.underlying
+                    && args.is_empty()
+                    && (KEY_SCALARS.contains(&under.as_str()) || set.contains(under))
+                {
+                    set.insert(name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                return set;
+            }
+        }
+    }
+
+    /// Whether a type without variables satisfies `Key`.
+    pub fn is_key(&self, ty: &Type) -> bool {
+        match ty {
+            Type::Error => true,
+            Type::Con(name, args) => {
+                args.is_empty()
+                    && (KEY_SCALARS.contains(&name.as_str()) || self.key_types.contains(name))
+            }
+            Type::Var(_) | Type::Fun(..) => false,
+        }
+    }
+
+    /// A field type that mentions `Set<T>` or `Map<T, V>` requires `Key` of `T`; a type
+    /// parameter never satisfies it (E7301).
+    fn check_collection_fields(&self, diagnostics: &mut Vec<Diagnostic>) {
+        for ctor in self.ctors.values() {
+            let rigid = rigid_vars(&ctor.type_params);
+            for (_, field) in &ctor.fields {
+                let ty = self.lower_quiet(field, &rigid);
+                for key in collection_keys(&ty) {
+                    if !self.is_key(key) {
+                        diagnostics.push(key_error(key, &ctor.span));
+                    }
+                }
+            }
+        }
     }
 
     /// A type is non-equatable when a field of one of its constructors contains a function,
@@ -646,6 +786,44 @@ impl Signatures for Env {
             }
         }
     }
+}
+
+/// The element types of the `Set`s and the key types of the `Map`s inside `ty`.
+pub fn collection_keys(ty: &Type) -> Vec<&Type> {
+    let mut output = Vec::new();
+    collect_keys(ty, &mut output);
+    output
+}
+
+fn collect_keys<'t>(ty: &'t Type, output: &mut Vec<&'t Type>) {
+    match ty {
+        Type::Con(name, args) => {
+            if (name == "Set" || name == "Map")
+                && let Some(key) = args.first()
+            {
+                output.push(key);
+            }
+            args.iter().for_each(|arg| collect_keys(arg, output));
+        }
+        Type::Fun(params, result, _) => {
+            params.iter().for_each(|param| collect_keys(param, output));
+            collect_keys(result, output);
+        }
+        Type::Var(_) | Type::Error => {}
+    }
+}
+
+/// E7301 for a set element or map key type that does not satisfy `Key`.
+pub fn key_error(ty: &Type, span: &Span) -> Diagnostic {
+    Diagnostic::error(
+        "E7301",
+        format!(
+            "`{}` does not support {}.",
+            display(ty),
+            Constraint::Key.describe()
+        ),
+        span.clone(),
+    )
 }
 
 fn contains_non_equatable(te: &TypeExpr, params: &[String], set: &BTreeSet<String>) -> bool {

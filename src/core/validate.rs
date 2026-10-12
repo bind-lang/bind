@@ -722,20 +722,21 @@ impl<'p> Validator<'p> {
     }
 
     fn builtin(&mut self, name: &str, instance: &[Type], ty: &Type) {
-        if name == "listOf" {
+        if name == "listOf" || name == "setOf" {
             let [element] = instance else {
                 self.problem(format!(
-                    "`listOf` is instantiated with {} types",
+                    "`{name}` is instantiated with {} types",
                     instance.len()
                 ));
                 return;
             };
-            let list = Type::list(element.clone());
+            let collection = if name == "listOf" { "List" } else { "Set" };
+            let list = Type::Con(collection.into(), vec![element.clone()]);
             let fits = matches!(ty, Type::Fun(params, result, _)
                 if params.iter().all(|param| same(param, element)) && same(result, &list));
             if !fits {
                 self.problem(format!(
-                    "`listOf` at element type {} has the type {}",
+                    "`{name}` at element type {} has the type {}",
                     display(element),
                     display(ty)
                 ));
@@ -1145,6 +1146,11 @@ mod tests {
             "fun h(): Int {\n val e = emptyList()\n 1\n}",
             "fun even(n: Int): Boolean = n == 0 || odd(n - 1)\nfun odd(n: Int): Boolean = n != 0 && even(n - 1)",
             "distinct type Id = UUID\nfun f(i: Id): Id = i",
+            "fun f() = toList(setOf(3, 1, 3))",
+            "fun f(s: Set<String>): Boolean = contains(remove(insert(s, \"a\"), \"b\"), \"a\")",
+            "fun f(m: Map<String, Int>) = lookup(removeKey(put(m, \"a\", 1), \"b\"), \"a\")",
+            "fun f(m: Map<Int, String>): Int = length(keys(m)) + length(values(m)) + mapSize(m)",
+            "enum class Cor { Z, A, M }\nfun f(): Int = setSize(insert(emptySet(), Cor.A))",
         ];
         for source in sources {
             assert_eq!(validate(&core(source)), Vec::<String>::new(), "{source}");

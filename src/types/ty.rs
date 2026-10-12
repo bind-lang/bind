@@ -42,9 +42,18 @@ impl Type {
 
 const NUMERIC: &[&str] = &["Int", "Double", "Float", "Decimal"];
 
-/// Operator constraints over closed sets of types, declared from weakest to strongest:
-/// every type a stronger constraint accepts is accepted by the weaker ones, so two
-/// constraints on the same variable combine by taking the stronger (`max`).
+/// Built-in types that satisfy `Key`; `enum class` types and distinct types over a `Key`
+/// type satisfy it too (`TypeTable::is_key_type`).
+pub const KEY_SCALARS: &[&str] = &[
+    "Int", "String", "Email", "Url", "Boolean", "UUID", "Decimal", "Money", "Date", "DateTime",
+    "Instant",
+];
+
+/// Constraints over closed sets of types. The operator constraints `Eq`, `Ord`, `Add`, `Sub`
+/// and `Num` are declared from weakest to strongest: every type a stronger one accepts is
+/// accepted by the weaker ones. `Key` (set elements and map keys) is not on that chain, so a
+/// variable that must satisfy both `Key` and an operator constraint gets their intersection
+/// (`KeyOrd`, `KeyAdd`, `KeySub`, `KeyNum`; `Key` already implies `Eq`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Constraint {
     Eq,
@@ -52,14 +61,47 @@ pub enum Constraint {
     Add,
     Sub,
     Num,
+    Key,
+    KeyOrd,
+    KeyAdd,
+    KeySub,
+    KeyNum,
 }
 
 impl Constraint {
-    pub fn meet(self, other: Constraint) -> Constraint {
-        self.max(other)
+    /// The operator part and whether `Key` is required.
+    fn parts(self) -> (Constraint, bool) {
+        match self {
+            Constraint::Key => (Constraint::Eq, true),
+            Constraint::KeyOrd => (Constraint::Ord, true),
+            Constraint::KeyAdd => (Constraint::Add, true),
+            Constraint::KeySub => (Constraint::Sub, true),
+            Constraint::KeyNum => (Constraint::Num, true),
+            operator => (operator, false),
+        }
     }
 
-    /// Whether a type constructor (ignoring its arguments) satisfies the constraint.
+    fn from_parts(operator: Constraint, key: bool) -> Constraint {
+        match (operator, key) {
+            (operator, false) => operator,
+            (Constraint::Ord, true) => Constraint::KeyOrd,
+            (Constraint::Add, true) => Constraint::KeyAdd,
+            (Constraint::Sub, true) => Constraint::KeySub,
+            (Constraint::Num, true) => Constraint::KeyNum,
+            (_, true) => Constraint::Key,
+        }
+    }
+
+    /// The constraint of a variable that must satisfy both: the stronger operator constraint,
+    /// with `Key` when either requires it.
+    pub fn meet(self, other: Constraint) -> Constraint {
+        let (a, key_a) = self.parts();
+        let (b, key_b) = other.parts();
+        Constraint::from_parts(a.max(b), key_a || key_b)
+    }
+
+    /// Whether a built-in type constructor (ignoring its arguments) satisfies the constraint.
+    /// User types satisfy only `Eq` and `Key` (see `unify::constrain`).
     pub fn accepts(self, name: &str) -> bool {
         match self {
             Constraint::Num => NUMERIC.contains(&name),
@@ -71,6 +113,11 @@ impl Constraint {
                 Constraint::Add.accepts(name) || matches!(name, "Date" | "DateTime" | "Instant")
             }
             Constraint::Eq => !name.starts_with('\''),
+            Constraint::Key => KEY_SCALARS.contains(&name),
+            combined => {
+                let (operator, _) = combined.parts();
+                operator.accepts(name) && Constraint::Key.accepts(name)
+            }
         }
     }
 
@@ -85,6 +132,21 @@ impl Constraint {
                 "ordering comparisons (accepted types: Int, Double, Float, Decimal, Money, Duration, String, Date, DateTime, Instant)"
             }
             Constraint::Eq => "equality (functions and type parameters cannot be compared)",
+            Constraint::Key => {
+                "use as a set element or map key (accepted types: Int, String, Email, Url, Boolean, UUID, Decimal, Money, Date, DateTime, Instant, enum classes and distinct types over them)"
+            }
+            Constraint::KeyOrd => {
+                "ordering comparisons and use as a set element or map key (accepted types: Int, Decimal, Money, String, Date, DateTime, Instant)"
+            }
+            Constraint::KeyAdd => {
+                "`+` and use as a set element or map key (accepted types: Int, Decimal, Money, String)"
+            }
+            Constraint::KeySub => {
+                "`-` and use as a set element or map key (accepted types: Int, Decimal, Money)"
+            }
+            Constraint::KeyNum => {
+                "`*`, `/` and use as a set element or map key (accepted types: Int, Decimal)"
+            }
         }
     }
 }
@@ -105,6 +167,9 @@ pub struct TypeTable {
     /// Type constructors that never support equality: `Ui` and user types whose fields
     /// contain a function or another such type (see `Env::build`).
     non_equatable: BTreeSet<String>,
+    /// User types that satisfy `Key`: `enum class` types and distinct types over a `Key` type
+    /// (see `Env::build`).
+    key_types: BTreeSet<String>,
 }
 
 impl TypeTable {
@@ -114,6 +179,14 @@ impl TypeTable {
 
     pub fn is_non_equatable(&self, name: &str) -> bool {
         self.non_equatable.contains(name)
+    }
+
+    pub fn set_key_types(&mut self, names: BTreeSet<String>) {
+        self.key_types = names;
+    }
+
+    pub fn is_key_type(&self, name: &str) -> bool {
+        self.key_types.contains(name)
     }
 
     pub fn fresh(&mut self, level: u32) -> Type {
@@ -306,10 +379,27 @@ pub fn instantiate_with_rows(
     if scheme.vars.is_empty() && scheme.row_vars.is_empty() {
         return (scheme.ty.clone(), BTreeMap::new());
     }
+    // A quantified variable keeps its constraint (only builtin schemes have one: `Key`).
     let types: BTreeMap<TypeVarId, Type> = scheme
         .vars
         .iter()
-        .map(|id| (*id, table.fresh(level)))
+        .map(|id| {
+            let constraint = match table.state(*id) {
+                VarState::Unbound { constraint, .. } => *constraint,
+                VarState::Link(_) => None,
+            };
+            let fresh = table.fresh(level);
+            if let (Some(constraint), Type::Var(var)) = (constraint, &fresh) {
+                table.set(
+                    *var,
+                    VarState::Unbound {
+                        level,
+                        constraint: Some(constraint),
+                    },
+                );
+            }
+            (*id, fresh)
+        })
         .collect();
     let mut rows = BTreeMap::new();
     for id in &scheme.row_vars {

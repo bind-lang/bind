@@ -9,9 +9,11 @@
 //! primitives give the text `Text` shows (`core::display`). `UUID`, `Date`, `DateTime` and
 //! `Instant` values (only ever arguments: Bind has no literal of these types) are their
 //! canonical wire texts (`Value::Str`), shown as is and ordered by
-//! `display::compare_temporal`. Anything else the generated code does not model in memory
-//! (database, `Decimal`, durations, environment values, server calls) is
-//! `EvalError::Unsupported`.
+//! `display::compare_temporal`. `Decimal` and `Money` values (also only arguments) are
+//! `Value::Decimal`, their canonical text, compared by value; their arithmetic is not
+//! modelled. `Set` and `Map` values are kept in the canonical key order ([`KeyKind`]) without
+//! duplicates. Anything else the generated code does not model in memory (database, `Decimal`
+//! arithmetic, durations, environment values, server calls) is `EvalError::Unsupported`.
 //!
 //! Strings, list items, constructor fields and UI children are shared (`Arc`), so copying a
 //! value (reading a local, capturing an environment) costs no more than a few pointers, and a
@@ -65,6 +67,20 @@ pub enum Value {
         fields: Shared,
     },
     List(Shared),
+    /// A `Decimal` or `Money` value: its canonical text (`rust_decimal`'s `Display`), kept as
+    /// given. Compared by value ([`decimal_order`]): `1.0` and `1.00` are equal, and a set or
+    /// map keeps the text of the element or key it holds first. Bind has no `Decimal`
+    /// literal: such values are only ever arguments (built by the tests and the harnesses).
+    #[cfg_attr(not(test), allow(dead_code))]
+    Decimal(Arc<str>),
+    /// A `Set`: its elements in canonical order ([`Interp::key_order`]), without duplicates.
+    Set(Shared),
+    /// A `Map`: its keys in canonical order, without duplicates, and `values[i]` the value of
+    /// `keys[i]` (always the same length).
+    Map {
+        keys: Shared,
+        values: Shared,
+    },
     /// Captures its environment by value.
     Closure {
         params: Vec<LocalId>,
@@ -72,7 +88,12 @@ pub enum Value {
         env: BTreeMap<LocalId, Value>,
     },
     Function(String),
-    Builtin(String),
+    /// A builtin function; `key` is its first instance type (the element or key type of the
+    /// `Set`/`Map` builtins, which orders their values).
+    Builtin {
+        name: String,
+        key: Option<Type>,
+    },
     /// A UI node; `args` are `Str` or `Int` values and `children` are `Ui` values.
     Ui {
         node: UiNode,
@@ -112,9 +133,16 @@ impl Drop for Shared {
         let mut pending: Vec<Value> = std::mem::take(items);
         while let Some(mut value) = pending.pop() {
             match &mut value {
-                Value::List(shared) | Value::Ctor { fields: shared, .. } => {
+                Value::List(shared) | Value::Set(shared) | Value::Ctor { fields: shared, .. } => {
                     if let Some(items) = Arc::get_mut(&mut shared.0) {
                         pending.append(items);
+                    }
+                }
+                Value::Map { keys, values } => {
+                    for shared in [keys, values] {
+                        if let Some(items) = Arc::get_mut(&mut shared.0) {
+                            pending.append(items);
+                        }
                     }
                 }
                 Value::Ui { args, children, .. } => {
@@ -151,6 +179,11 @@ impl Value {
     /// - `Bool`: `true` / `false`; `None`: `null`; `Some(v)`: just `v`;
     /// - `Ctor`: `Nome` when it has no fields, otherwise `Nome(a, b)`;
     /// - `List`: `[a, b]`; `Unit`: `()`;
+    /// - `Decimal` (also `Money`): its text as held, unquoted (`1.50`, `-0.5`);
+    /// - `Set`: `Set[` the elements in canonical order joined by `, ` `]`: `Set[1, 3]`,
+    ///   `Set[]`;
+    /// - `Map`: `Map[` the entries `key: value` in canonical key order joined by `, ` `]`:
+    ///   `Map[1: "a", 2: "b"]`, `Map[]`;
     /// - `Closure`, `Function`, `Builtin`: `<fun>` (not comparable);
     /// - `Ui`: its HTML, `display::render_html_limited` (unlimited).
     pub fn render(&self) -> String {
@@ -166,7 +199,17 @@ impl Value {
             Value::Ctor { name, fields } if fields.is_empty() => name.clone(),
             Value::Ctor { name, fields } => format!("{name}({})", join(fields)),
             Value::List(items) => format!("[{}]", join(items)),
-            Value::Closure { .. } | Value::Function(_) | Value::Builtin(_) => "<fun>".into(),
+            Value::Decimal(text) => text.to_string(),
+            Value::Set(items) => format!("Set[{}]", join(items)),
+            Value::Map { keys, values } => {
+                let entries: Vec<String> = keys
+                    .iter()
+                    .zip(values.iter())
+                    .map(|(key, value)| format!("{}: {}", key.render(), value.render()))
+                    .collect();
+                format!("Map[{}]", entries.join(", "))
+            }
+            Value::Closure { .. } | Value::Function(_) | Value::Builtin { .. } => "<fun>".into(),
             Value::Ui { .. } => display::render_html_limited(self, usize::MAX).unwrap_or_default(),
         }
     }
@@ -192,7 +235,10 @@ impl Value {
             Value::Some(_) => "an optional value",
             Value::Ctor { .. } => "a constructor",
             Value::List(_) => "a list",
-            Value::Closure { .. } | Value::Function(_) | Value::Builtin(_) => "a function",
+            Value::Decimal(_) => "a Decimal",
+            Value::Set(_) => "a set",
+            Value::Map { .. } => "a map",
+            Value::Closure { .. } | Value::Function(_) | Value::Builtin { .. } => "a function",
             Value::Ui { .. } => "a UI node",
         }
     }
@@ -470,7 +516,7 @@ impl Interp<'_> {
                 }
                 self.eval(&body, &mut env)
             }
-            Value::Builtin(name) => self.builtin(&name, args),
+            Value::Builtin { name, key } => self.builtin(&name, key.as_ref(), args),
             other => Err(unsupported(&format!("call of {}", other.kind())).into()),
         }
     }
@@ -491,7 +537,10 @@ impl Interp<'_> {
             ExprKind::Lit(literal) => literal_value(literal, &expr.ty).map_err(Signal::Error),
             ExprKind::Local(id) => local(env, *id),
             ExprKind::Global { name, .. } => Ok(Value::Function(name.clone())),
-            ExprKind::Builtin { name, .. } => Ok(Value::Builtin(name.clone())),
+            ExprKind::Builtin { name, instance } => Ok(Value::Builtin {
+                name: name.clone(),
+                key: instance.first().cloned(),
+            }),
             ExprKind::Environment(name) => Err(not_modelled("environment value", name).into()),
             ExprKind::Ctor { ctor, args, .. } => self.ctor_expr(ctor, args, env),
             ExprKind::None => Ok(Value::None),
@@ -736,11 +785,32 @@ impl Interp<'_> {
                     }
                     pending.extend(fa.iter().zip(fb.iter()).rev());
                 }
-                (Value::List(a), Value::List(b)) => {
+                (Value::List(a), Value::List(b)) | (Value::Set(a), Value::Set(b)) => {
                     if a.len() != b.len() {
                         return Ok(false);
                     }
                     pending.extend(a.iter().zip(b.iter()).rev());
+                }
+                (
+                    Value::Map {
+                        keys: ka,
+                        values: va,
+                    },
+                    Value::Map {
+                        keys: kb,
+                        values: vb,
+                    },
+                ) => {
+                    if ka.len() != kb.len() {
+                        return Ok(false);
+                    }
+                    pending.extend(va.iter().zip(vb.iter()).rev());
+                    pending.extend(ka.iter().zip(kb.iter()).rev());
+                }
+                (Value::Decimal(a), Value::Decimal(b)) => {
+                    if decimal_order(a, b)? != Ordering::Equal {
+                        return Ok(false);
+                    }
                 }
                 _ => return Err(unsupported("equality on incomparable values")),
             }
@@ -748,7 +818,13 @@ impl Interp<'_> {
         Ok(true)
     }
 
-    fn builtin(&mut self, name: &str, args: Vec<Value>) -> Eval {
+    fn builtin(&mut self, name: &str, key: Option<&Type>, args: Vec<Value>) -> Eval {
+        if is_collection_builtin(name) {
+            let key =
+                key.ok_or_else(|| unsupported(&format!("builtin `{name}` without a key type")))?;
+            let order = self.key_kind(key)?;
+            return Ok(self.collection_builtin(name, &order, args)?);
+        }
         let bad = || unsupported(&format!("bad arguments for builtin `{name}`"));
         let mut args = args.into_iter();
         let value = match name {
@@ -794,6 +870,297 @@ impl Interp<'_> {
         };
         Ok(value)
     }
+}
+
+/// The `Set`/`Map` builtins (`setOf` included), whose first instance type is the key type.
+fn is_collection_builtin(name: &str) -> bool {
+    matches!(
+        name,
+        "setOf"
+            | "emptySet"
+            | "insert"
+            | "remove"
+            | "contains"
+            | "setSize"
+            | "toList"
+            | "emptyMap"
+            | "put"
+            | "lookup"
+            | "removeKey"
+            | "keys"
+            | "values"
+            | "mapSize"
+    )
+}
+
+/// How the values of a `Key` type are ordered (the canonical order of sets and map keys,
+/// the same in the three runtimes).
+enum KeyKind {
+    /// `Int`: numeric.
+    Int,
+    /// `Boolean`: `false < true`.
+    Bool,
+    /// `Decimal`, `Money`: numeric, by value ([`decimal_order`]).
+    Decimal,
+    /// `Date`, `DateTime`, `Instant`: `display::compare_temporal` on the canonical texts.
+    Temporal,
+    /// `String`, `Email`, `Url`, `UUID`: by Unicode code point (the order of the UTF-8 bytes;
+    /// a `UUID` is its canonical lowercase text, so this is also the order of its 128 bits).
+    Text,
+    /// An `enum class`: the declaration order of its variants.
+    Enum(Vec<String>),
+    /// A distinct type: the order of the value it wraps.
+    Distinct(Box<KeyKind>),
+}
+
+impl Interp<'_> {
+    /// The order of the values of the `Key` type `ty`.
+    fn key_kind(&self, ty: &Type) -> Result<KeyKind, EvalError> {
+        let mut current = ty;
+        let mut wrappers = 0;
+        let base = loop {
+            let name = scalar(current).ok_or_else(|| unsupported("a key of a non-key type"))?;
+            let kind = match name {
+                "Int" => KeyKind::Int,
+                "Boolean" => KeyKind::Bool,
+                "Decimal" | "Money" => KeyKind::Decimal,
+                "Date" | "DateTime" | "Instant" => KeyKind::Temporal,
+                "String" | "Email" | "Url" | "UUID" => KeyKind::Text,
+                _ => match self.program.types.iter().find(|ty| type_name(ty) == name) {
+                    Some(CoreType::Sum { variants, .. }) => {
+                        KeyKind::Enum(variants.iter().map(|(name, _)| name.clone()).collect())
+                    }
+                    // Bounded: a cycle of distinct types is never a `Key` type.
+                    Some(CoreType::Distinct { underlying, .. }) if wrappers < 64 => {
+                        wrappers += 1;
+                        current = underlying;
+                        continue;
+                    }
+                    _ => return Err(unsupported(&format!("a key of type `{name}`"))),
+                },
+            };
+            break kind;
+        };
+        Ok((0..wrappers).fold(base, |kind, _| KeyKind::Distinct(Box::new(kind))))
+    }
+
+    /// The canonical order of two keys (one unit of work).
+    fn key_order(&mut self, kind: &KeyKind, a: &Value, b: &Value) -> Result<Ordering, EvalError> {
+        self.charge(1)?;
+        key_order(kind, a, b)
+    }
+
+    /// The position of `key` in the canonically ordered `items`: `Ok` where an equal key is,
+    /// `Err` where it would be inserted.
+    fn search(
+        &mut self,
+        kind: &KeyKind,
+        items: &[Value],
+        key: &Value,
+    ) -> Result<Result<usize, usize>, EvalError> {
+        let (mut low, mut high) = (0, items.len());
+        while low < high {
+            let middle = low + (high - low) / 2;
+            match self.key_order(kind, &items[middle], key)? {
+                Ordering::Less => low = middle + 1,
+                Ordering::Greater => high = middle,
+                Ordering::Equal => return Ok(Ok(middle)),
+            }
+        }
+        Ok(Err(low))
+    }
+
+    /// `s` with `x` added; `s` itself when it has an equal element (which it keeps).
+    fn insert(&mut self, kind: &KeyKind, set: Shared, item: Value) -> Result<Shared, EvalError> {
+        match self.search(kind, &set, &item)? {
+            Ok(_) => Ok(set),
+            Err(index) => {
+                self.charge(set.len() as u64)?;
+                let mut items = set.to_vec();
+                items.insert(index, item);
+                Ok(items.into())
+            }
+        }
+    }
+
+    /// The `Set`/`Map` builtins. Collections are immutable: an operation that changes nothing
+    /// (inserting an element already there, removing an absent one) returns the same value.
+    fn collection_builtin(
+        &mut self,
+        name: &str,
+        kind: &KeyKind,
+        args: Vec<Value>,
+    ) -> Result<Value, EvalError> {
+        let bad = || unsupported(&format!("bad arguments for builtin `{name}`"));
+        let mut args = args.into_iter();
+        let mut next = || args.next();
+        Ok(match (name, next(), next(), next()) {
+            // Inserted left to right: of equal elements, the first is kept.
+            ("setOf", first, second, third) => {
+                let mut set = Shared::default();
+                for item in [first, second, third].into_iter().flatten().chain(args) {
+                    set = self.insert(kind, set, item)?;
+                }
+                Value::Set(set)
+            }
+            ("emptySet", None, None, None) => Value::Set(Shared::default()),
+            ("insert", Some(Value::Set(set)), Some(item), None) => {
+                Value::Set(self.insert(kind, set, item)?)
+            }
+            ("remove", Some(Value::Set(set)), Some(item), None) => {
+                match self.search(kind, &set, &item)? {
+                    Ok(index) => {
+                        self.charge(set.len() as u64)?;
+                        let mut items = set.to_vec();
+                        items.remove(index);
+                        Value::Set(items.into())
+                    }
+                    Err(_) => Value::Set(set),
+                }
+            }
+            ("contains", Some(Value::Set(set)), Some(item), None) => {
+                Value::Bool(self.search(kind, &set, &item)?.is_ok())
+            }
+            ("setSize", Some(Value::Set(set)), None, None) => Value::Int(BigInt::from(set.len())),
+            ("toList", Some(Value::Set(set)), None, None) => Value::List(set),
+            ("emptyMap", None, None, None) => Value::Map {
+                keys: Shared::default(),
+                values: Shared::default(),
+            },
+            // An equal key already there keeps its text; only the value is replaced.
+            ("put", Some(Value::Map { keys, values }), Some(key), Some(value)) => {
+                self.charge(keys.len() as u64)?;
+                match self.search(kind, &keys, &key)? {
+                    Ok(index) => {
+                        let mut items = values.to_vec();
+                        items[index] = value;
+                        Value::Map {
+                            keys,
+                            values: items.into(),
+                        }
+                    }
+                    Err(index) => {
+                        let (mut new_keys, mut new_values) = (keys.to_vec(), values.to_vec());
+                        new_keys.insert(index, key);
+                        new_values.insert(index, value);
+                        Value::Map {
+                            keys: new_keys.into(),
+                            values: new_values.into(),
+                        }
+                    }
+                }
+            }
+            ("lookup", Some(Value::Map { keys, values }), Some(key), None) => {
+                match self.search(kind, &keys, &key)? {
+                    Ok(index) => option(values.get(index).cloned()),
+                    Err(_) => Value::None,
+                }
+            }
+            ("removeKey", Some(Value::Map { keys, values }), Some(key), None) => {
+                match self.search(kind, &keys, &key)? {
+                    Ok(index) => {
+                        self.charge(keys.len() as u64)?;
+                        let (mut new_keys, mut new_values) = (keys.to_vec(), values.to_vec());
+                        new_keys.remove(index);
+                        new_values.remove(index);
+                        Value::Map {
+                            keys: new_keys.into(),
+                            values: new_values.into(),
+                        }
+                    }
+                    Err(_) => Value::Map { keys, values },
+                }
+            }
+            ("keys", Some(Value::Map { keys, .. }), None, None) => Value::List(keys),
+            ("values", Some(Value::Map { values, .. }), None, None) => Value::List(values),
+            ("mapSize", Some(Value::Map { keys, .. }), None, None) => {
+                Value::Int(BigInt::from(keys.len()))
+            }
+            _ => return Err(bad()),
+        })
+    }
+}
+
+fn type_name(ty: &CoreType) -> &str {
+    match ty {
+        CoreType::Record { name, .. }
+        | CoreType::Sum { name, .. }
+        | CoreType::Distinct { name, .. } => name,
+    }
+}
+
+/// The canonical order of two keys of the kind `kind` (see [`KeyKind`]).
+fn key_order(kind: &KeyKind, a: &Value, b: &Value) -> Result<Ordering, EvalError> {
+    match (kind, a, b) {
+        (KeyKind::Int, Value::Int(a), Value::Int(b)) => Ok(a.cmp(b)),
+        (KeyKind::Bool, Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(b)),
+        (KeyKind::Decimal, Value::Decimal(a), Value::Decimal(b)) => decimal_order(a, b),
+        (KeyKind::Temporal, Value::Str(a), Value::Str(b)) => Ok(display::compare_temporal(a, b)),
+        (KeyKind::Text, Value::Str(a), Value::Str(b)) => Ok(a.as_bytes().cmp(b.as_bytes())),
+        (KeyKind::Enum(variants), Value::Ctor { name: a, .. }, Value::Ctor { name: b, .. }) => {
+            let index = |name: &String| {
+                variants
+                    .iter()
+                    .position(|variant| variant == name)
+                    .ok_or_else(|| {
+                        unsupported(&format!("`{name}` is not a variant of the key type"))
+                    })
+            };
+            Ok(index(a)?.cmp(&index(b)?))
+        }
+        (
+            KeyKind::Distinct(inner),
+            Value::Ctor { fields: a, .. },
+            Value::Ctor { fields: b, .. },
+        ) => match (a.first(), b.first()) {
+            (Some(a), Some(b)) => key_order(inner, a, b),
+            _ => Err(unsupported("a distinct key without its value")),
+        },
+        _ => Err(unsupported(&format!(
+            "ordering {} and {} as keys",
+            a.kind(),
+            b.kind()
+        ))),
+    }
+}
+
+/// The value of a canonical `Decimal` text (`-?digits(.digits)?`, as `rust_decimal` prints it)
+/// as `mantissa / 10^scale`; `None` for any other text.
+fn parse_decimal(text: &str) -> Option<(BigInt, usize)> {
+    let (negative, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, text),
+    };
+    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    let digits = |part: &str| part.bytes().all(|b| b.is_ascii_digit());
+    if whole.is_empty()
+        || !digits(whole)
+        || !digits(fraction)
+        || (unsigned.contains('.') && fraction.is_empty())
+    {
+        return None;
+    }
+    let magnitude = BigInt::parse_bytes(format!("{whole}{fraction}").as_bytes(), 10)?;
+    Some((
+        if negative { -magnitude } else { magnitude },
+        fraction.len(),
+    ))
+}
+
+/// The order of two `Decimal` (or `Money`) texts by value: `1.0` equals `1.00` and `-0`
+/// equals `0`, as `rust_decimal` compares them.
+fn decimal_order(a: &str, b: &str) -> Result<Ordering, EvalError> {
+    let invalid = |text: &str| unsupported(&format!("invalid Decimal `{text}`"));
+    let (mut x, x_scale) = parse_decimal(a).ok_or_else(|| invalid(a))?;
+    let (mut y, y_scale) = parse_decimal(b).ok_or_else(|| invalid(b))?;
+    let ten = || BigInt::from(10usize);
+    for _ in x_scale..y_scale {
+        x = x * ten();
+    }
+    for _ in y_scale..x_scale {
+        y = y * ten();
+    }
+    Ok(x.cmp(&y))
 }
 
 fn option(value: Option<Value>) -> Value {
@@ -1002,6 +1369,7 @@ fn compare(a: &Value, b: &Value) -> Result<Option<Ordering>, EvalError> {
         (Value::Float(a), Value::Float(b)) => Ok(a.partial_cmp(b)),
         (Value::Str(a), Value::Str(b)) => Ok(Some(a.cmp(b))),
         (Value::Bool(a), Value::Bool(b)) => Ok(Some(a.cmp(b))),
+        (Value::Decimal(a), Value::Decimal(b)) => decimal_order(a, b).map(Some),
         _ => Err(unsupported("ordering on unsupported values")),
     }
 }
@@ -1333,5 +1701,203 @@ mod tests {
             Value::Str("a\"b\\c\nd\te\u{1}ção é 😀".into()).render(),
             "\"a\\\"b\\\\c\\nd\\te\\u0001ção é 😀\""
         );
+    }
+
+    fn decimal(text: &str) -> Value {
+        Value::Decimal(text.into())
+    }
+
+    fn text(value: &str) -> Value {
+        Value::Str(value.into())
+    }
+
+    #[test]
+    fn sets_are_canonical_and_without_duplicates() {
+        assert_eq!(
+            rendered("fun f() = toList(setOf(3, 1, 3))", vec![]),
+            "[1, 3]"
+        );
+        assert_eq!(rendered("fun f() = setOf(3, 1, 3)", vec![]), "Set[1, 3]");
+        assert_eq!(rendered("fun f(): Set<Int> = emptySet()", vec![]), "Set[]");
+        assert_eq!(
+            rendered("fun f(): Map<Int, String> = emptyMap()", vec![]),
+            "Map[]"
+        );
+        assert_eq!(
+            rendered(
+                "fun f() = setOf(\"b\", \"a\", \"B\", \"é\", \"z\", \"\")",
+                vec![]
+            ),
+            "Set[\"\", \"B\", \"a\", \"b\", \"z\", \"é\"]"
+        );
+        assert_eq!(
+            rendered("fun f() = setOf(true, false, true)", vec![]),
+            "Set[false, true]"
+        );
+        assert_eq!(
+            rendered("fun f() = setOf(10, -2, 0, 7, -30)", vec![]),
+            "Set[-30, -2, 0, 7, 10]"
+        );
+        let ops = "fun f(s: Set<Int>): List<Int> = listOf(setSize(s), setSize(insert(s, 2)), setSize(insert(s, 9)), setSize(remove(s, 2)), if (contains(s, 2)) 1 else 0, if (contains(s, 3)) 1 else 0)";
+        assert_eq!(
+            run(ops, "f", vec![Value::Set(vec![int("1"), int("2")].into())])
+                .expect("evaluates")
+                .render(),
+            "[2, 2, 3, 1, 1, 0]"
+        );
+    }
+
+    /// Review Focus 3: variants are ordered by declaration, not by name.
+    #[test]
+    fn enum_keys_follow_declaration_order() {
+        let source = "enum class Cor { Z, A, M }\nfun f() = toList(setOf(M, Z, A))\nfun g() = keys(put(put(put(emptyMap(), Cor.A, 1), Cor.M, 2), Cor.Z, 3))";
+        assert_eq!(rendered(source, vec![]), "[Z, A, M]");
+        assert_eq!(
+            run(source, "g", vec![]).expect("evaluates").render(),
+            "[Z, A, M]"
+        );
+    }
+
+    /// Review Focus 1: `Decimal` keys are compared by value; the stored key keeps its text.
+    #[test]
+    fn decimal_keys_compare_by_value() {
+        let lookup =
+            "fun f(a: Decimal, b: Decimal): String? = lookup(put(emptyMap(), a, \"a\"), b)";
+        assert_eq!(
+            rendered(lookup, vec![decimal("1.0"), decimal("1.00")]),
+            "\"a\""
+        );
+        assert_eq!(
+            rendered(lookup, vec![decimal("1.0"), decimal("1.01")]),
+            "null"
+        );
+        // Controller Ruling A: `put` keeps the existing key, `insert` the existing element.
+        let put = "fun f(a: Decimal, b: Decimal) = put(put(emptyMap(), a, \"x\"), b, \"y\")";
+        assert_eq!(
+            rendered(put, vec![decimal("1.0"), decimal("1.00")]),
+            "Map[1.0: \"y\"]"
+        );
+        let insert = "fun f(a: Decimal, b: Decimal) = insert(setOf(a), b)";
+        assert_eq!(
+            rendered(insert, vec![decimal("1.0"), decimal("1.00")]),
+            "Set[1.0]"
+        );
+        let first = "fun f(a: Decimal, b: Decimal) = setOf(b, a)";
+        assert_eq!(
+            rendered(first, vec![decimal("1.0"), decimal("1.00")]),
+            "Set[1.00]"
+        );
+        let order = "fun f(a: Decimal, b: Decimal, c: Decimal, d: Decimal, e: Decimal) = setOf(a, b, c, d, e)";
+        assert_eq!(
+            rendered(
+                order,
+                vec![
+                    decimal("10"),
+                    decimal("9.5"),
+                    decimal("-1"),
+                    decimal("0.001"),
+                    decimal("-0.50")
+                ]
+            ),
+            "Set[-1, -0.50, 0.001, 9.5, 10]"
+        );
+        assert_eq!(
+            rendered(
+                "fun f(a: Money, b: Money) = setOf(a, b)",
+                vec![decimal("0.00"), decimal("-0")]
+            ),
+            "Set[0.00]"
+        );
+        let equal = "fun f(a: Decimal, b: Decimal) = listOf(setOf(a) == setOf(b), a == b, a < b)";
+        assert_eq!(
+            rendered(equal, vec![decimal("2.50"), decimal("2.5")]),
+            "[true, true, false]"
+        );
+    }
+
+    #[test]
+    fn temporal_and_distinct_keys_use_their_typed_order() {
+        let dates = "fun f(a: Date, b: Date, c: Date) = toList(setOf(a, b, c))";
+        assert_eq!(
+            rendered(
+                dates,
+                vec![
+                    text("+10000-01-01"),
+                    text("2026-01-02"),
+                    text("-0001-01-01")
+                ]
+            ),
+            "[\"-0001-01-01\", \"2026-01-02\", \"+10000-01-01\"]"
+        );
+        let instants = "fun f(a: Instant, b: Instant) = setOf(a, b)";
+        assert_eq!(
+            rendered(
+                instants,
+                vec![
+                    text("2026-01-01T10:00:00.500Z"),
+                    text("2026-01-01T10:00:00Z")
+                ]
+            ),
+            "Set[\"2026-01-01T10:00:00Z\", \"2026-01-01T10:00:00.500Z\"]"
+        );
+        let distinct = "distinct type Dia = Date\nfun f(a: Date, b: Date) = setOf(Dia(a), Dia(b))";
+        assert_eq!(
+            rendered(distinct, vec![text("+10000-01-01"), text("2026-01-01")]),
+            "Set[Dia(\"2026-01-01\"), Dia(\"+10000-01-01\")]"
+        );
+    }
+
+    #[test]
+    fn maps_keep_values_in_key_order() {
+        let build =
+            "fun m(): Map<Int, String> = put(put(put(emptyMap(), 3, \"c\"), 1, \"a\"), 2, \"b\")\n";
+        let eval = |body: &str| {
+            run(&format!("{build}fun f() = {body}"), "f", vec![])
+                .expect("evaluates")
+                .render()
+        };
+        assert_eq!(eval("m()"), "Map[1: \"a\", 2: \"b\", 3: \"c\"]");
+        assert_eq!(eval("keys(m())"), "[1, 2, 3]");
+        assert_eq!(eval("values(m())"), "[\"a\", \"b\", \"c\"]");
+        assert_eq!(eval("mapSize(m())"), "3");
+        assert_eq!(eval("lookup(m(), 2)"), "\"b\"");
+        assert_eq!(eval("lookup(m(), 4)"), "null");
+        assert_eq!(eval("removeKey(m(), 1)"), "Map[2: \"b\", 3: \"c\"]");
+        assert_eq!(
+            eval("put(m(), 2, \"z\")"),
+            "Map[1: \"a\", 2: \"z\", 3: \"c\"]"
+        );
+        assert_eq!(eval("put(emptyMap(), 1, setOf(2))"), "Map[1: Set[2]]");
+        assert_eq!(
+            eval("lookup(put(emptyMap(), 1, first(emptyList())), 1)"),
+            "null"
+        );
+    }
+
+    #[test]
+    fn removing_an_absent_element_returns_the_same_collection() {
+        let set: Value = Value::Set(vec![int("1"), int("2")].into());
+        let Value::Set(same) =
+            run("fun f(s: Set<Int>) = remove(s, 5)", "f", vec![set.clone()]).expect("evaluates")
+        else {
+            panic!("not a set")
+        };
+        let Value::Set(original) = &set else { panic!() };
+        assert!(Arc::ptr_eq(&same.0, &original.0));
+        let map = Value::Map {
+            keys: vec![int("1")].into(),
+            values: vec![text("a")].into(),
+        };
+        let removed = run(
+            "fun f(m: Map<Int, String>) = removeKey(m, 5)",
+            "f",
+            vec![map.clone()],
+        )
+        .expect("evaluates");
+        let (Value::Map { keys: a, .. }, Value::Map { keys: b, .. }) = (&removed, &map) else {
+            panic!("not maps")
+        };
+        assert!(Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(removed.render(), "Map[1: \"a\"]");
     }
 }

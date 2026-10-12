@@ -12,7 +12,7 @@ use crate::schema::{Column, DatabaseSchema};
 use crate::syntax::expr::*;
 
 use super::effects::{DB_READ, DB_WRITE, Label, Row, RowState, RowVarId, SERVER_CALL};
-use super::env::{BUILTINS, Env, UI_NODES, builtin_scheme, rigid_vars};
+use super::env::{BUILTINS, Env, UI_NODES, builtin_scheme, key_error, rigid_vars};
 use super::exhaustive::{self, Pat};
 use super::ty::*;
 use super::unify::{UnifyError, constrain, unify, unify_rows};
@@ -27,7 +27,7 @@ pub enum Resolution {
     Local,
     /// A top-level function of the program.
     Function(String),
-    /// `first`, `get`, `length`, `map`, `fold`, `emptyList`, `listOf`.
+    /// A builtin function: `listOf`, `setOf` or one of `env::BUILTINS`.
     Builtin(String),
     /// A constructor used as a value or called (`Pago(...)`, `Ok(...)`, `Cancelado`).
     Constructor(String),
@@ -166,6 +166,7 @@ impl<'a> Checker<'a> {
     fn new(env: &'a Env, schema: &'a DatabaseSchema) -> Self {
         let mut table = TypeTable::default();
         table.set_non_equatable(env.non_equatable.clone());
+        table.set_key_types(env.key_types.clone());
         Self {
             env,
             schema,
@@ -282,6 +283,11 @@ impl<'a> Checker<'a> {
                     _ => None,
                 })
                 .collect();
+            if builtin.key
+                && let Some(key) = types.get(&0)
+            {
+                let _ = constrain(&mut self.table, Constraint::Key, key);
+            }
             let scheme = Scheme {
                 vars,
                 row_vars: rows.values().copied().collect(),
@@ -402,7 +408,10 @@ impl<'a> Checker<'a> {
             &mut sink
         };
         match parse_type_text(&type_ref.display(), span) {
-            Ok(te) => self.env.lower_with_effects(&te, vars, effects, diagnostics),
+            Ok(te) => {
+                let ty = self.env.lower_with_effects(&te, vars, effects, diagnostics);
+                checked_keys(self.env, ty, span, diagnostics)
+            }
             Err(diagnostic) => {
                 diagnostics.push(diagnostic);
                 Type::Error
@@ -1349,6 +1358,7 @@ impl<'a> Checker<'a> {
                 &self.effect_scope,
                 &mut self.diagnostics,
             );
+            let declared = checked_keys(self.env, declared, span, &mut self.diagnostics);
             self.unify_at(
                 &declared,
                 &ty,
@@ -1618,9 +1628,9 @@ impl<'a> Checker<'a> {
             if UI_NODES.contains(&name.as_str()) {
                 return self.infer_ui(name, args, children, span);
             }
-            if name == "listOf" {
-                self.resolve(callee.id, Resolution::Builtin("listOf".into()));
-                return self.infer_list_of(args, children, span);
+            if name == "listOf" || name == "setOf" {
+                self.resolve(callee.id, Resolution::Builtin(name.clone()));
+                return self.infer_list_of(name, args, children, span);
             }
         }
         if let Some((table, method)) = db_method(callee)
@@ -1746,21 +1756,40 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn infer_list_of(&mut self, args: &[Expr], children: Option<&Block>, span: &Span) -> Type {
+    /// The variadic `listOf(…): List<T>` and `setOf(…): Set<T>` (`T` must satisfy `Key`).
+    fn infer_list_of(
+        &mut self,
+        name: &str,
+        args: &[Expr],
+        children: Option<&Block>,
+        span: &Span,
+    ) -> Type {
         if children.is_some() {
-            self.error("E7004", "`listOf` does not accept a child block.", span);
+            self.error(
+                "E7004",
+                format!("`{name}` does not accept a child block."),
+                span,
+            );
         }
         let element = self.fresh();
+        let set = name == "setOf";
+        if set {
+            self.require(Constraint::Key, &element, span);
+        }
         for arg in args {
             let ty = self.infer(arg);
             self.unify_at(
                 &element,
                 &ty,
                 &arg.span,
-                Some("the first element of `listOf`".into()),
+                Some(format!("the first element of `{name}`")),
             );
         }
-        Type::list(element)
+        if set {
+            Type::Con("Set".into(), vec![element])
+        } else {
+            Type::list(element)
+        }
     }
 
     fn infer_field(&mut self, id: NodeId, target: &Expr, name: &str, span: &Span) -> Type {
@@ -2408,6 +2437,39 @@ impl<'a> Checker<'a> {
 }
 
 /// `db.<table>.<method>` as written, before any shadowing check.
+/// A written type whose `Set` elements and `Map` keys satisfy `Key`. Each one that does not
+/// (a type parameter never does) is reported (E7301) and replaced by `Error`, so the uses of
+/// the value do not report it again.
+fn checked_keys(env: &Env, ty: Type, span: &Span, diagnostics: &mut Vec<Diagnostic>) -> Type {
+    match ty {
+        Type::Con(name, args) => {
+            let collection = name == "Set" || name == "Map";
+            let args = args
+                .into_iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    if collection && index == 0 && !env.is_key(&arg) {
+                        diagnostics.push(key_error(&arg, span));
+                        Type::Error
+                    } else {
+                        checked_keys(env, arg, span, diagnostics)
+                    }
+                })
+                .collect();
+            Type::Con(name, args)
+        }
+        Type::Fun(params, result, row) => Type::Fun(
+            params
+                .into_iter()
+                .map(|param| checked_keys(env, param, span, diagnostics))
+                .collect(),
+            Box::new(checked_keys(env, *result, span, diagnostics)),
+            row,
+        ),
+        other => other,
+    }
+}
+
 fn db_method(expr: &Expr) -> Option<(&str, &str)> {
     let ExprKind::Field {
         target,
@@ -2860,6 +2922,143 @@ mod tests {
         assert_eq!(
             errors("fun <T> igual(a: T, b: T): Boolean = a == b"),
             vec!["E7301"]
+        );
+    }
+
+    const KEYS: &str = "distinct type CustomerId = UUID\ndistinct type Codigo = CustomerId\ndistinct type Peso = Double\nentity Customer(val id: CustomerId, val name: String)\nenum class Cor { Z, A, M }\n";
+
+    #[test]
+    fn key_constraint_accepts_closed_set_of_types() {
+        for ty in [
+            "Int",
+            "String",
+            "Email",
+            "Url",
+            "Boolean",
+            "UUID",
+            "Decimal",
+            "Money",
+            "Date",
+            "DateTime",
+            "Instant",
+            "Cor",
+            "CustomerId",
+            "Codigo",
+        ] {
+            let source = format!("{KEYS}fun f(s: Set<{ty}>, x: {ty}): Set<{ty}> = insert(s, x)");
+            assert_eq!(
+                scheme(&source, "f"),
+                format!("(Set<{ty}>, {ty}) -> Set<{ty}>"),
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            scheme(
+                &format!(
+                    "{KEYS}fun f(m: Map<CustomerId, Customer>, k: CustomerId): Customer? = lookup(m, k)"
+                ),
+                "f"
+            ),
+            "(Map<CustomerId, Customer>, CustomerId) -> Customer?"
+        );
+        assert_eq!(
+            scheme(&format!("{KEYS}fun f() = toList(setOf(M, Z, A))"), "f"),
+            "() -> List<Cor>"
+        );
+        assert_eq!(scheme("fun f() = setOf(3, 1, 3)", "f"), "() -> Set<Int>");
+        assert_eq!(
+            scheme("fun f(m: Map<String, Int>) = keys(m)", "f"),
+            "(Map<String, Int>) -> List<String>"
+        );
+        assert_eq!(
+            scheme(
+                "fun f(s: Set<Int>): Int = setSize(s) + mapSize(put(emptyMap(), \"a\", s))",
+                "f"
+            ),
+            "(Set<Int>) -> Int"
+        );
+    }
+
+    #[test]
+    fn key_constraint_rejects_other_types() {
+        for ty in [
+            "Double",
+            "Float",
+            "Customer",
+            "Int?",
+            "List<Int>",
+            "Peso",
+            "Duration",
+            "Long",
+        ] {
+            assert_eq!(
+                errors(&format!("{KEYS}fun f(s: Set<{ty}>): Int = setSize(s)")),
+                vec!["E7301"],
+                "{ty}"
+            );
+        }
+        assert_eq!(
+            errors(&format!(
+                "{KEYS}fun f(m: Map<Customer, Int>): Int = mapSize(m)"
+            )),
+            vec!["E7301"]
+        );
+        // Through inference: the builtins require `Key` of the element and of the key.
+        assert_eq!(errors("fun f() = setOf(1.0, 2.0)"), vec!["E7301"]);
+        assert_eq!(
+            errors("fun f(x: Double) = insert(emptySet(), x)"),
+            vec!["E7301"]
+        );
+        assert_eq!(
+            errors(&format!("{KEYS}fun f(c: Customer) = put(emptyMap(), c, 1)")),
+            vec!["E7301"]
+        );
+        assert_eq!(errors("fun f(x: Int?) = setOf(x)"), vec!["E7301"]);
+        // In declarations, and a type parameter is never a `Key`.
+        assert_eq!(errors("data class B(val s: Set<Double>)"), vec!["E7301"]);
+        assert_eq!(errors("data class B<T>(val s: Map<T, Int>)"), vec!["E7301"]);
+        assert_eq!(
+            errors("fun <T> f(s: Set<T>): Int = setSize(s)"),
+            vec!["E7301"]
+        );
+        // Reported once, at the annotation: the uses of the value do not repeat it.
+        for source in [
+            "fun <T> f(s: Set<T>): Int = setSize(insert(s, first(toList(s)) ?: return 0))",
+            "fun f(s: Set<Double>): Int = setSize(insert(s, 1.0))",
+        ] {
+            let (tokens, _) = crate::lexer::lex("test.bd", source);
+            let (program, _) = crate::parser::parse(tokens);
+            let (_, diagnostics) = crate::types::check(&program, &DatabaseSchema::default());
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert!(
+                diagnostics[0]
+                    .message
+                    .contains("does not support use as a set element or map key"),
+                "{diagnostics:?}"
+            );
+        }
+        // No defaulting: an unresolved `Key` variable is ambiguous.
+        assert_eq!(errors("fun f() = emptySet()"), vec!["E7302"]);
+        assert_eq!(errors("fun f(x) = setOf(x)"), vec!["E7302"]);
+        // `Key` meets the operator constraints: `Double` satisfies `<` but is not a key.
+        assert_eq!(
+            errors("fun f(a, b: Double) = if (a < a) setOf(a) else setOf(b)"),
+            vec!["E7301"]
+        );
+        assert_eq!(
+            scheme("fun f(a, b: Int) = if (a < a) setOf(a) else setOf(b)", "f"),
+            "(Int, Int) -> Set<Int>"
+        );
+        assert_eq!(
+            errors("fun f(a, b: Boolean) = if (a + a == a) setOf(a) else setOf(b)"),
+            vec!["E7301"]
+        );
+        assert_eq!(
+            scheme(
+                "fun f(a, b: String) = if (a + a == a) setOf(a) else setOf(b)",
+                "f"
+            ),
+            "(String, String) -> Set<String>"
         );
     }
 

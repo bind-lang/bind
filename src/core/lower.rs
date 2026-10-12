@@ -993,7 +993,7 @@ impl Lowerer<'_> {
                 None if let Some(node) = UiNode::from_name(name) => {
                     return self.ui(node, args, children, ty);
                 }
-                Some(Resolution::Builtin(builtin)) if builtin == "listOf" => {
+                Some(Resolution::Builtin(builtin)) if builtin == "listOf" || builtin == "setOf" => {
                     let args = self.exprs(args);
                     let element = list_element(&ty);
                     let callee_ty = Type::Fun(
@@ -1494,9 +1494,12 @@ pub fn client_functions(program: &CoreProgram, component: &str) -> Vec<String> {
 }
 
 /// The element type of `List<T>`.
+/// The element type of a `List<T>` or `Set<T>`.
 fn list_element(ty: &Type) -> Type {
     match ty {
-        Type::Con(name, args) if name == "List" && args.len() == 1 => args[0].clone(),
+        Type::Con(name, args) if (name == "List" || name == "Set") && args.len() == 1 => {
+            args[0].clone()
+        }
         _ => Type::Error,
     }
 }
@@ -1842,6 +1845,22 @@ pub(crate) mod tests {
         assert_eq!(
             body("fun f() = listOf(1, 2)", "f"),
             "Call(Builtin(listOf[Int]), [Lit(1), Lit(2)])"
+        );
+        assert_eq!(
+            body("fun f() = setOf(3, 1)", "f"),
+            "Call(Builtin(setOf[Int]), [Lit(3), Lit(1)])"
+        );
+        assert_eq!(
+            body("fun f(m: Map<String, Int>) = put(m, \"a\", 1)", "f"),
+            "Call(Builtin(put[String, Int]), [Local(0), Lit(\"a\"), Lit(1)])"
+        );
+        assert_eq!(
+            body("fun f(m: Map<String, Int>) = values(m)", "f"),
+            "Call(Builtin(values[String, Int]), [Local(0)])"
+        );
+        assert_eq!(
+            body("fun f(): Set<Int> = emptySet()", "f"),
+            "Call(Builtin(emptySet[Int]), [])"
         );
     }
 

@@ -68,6 +68,37 @@ such type (directly, through a wrapper such as `data class W(val h: H)`, or in o
 class) does not support equality (E7301). The type's own parameters do not count, because they are
 checked through the type arguments: `Box<Int>` supports `==`, `Box<(Int) -> Int>` does not.
 
+### `Key`: set elements and map keys
+
+`Key` is a closed constraint off the operator chain: the element type of a `Set<T>` and the key type
+of a `Map<K, V>` must satisfy it.
+
+| Constraint | Accepted types |
+|---|---|
+| `Key` | {Int, String, Email, Url, Boolean, UUID, Decimal, Money, Date, DateTime, Instant}, every `enum class`, and every `distinct type` over a `Key` type (directly or through another distinct type) |
+
+`Double`, `Float`, `Long`, `Duration`, records, sealed classes, lists, sets, maps, options, functions
+and type parameters are not `Key`. The requirement is checked where `Set`/`Map` types are written
+(signatures, `val` annotations and the fields of declared types) and where the collection builtins
+are instantiated (`setOf`, `insert`, `put`, …). A type parameter never satisfies `Key`, so
+`fun <T> f(s: Set<T>)` and `data class B<T>(val s: Set<T>)` are rejected. A variable that must
+satisfy both `Key` and an operator constraint gets their intersection: `Key` and `<` accept
+{Int, Decimal, Money, String, Date, DateTime, Instant}; `Key` and `+` {Int, Decimal, Money,
+String}; `Key` and `-` {Int, Decimal, Money}; `Key` and `*`/`/` {Int, Decimal}. As with the operator
+constraints, a `Key` variable is never generalized nor defaulted: `fun f() = emptySet()` and
+`val s = emptySet()` are ambiguous (E7302) until annotated (`val s: Set<Int> = emptySet()`).
+
+An unsatisfied `Key` is E7301, the code of every unsatisfied closed constraint:
+"`Double` does not support use as a set element or map key (accepted types: …)". A written type is
+reported once, at its annotation; the uses of the value do not repeat it.
+
+The canonical order of the keys, the same in the evaluator and both runtimes: numeric for `Int`;
+numeric by value for `Decimal` and `Money` (`1.0` and `1.00` are the same key, as are `0` and `-0`);
+by Unicode code point for `String`, `Email`, `Url` and `UUID` (canonical lowercase text, so also the
+order of its 128 bits); the typed temporal order for `Date`, `DateTime` and `Instant`
+(`core::display::compare_temporal`, never the text order); the declaration order of the variants
+for an `enum class`; `false < true`; a distinct type orders as the type it wraps.
+
 `?:` is right-associative: `a ?: b ?: c` is `a ?: (b ?: c)`, so
 `fun f(a: Int?, b: Int?): Int = a ?: b ?: 0` type-checks.
 
@@ -102,6 +133,24 @@ several do, E7104 if none).
 Built-in functions: `first(xs): T?`, `get(xs, i): T?`, `length(xs): Int`, `map(xs, f): List<U>`,
 `fold(xs, init, f): A` with `f: (A, T) -> A`, `emptyList(): List<T>`, and the variadic `listOf(…)`.
 A name declared by the program takes precedence over them.
+
+Collection builtins (all pure and immutable: each returns a new collection; `T` and `K` must
+satisfy `Key`):
+
+| `Set<T>` | `Map<K, V>` |
+|---|---|
+| `setOf(a, b, …): Set<T>` (variadic) | `emptyMap(): Map<K, V>` |
+| `emptySet(): Set<T>` | `put(m, k, v): Map<K, V>` |
+| `insert(s, x): Set<T>` | `lookup(m, k): V?` |
+| `remove(s, x): Set<T>` | `removeKey(m, k): Map<K, V>` |
+| `contains(s, x): Boolean` | `keys(m): List<K>` (canonical order) |
+| `setSize(s): Int` | `values(m): List<V>` (in the order of their keys) |
+| `toList(s): List<T>` (canonical order) | `mapSize(m): Int` |
+
+`setOf(a, b, …)` inserts its arguments left to right. Inserting an element equal to one already in
+the set keeps the existing one (and the set); `put` with a key equal to one already in the map
+replaces the value and keeps the existing key (putting the `Decimal` key `1.00` into a map that holds
+`1.0` keeps the key `1.0`); `remove` and `removeKey` of an absent element return the collection unchanged.
 
 Without mutation the value restriction is unnecessary: every `val` is generalized.
 
