@@ -472,6 +472,21 @@ fn lower_and_check(
             &typed_problems,
         ));
     }
+    // The `ssr` page renders in a read-only transaction: a page that reaches a database write
+    // is refused here, with the same message generation would give.
+    if matches!(backend, Backend::RustWeb(_))
+        && target_config.mode == Some(Mode::Ssr)
+        && let Some(component) = program
+            .functions
+            .iter()
+            .find(|function| function.domain == Domain::Client && function.component)
+    {
+        server_diagnostics.extend(
+            crate::backend::rust::ssr_page_problems(&core, &component.name)
+                .into_iter()
+                .map(|problem| Diagnostic::error("E8311", problem, component.span.clone())),
+        );
+    }
     diagnostics.extend(server_diagnostics);
     (!has_errors(diagnostics)).then_some(core)
 }

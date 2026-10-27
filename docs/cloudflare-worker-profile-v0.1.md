@@ -64,7 +64,7 @@ Only the final Cloudflare/V8 step translates portable Wasm instructions to physi
 
 ## Certification
 
-`bind certify` verifies the whole application, generates the project, asks Node to parse every JavaScript module, validates `app.wasm` with the WebAssembly engine, hashes every deployable artifact, and records both the Wasm and JavaScript runtime hashes in the target lock and manifest. It does not invoke Cargo or rustc.
+`bind certify` verifies the whole application, generates the project, asks Node to parse every JavaScript module, validates `app.wasm` with the WebAssembly engine, hashes every deployable artifact, records the Wasm and every artifact hash in the manifest, and pins the JavaScript runtime hash in the target lock (`.bind/locks/<target>.lock`), so editing the program does not invalidate the lock. It does not invoke Cargo or rustc.
 
 The output is deployable with:
 

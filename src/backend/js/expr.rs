@@ -806,9 +806,13 @@ impl Generator<'_, '_> {
             )
         };
         let code = match op {
-            IntAdd | DoubleAdd | StringConcat => infix("+"),
-            IntSub | DoubleSub => infix("-"),
-            IntMul | DoubleMul => infix("*"),
+            // `Int` results above the runtime's bound throw Overflow, as in Rust and the evaluator.
+            IntAdd => Some(runtime("intAdd", true)),
+            IntSub => Some(runtime("intSub", true)),
+            IntMul => Some(runtime("intMul", true)),
+            DoubleAdd | StringConcat => infix("+"),
+            DoubleSub => infix("-"),
+            DoubleMul => infix("*"),
             DoubleDiv => infix("/"),
             IntNeg | DoubleNeg => unary(&|a| Code::complex(format!("-{}", a.wrapped()), pure)),
             IntDivChecked => Some(runtime("intDiv", false)),
@@ -1274,7 +1278,7 @@ mod tests {
         let function = program.functions.first().expect("function");
         assert_eq!(
             super::function(function, &program),
-            "async function u_f(ctx, u_x_0) {\nctx = await rt.enter(ctx);\nreturn (u_x_0 * u_x_0) + 1n;\n}\n"
+            "async function u_f(ctx, u_x_0) {\nctx = await rt.enter(ctx);\nreturn rt.intAdd(rt.intMul(u_x_0, u_x_0), 1n);\n}\n"
         );
     }
 

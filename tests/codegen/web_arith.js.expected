@@ -46,7 +46,7 @@ async function u_duplo(ctx, u_x_0) {
 
 async function u_grande(ctx, u_x_0) {
     ctx = await rt.enter(ctx);
-    return (u_x_0 * 123456789012345678901234567890n) + 1n;
+    return rt.intAdd(rt.intMul(u_x_0, 123456789012345678901234567890n), 1n);
 }
 
 async function u_simples(ctx, u_x_0) {

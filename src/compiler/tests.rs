@@ -1862,3 +1862,27 @@ fn symbolic_links_in_the_source_directory_are_refused() {
     assert!(result.diagnostics[0].message.contains("Symbolic link"));
     fs::remove_dir_all(root).unwrap();
 }
+
+/// The `ssr` page renders in a read-only transaction: a component that reaches a database
+/// write is refused by `verify` (not only by generation); the `split` page may call it.
+#[test]
+fn ssr_pages_that_write_are_refused_at_verification() {
+    let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun criar(nome: String): Customer effects [db.read, db.write] {\n    val novo = db.customers.insert {\n        name = nome\n    }\n    return db.customers.require(novo.id)\n}\nclient component Novo(nome: String) {\n    val c = server.criar(nome)\n    UI { Text(c.name) }\n}\n";
+    let check = |target: &str| {
+        let (root, config) = web_fixture(source, target);
+        fs::write(root.join("schema.csv"), SCHEMA).unwrap();
+        let result = verify(&config, "t");
+        fs::remove_dir_all(root).unwrap();
+        result
+    };
+    let ssr = check(WEB_SSR);
+    assert!(ssr.application.is_none());
+    assert_eq!(codes(&ssr), vec!["E8311"], "{:?}", ssr.diagnostics);
+    assert!(
+        ssr.diagnostics[0].message.contains("`criar`"),
+        "{:?}",
+        ssr.diagnostics
+    );
+    let split = check(WEB_SPLIT);
+    assert!(split.diagnostics.is_empty(), "{:?}", split.diagnostics);
+}

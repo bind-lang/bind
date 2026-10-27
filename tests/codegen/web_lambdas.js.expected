@@ -8,7 +8,7 @@ async function u_Listas(ctx, u_n_0) {
     ctx = await rt.enter(ctx);
     return rt.node("UI", [], rt.listOf(rt.text(rt.intToString(await u_f(ctx, rt.listOf(u_n_0, 2n, 3n)))), rt.text(rt.intToString(await u_usaIgnora(ctx))), rt.text(rt.intToString(await u_primeiro(ctx, await u_talvez(ctx, null)))), rt.text(rt.intToString(await u_indice(ctx, await u_soma(ctx, await u_dobra(ctx, rt.listOf(1n, 2n)), u_n_0), 1n))), rt.text(rt.intToString(await u_aplica(ctx, u_dobro, u_n_0))), rt.text(rt.intToString(await rt.fold(ctx, await u_tamanhos(ctx, rt.listOf(rt.listOf(1n, 2n), rt.listOf(u_n_0))), 0n, async (ctx, u_s_1, u_x_2) => {
         ctx = await rt.enter(ctx);
-        return u_s_1 + u_x_2;
+        return rt.intAdd(u_s_1, u_x_2);
     })))));
 }
 
@@ -24,17 +24,17 @@ async function u_dobra(ctx, u_xs_0) {
 
 async function u_dobro(ctx, u_x_0) {
     ctx = await rt.enter(ctx);
-    return u_x_0 * 2n;
+    return rt.intMul(u_x_0, 2n);
 }
 
 async function u_f(ctx, u_xs_0) {
     ctx = await rt.enter(ctx);
     return await rt.fold(ctx, await rt.map(ctx, u_xs_0, async (ctx, u_x_1) => {
         ctx = await rt.enter(ctx);
-        return u_x_1 * 2n;
+        return rt.intMul(u_x_1, 2n);
     }), 0n, async (ctx, u_s_2, u_x_3) => {
         ctx = await rt.enter(ctx);
-        return u_s_2 + u_x_3;
+        return rt.intAdd(u_s_2, u_x_3);
     });
 }
 
@@ -89,7 +89,7 @@ async function u_soma(ctx, u_xs_0, u_k_1) {
     ctx = await rt.enter(ctx);
     return await rt.map(ctx, u_xs_0, async (ctx, u_x_2) => {
         ctx = await rt.enter(ctx);
-        return u_x_2 + u_k_1;
+        return rt.intAdd(u_x_2, u_k_1);
     });
 }
 

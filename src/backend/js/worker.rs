@@ -233,7 +233,6 @@ return env.ASSETS.fetch(request);
 /// boots with one), so no `'unsafe-inline'` is needed. `api_origin` is the API's origin when the
 /// frontend calls it cross-origin (`connect-src`).
 // Wired into `public/_headers` by the Cloudflare generator (`src/cloudflare.rs`).
-#[allow(dead_code)]
 pub fn asset_headers(index_html: &str, api_origin: Option<&str>) -> String {
     let mut scripts = vec!["'self'".to_string()];
     let mut rest = index_html;
@@ -263,7 +262,6 @@ pub fn asset_headers(index_html: &str, api_origin: Option<&str>) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::new();

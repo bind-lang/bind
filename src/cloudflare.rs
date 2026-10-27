@@ -85,6 +85,20 @@ pub fn generate(
             .ok_or_else(|| format!("Unexpected web artifact `{path}`"))?;
         files.push((public, content));
     }
+    // The page boots from an inline module script: the CSP allows exactly that script by hash.
+    let index = files
+        .iter()
+        .find(|(path, _)| path == "public/index.html")
+        .map(|(_, content)| content.clone())
+        .unwrap_or_default();
+    let api_origin = target_config
+        .api_url
+        .strip_suffix("/api")
+        .filter(|origin| !origin.is_empty());
+    files.push((
+        "public/_headers".to_string(),
+        crate::backend::js::worker::asset_headers(&index, api_origin),
+    ));
 
     // Compute every file before replacing the previous output. A generation failure therefore
     // leaves the last successful project available.

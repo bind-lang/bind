@@ -187,7 +187,7 @@ async function u_numeros(ctx, u_xs_0) {
     ctx = await rt.enter(ctx);
     return await rt.fold(ctx, u_xs_0, 0n, async (ctx, u_s_1, u_x_2) => {
         ctx = await rt.enter(ctx);
-        return (u_s_1 * 100n) + u_x_2;
+        return rt.intAdd(rt.intMul(u_s_1, 100n), u_x_2);
     });
 }
 
