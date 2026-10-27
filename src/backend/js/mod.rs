@@ -17,6 +17,7 @@ pub mod expr;
 pub mod names;
 pub mod page;
 pub mod plan;
+pub mod worker;
 
 use crate::core::ir::CoreProgram;
 

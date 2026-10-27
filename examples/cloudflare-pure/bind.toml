@@ -1,0 +1,21 @@
+[project]
+name = "bind-cloudflare-example"
+version = "0.1.0"
+source = "src"
+output = ".bind/generated"
+
+[compiler]
+warnings_as_errors = true
+
+[web]
+title = "Bind on Cloudflare"
+description = "A Bind application compiled directly to WebAssembly for Cloudflare Workers."
+language = "en"
+
+[target.cloudflare]
+client = "web"
+server = "wasm"
+mode = "split"
+deployment = "cloudflare-workers"
+certified = true
+capabilities = ["ui.dom", "server.http"]

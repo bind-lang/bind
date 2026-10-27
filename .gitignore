@@ -1,5 +1,6 @@
 /target/
 /.bind/
+**/.bind/
 .DS_Store
 
 /runtime/bind-runtime/target/

@@ -6,9 +6,11 @@ Bind is a new whole-application language and compiler, not a wrapper around a ha
 
 Repository: <https://github.com/bind-lang/bind>
 
-## Certified profiles
+## Execution profiles
 
 The current profile is `rust-web-v4` ([certified profile v0.4](docs/certified-profile-v0.4.md)): the type checker lowers the program to a typed core IR, and the Rust server, the Rust SSR renderer and the native HTML/CSS/JS frontend are all generated from that IR alone. Every analysis after parsing works on that IR too: the application graph, the database operations and the secret-flow, insert, column-type and return checks are computed by `core::analysis`, and no token is read outside the lexer and the parser. Sealed classes with fields, instantiated generics, `Result`, `Set` and `Map` cross the wire (`bind-json-v4`); `Set` and `Map` have immutable builtins (`setOf`, `insert`, `put`, `lookup`, …) over `Key` types, with the same canonical order in the evaluator, Rust and JS. A target chooses `mode = "ssr"` (the Rust server renders the page, one transaction per page) or `mode = "split"` (static `web/` calling the API, one transaction per RPC), on AWS Lambda or Vercel. `Int` is exact in the frontend (`BigInt`), and overflow or deep recursion become typed errors instead of panics. Both modes show the same page for every program and input. The previous profile is kept in docs: [v0.3](docs/certified-profile-v0.3.md) (`rust-web-v3`); earlier profiles are no longer supported.
+
+The experimental `cloudflare-worker-wasm-v1` profile ([Cloudflare profile](docs/cloudflare-worker-profile-v0.1.md)) lowers the same typed IR directly to a compiler-owned `app.wasm`, a thin Cloudflare Worker host, and static assets. Bind writes WebAssembly Binary Format itself: no generated Rust, LLVM, WAT toolchain, `wasm-bindgen`, or Cargo target. The first exact slice supports pure non-recursive computation over `Boolean`, `Float`, `Double`, and `Unit`; everything else is rejected at compile time rather than weakened.
 
 The overall shape is:
 
@@ -20,8 +22,9 @@ Bind source (.bind or .bd)
         │       └── Vercel Rust Functions
         │
         ├── Rust SSR (mode = "ssr")
+        ├── HTML/CSS/JS frontend, native ES modules (mode = "split")
         │
-        └── HTML/CSS/JS frontend, native ES modules (mode = "split")
+        └── Bind WebAssembly + Cloudflare host + assets (no generated Rust/LLVM)
 ```
 
 ### Target configuration
@@ -46,6 +49,20 @@ The compiler owns all generated dependencies and pins them. Certified applicatio
 
 Vercel's Rust runtime is currently Beta. Bind treats that as a deployment-platform limitation, not as a silently stronger guarantee.
 
+A Cloudflare Workers target uses Bind's direct WebAssembly backend plus a minimal JavaScript host:
+
+```toml
+[target.cloudflare]
+client = "web"
+server = "wasm"
+mode = "split"
+deployment = "cloudflare-workers"
+certified = true
+capabilities = ["ui.dom", "server.http"]
+```
+
+Cloudflare executes the generated precompiled Wasm module in V8. The JavaScript adapter remains responsible only for Fetch, JSON, assets, and future asynchronous Cloudflare bindings.
+
 ## Quick start
 
 Required tool is Rust 1.98.0. The generated frontend needs no npm or bundler; `node` is only used by some tests.
@@ -55,9 +72,10 @@ cargo test
 DATABASE_URL=postgresql://bind:bind@localhost/bind cargo run -- check --target aws-lambda-ssr
 DATABASE_URL=postgresql://bind:bind@localhost/bind cargo run -- certify --target aws-lambda-split
 DATABASE_URL=postgresql://bind:bind@localhost/bind cargo run -- certify --target vercel-ssr
+cargo run -- certify --manifest examples/cloudflare-pure/bind.toml --target cloudflare
 ```
 
-`certify` performs semantic verification, generates target code, resolves locked dependency graphs, runs generated Rust tests, rejects every Rust warning through Clippy, builds release binaries, and hashes the result.
+For Rust targets, `certify` performs semantic verification, resolves locked dependency graphs, runs generated Rust tests, rejects every Rust warning through Clippy, builds release binaries, and hashes the result. For Cloudflare, it generates and validates `app.wasm`, validates every JavaScript host module, and hashes the deployable artifacts without invoking Cargo or rustc.
 
 Generated workspaces are placed under `.bind/generated/<target>/`; target resolution attestations are placed under `.bind/locks/`.
 
@@ -124,7 +142,15 @@ vercel build
 vercel deploy
 ```
 
-Neither command is run automatically because both require the user's cloud account and may create remote resources.
+Cloudflare generation includes `app.wasm`, `worker.js`, `wrangler.jsonc`, the shared runtime module and `public/` assets:
+
+```sh
+cargo run -- certify --manifest examples/cloudflare-pure/bind.toml --target cloudflare
+cd examples/cloudflare-pure/.bind/generated/cloudflare
+npx wrangler deploy
+```
+
+Deployment commands are not run automatically because they require the user's cloud account and may create remote resources.
 
 ## What the certified profile proves
 
@@ -139,6 +165,6 @@ Neither command is run automatically because both require the user's cloud accou
 - target capability negotiation before generation;
 - deterministic SHA-256 source, schema, lockfile, and artifact attestations.
 
-No compiler can prove database availability, future uniqueness conflicts, network availability, or a cloud provider's uptime. `certified-host` in the manifest means the generated project passed the local certified toolchain; the cloud-native builders still produce the final Linux deployment artifact.
+No compiler can prove database availability, future uniqueness conflicts, network availability, or a cloud provider's uptime. `certified-host` in the manifest means the generated project passed the local certified toolchain. Rust targets still rely on cloud-native builders for the final Linux artifact; the Cloudflare target ships its already validated Wasm module through Wrangler.
 
-The exact supported subset and rejection policy are specified in the [certified profile v0.4](docs/certified-profile-v0.4.md) (previous: [v0.3](docs/certified-profile-v0.3.md)). The implementation architecture is described in [architecture](docs/architecture.md).
+The exact supported subsets and rejection policies are specified in the [certified Rust profile v0.4](docs/certified-profile-v0.4.md), the [Cloudflare Worker profile v0.1](docs/cloudflare-worker-profile-v0.1.md), and [architecture](docs/architecture.md).

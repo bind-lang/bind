@@ -49,7 +49,7 @@ pub fn function(function: &CoreFunction, program: &CoreProgram) -> String {
 }
 
 /// One function; codec helpers are added to `codecs`.
-pub(super) fn function_with<'p>(
+pub(crate) fn function_with<'p>(
     function: &CoreFunction,
     program: &'p CoreProgram,
     codecs: &mut Codecs<'p>,

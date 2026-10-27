@@ -2,6 +2,7 @@ mod ast;
 mod backend;
 mod certified;
 mod cli;
+mod cloudflare;
 mod compiler;
 mod config;
 mod core;

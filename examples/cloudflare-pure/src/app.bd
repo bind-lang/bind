@@ -1,0 +1,19 @@
+package examples.cloudflare
+
+server fun double(value: Double): Double effects [] = value * 2.0
+
+client component Home() {
+    val answer = server.double(21.0)
+
+    UI {
+        Main("cloudflare-example") {
+            Heading(1, "Bind on Cloudflare")
+            Paragraph {
+                Text("The answer is ")
+                Strong {
+                    Text(answer)
+                }
+            }
+        }
+    }
+}

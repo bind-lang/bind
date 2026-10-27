@@ -41,7 +41,12 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 .targets
                 .get(&target)
                 .ok_or_else(|| format!("Target `{target}` is not declared"))?;
-            let generated = certified::generate(&app, &config, output.as_deref())?;
+            let cloudflare = crate::cloudflare::is_target(target_config);
+            let generated = if cloudflare {
+                crate::cloudflare::generate(&app, &config, output.as_deref())?
+            } else {
+                certified::generate(&app, &config, output.as_deref())?
+            };
             if args.iter().any(|arg| arg == "--emit-ir") {
                 std::fs::write(
                     generated.join("verified-application.ir.json"),
@@ -68,37 +73,66 @@ pub fn run(args: Vec<String>) -> Result<(), String> {
                 } else {
                     BuildMode::Build
                 };
-                let report = pipeline::build(&generated, &app, &config, target_config, mode)?;
-                println!(
-                    "✓ Parsed {} module(s)\n✓ Whole-application verification\n✓ Rust target compilation and tests\n{}✓ Artifact hashing and lockfile\n\nApplication {} successfully.\nManifest: {}\nTarget lock: {}\nWeb:\n  {}\nRust artifacts:\n  {}\nCargo lock: {}\nJS runtime: {}",
-                    result.module_count,
-                    if mode == BuildMode::Certify {
-                        "✓ Rust lint policy\n"
-                    } else {
-                        ""
-                    },
-                    if mode == BuildMode::Certify {
-                        "certified"
-                    } else {
-                        "built"
-                    },
-                    report.manifest.display(),
-                    report.target_lock.display(),
-                    report
-                        .web_artifacts
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n  "),
-                    report
-                        .rust_artifacts
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n  "),
-                    report.cargo_lock_hash,
-                    report.js_runtime_hash.as_deref().unwrap_or("not shipped")
-                );
+                if cloudflare {
+                    let report =
+                        crate::cloudflare::build(&generated, &app, &config, target_config, mode)?;
+                    println!(
+                        "✓ Parsed {} module(s)\n✓ Whole-application verification\n✓ Direct Bind IR → WebAssembly generation (no Rust target or LLVM)\n{}✓ Artifact hashing and lockfile\n\nApplication {} successfully.\nManifest: {}\nTarget lock: {}\nWorker artifacts:\n  {}\nWasm module: {}\nJS runtime: {}",
+                        result.module_count,
+                        if mode == BuildMode::Certify {
+                            "✓ Generated JavaScript and WebAssembly validation\n"
+                        } else {
+                            ""
+                        },
+                        if mode == BuildMode::Certify {
+                            "certified"
+                        } else {
+                            "built"
+                        },
+                        report.manifest.display(),
+                        report.target_lock.display(),
+                        report
+                            .artifacts
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n  "),
+                        report.wasm_hash,
+                        report.js_runtime_hash,
+                    );
+                } else {
+                    let report = pipeline::build(&generated, &app, &config, target_config, mode)?;
+                    println!(
+                        "✓ Parsed {} module(s)\n✓ Whole-application verification\n✓ Rust target compilation and tests\n{}✓ Artifact hashing and lockfile\n\nApplication {} successfully.\nManifest: {}\nTarget lock: {}\nWeb:\n  {}\nRust artifacts:\n  {}\nCargo lock: {}\nJS runtime: {}",
+                        result.module_count,
+                        if mode == BuildMode::Certify {
+                            "✓ Rust lint policy\n"
+                        } else {
+                            ""
+                        },
+                        if mode == BuildMode::Certify {
+                            "certified"
+                        } else {
+                            "built"
+                        },
+                        report.manifest.display(),
+                        report.target_lock.display(),
+                        report
+                            .web_artifacts
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n  "),
+                        report
+                            .rust_artifacts
+                            .iter()
+                            .map(|path| path.display().to_string())
+                            .collect::<Vec<_>>()
+                            .join("\n  "),
+                        report.cargo_lock_hash,
+                        report.js_runtime_hash.as_deref().unwrap_or("not shipped")
+                    );
+                }
             }
         }
         "graph" => {

@@ -322,7 +322,7 @@ fn require_non_empty(path: &Path) -> Result<(), String> {
     }
 }
 
-fn hash_file(path: &Path) -> Result<String, String> {
+pub(crate) fn hash_file(path: &Path) -> Result<String, String> {
     let bytes =
         fs::read(path).map_err(|error| format!("Cannot hash {}: {error}", path.display()))?;
     Ok(hash_bytes(&bytes))

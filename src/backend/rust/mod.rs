@@ -281,7 +281,7 @@ pub const PROGRAM_MODULE: &str = "app";
 
 /// The endpoints and the program functions reachable from them through `Global` references,
 /// ordered by name.
-fn reachable<'p>(
+pub(crate) fn reachable<'p>(
     program: &'p CoreProgram,
     endpoints: &[&'p CoreFunction],
 ) -> Vec<&'p CoreFunction> {
