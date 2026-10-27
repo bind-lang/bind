@@ -92,7 +92,7 @@ pub fn build(
     locks.require_present(&locks.target, options)?;
     locks.require_present(&locks.cargo, options)?;
 
-    check_no_project_cargo_config(&config.root, generated)?;
+    check_no_project_build_config(&config.root, generated)?;
     let environment = CargoEnvironment::new(config, app);
     ensure_tool(
         environment.command("cargo", generated).arg("--version"),
@@ -416,12 +416,14 @@ fn is_cargo_override(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-/// Refuses a Cargo configuration file (`.cargo/config` or `.cargo/config.toml`) inside the
-/// project on the way to the generated workspace: Cargo reads every such file in the ancestors
-/// of the directory it runs in, and one shipped with the project could set a `rustc` wrapper,
-/// a linker, a runner or a source replacement. The user's own configuration (`$CARGO_HOME`
-/// and the directories above the project) is theirs and stays trusted.
-fn check_no_project_cargo_config(root: &Path, generated: &Path) -> Result<(), String> {
+/// Refuses a Cargo configuration file (`.cargo/config` or `.cargo/config.toml`) or a rustup
+/// toolchain file (`rust-toolchain`, `rust-toolchain.toml`) inside the project on the way to
+/// the generated workspace: Cargo and rustup read them in the ancestors of the directory they
+/// run in, and one shipped with the project could set a `rustc` wrapper, a linker, a runner, a
+/// source replacement or a toolchain `path` to arbitrary binaries. The user's own configuration
+/// (`$CARGO_HOME`, `$RUSTUP_HOME` and the directories above the project) is theirs and stays
+/// trusted.
+fn check_no_project_build_config(root: &Path, generated: &Path) -> Result<(), String> {
     // A manifest named without a directory (`bind.toml`) has the empty path as its root.
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
@@ -435,11 +437,16 @@ fn check_no_project_cargo_config(root: &Path, generated: &Path) -> Result<(), St
         .canonicalize()
         .map_err(|error| format!("Cannot resolve {}: {error}", generated.display()))?;
     for directory in generated.ancestors() {
-        for name in ["config", "config.toml"] {
-            let file = directory.join(".cargo").join(name);
+        let candidates = [
+            directory.join(".cargo/config"),
+            directory.join(".cargo/config.toml"),
+            directory.join("rust-toolchain"),
+            directory.join("rust-toolchain.toml"),
+        ];
+        for file in candidates {
             if fs::symlink_metadata(&file).is_ok() {
                 return Err(format!(
-                    "Refusing to build: {} would change how Cargo compiles the generated workspace. Certified builds do not read Cargo configuration from the project; remove it.",
+                    "Refusing to build: {} would change how the generated workspace is compiled. Certified builds do not read Cargo or toolchain configuration from the project; remove it.",
                     file.display()
                 ));
             }
@@ -933,15 +940,15 @@ mod tests {
     }
 
     #[test]
-    fn cargo_configuration_from_the_project_is_refused() {
+    fn build_configuration_from_the_project_is_refused() {
         let root = std::env::temp_dir().join(format!("bindc-cargo-config-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let generated = root.join(".bind/generated/t");
         fs::create_dir_all(&generated).unwrap();
-        assert!(check_no_project_cargo_config(&root, &generated).is_ok());
+        assert!(check_no_project_build_config(&root, &generated).is_ok());
         // The root of a manifest named without a directory is the empty path.
         let current = std::env::current_dir().unwrap();
-        assert!(check_no_project_cargo_config(Path::new(""), &current).is_ok());
+        assert!(check_no_project_build_config(Path::new(""), &current).is_ok());
         for directory in [root.clone(), root.join(".bind"), generated.clone()] {
             fs::create_dir_all(directory.join(".cargo")).unwrap();
             fs::write(
@@ -949,9 +956,19 @@ mod tests {
                 "[build]\nrustc-wrapper = \"x\"\n",
             )
             .unwrap();
-            let error = check_no_project_cargo_config(&root, &generated).unwrap_err();
+            let error = check_no_project_build_config(&root, &generated).unwrap_err();
             assert!(error.contains("config.toml"), "{error}");
             fs::remove_dir_all(directory.join(".cargo")).unwrap();
+            for toolchain in ["rust-toolchain", "rust-toolchain.toml"] {
+                fs::write(
+                    directory.join(toolchain),
+                    "[toolchain]\npath = \"/tmp/x\"\n",
+                )
+                .unwrap();
+                let error = check_no_project_build_config(&root, &generated).unwrap_err();
+                assert!(error.contains(toolchain), "{error}");
+                fs::remove_file(directory.join(toolchain)).unwrap();
+            }
         }
         assert!(is_cargo_override(
             "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
