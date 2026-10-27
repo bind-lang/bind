@@ -15,13 +15,15 @@
 //! duplicates. Anything else the generated code does not model in memory (database, `Decimal`
 //! arithmetic, durations, environment values, server calls) is `EvalError::Unsupported`.
 //!
-//! Strings, list items, constructor fields and UI children are shared (`Arc`), so copying a
-//! value (reading a local, capturing an environment) costs no more than a few pointers, and a
-//! value nested to any depth is dropped iteratively ([`Shared`]).
+//! Strings, list items, constructor fields, UI children and a closure's parts (parameters,
+//! body, captured locals) are shared (`Arc`), so copying a value costs a few pointers (an
+//! `Int` copies its limbs, which the budget charges), and a value nested to any depth is
+//! dropped iteratively ([`Shared`]). A closure captures only the locals its body reads: an
+//! environment is never copied whole, so closures that capture closures stay linear in size.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
@@ -81,11 +83,12 @@ pub enum Value {
         keys: Shared,
         values: Shared,
     },
-    /// Captures its environment by value.
+    /// Captures, by value, the locals its body uses. Every part is shared: copying a closure
+    /// copies three pointers (a closure inside `env` is not copied again).
     Closure {
-        params: Vec<LocalId>,
+        params: Arc<[LocalId]>,
         body: Arc<Expr>,
-        env: BTreeMap<LocalId, Value>,
+        env: Arc<Env>,
     },
     Function(String),
     /// A builtin function; `key` is its first instance type (the element or key type of the
@@ -94,10 +97,11 @@ pub enum Value {
         name: String,
         key: Option<Type>,
     },
-    /// A UI node; `args` are `Str` or `Int` values and `children` are `Ui` values.
+    /// A UI node; `args` are its `String` and `Int` arguments (an `Int` as its decimal text,
+    /// computed once) and `children` are `Ui` values.
     Ui {
         node: UiNode,
-        args: Vec<Value>,
+        args: Vec<UiArgValue>,
         children: Shared,
     },
 }
@@ -145,14 +149,17 @@ impl Drop for Shared {
                         }
                     }
                 }
-                Value::Ui { args, children, .. } => {
-                    pending.append(args);
+                Value::Ui { children, .. } => {
                     if let Some(items) = Arc::get_mut(&mut children.0) {
                         pending.append(items);
                     }
                 }
                 Value::Some(inner) => pending.push(std::mem::replace(&mut **inner, Value::Unit)),
-                Value::Closure { env, .. } => pending.extend(std::mem::take(env).into_values()),
+                Value::Closure { env, .. } => {
+                    if let Some(env) = Arc::get_mut(env) {
+                        pending.extend(std::mem::take(env).into_values());
+                    }
+                }
                 _ => {}
             }
         }
@@ -244,6 +251,14 @@ impl Value {
     }
 }
 
+/// An argument of a [`Value::Ui`]: a `String`, or an `Int` as its decimal digits (converted
+/// once, when the node is built: a subtree shared many times is rendered many times).
+#[derive(Clone, Debug)]
+pub enum UiArgValue {
+    Str(Arc<str>),
+    Int(Arc<str>),
+}
+
 /// Evaluation only builds well-formed UI nodes (`Str` or `Int` arguments, `Ui` children); any
 /// other value renders as nothing.
 impl UiView for Value {
@@ -258,11 +273,10 @@ impl UiView for Value {
         let Value::Ui { args, .. } = self else {
             return None;
         };
-        match args.get(index)? {
-            Value::Str(text) => Some(UiArgView::Str(text)),
-            Value::Int(value) => Some(UiArgView::Int(Cow::Owned(value.to_string()))),
-            _ => None,
-        }
+        Some(match args.get(index)? {
+            UiArgValue::Str(text) => UiArgView::Str(text),
+            UiArgValue::Int(digits) => UiArgView::Int(Cow::Borrowed(digits)),
+        })
     }
 
     fn ui_children(&self) -> &[Value] {
@@ -317,8 +331,10 @@ pub fn eval_function(
 /// A bound on one evaluation (the compile-time pre-render). `work` counts down one unit per
 /// evaluated expression plus the size of what an operation goes through: the limbs of `Int`
 /// arithmetic (their product for `*`, `/`, `%` and for the decimal text), a 64th of the bytes of
-/// a concatenation, the locals a closure captures, the children a UI node gets and every pair of
-/// values `==` / `!=` visits. Every other operation takes constant time (values are shared), so
+/// a concatenation, the locals a closure captures (and copies again at each call), a 64th of
+/// the limbs of an `Int` local read, the decimal text of a UI node's `Int` argument (computed
+/// once, however often a shared subtree renders it), the children a UI node gets and every pair
+/// of values `==` / `!=` visits. Every other operation takes constant time (values are shared), so
 /// the whole evaluation does at most a constant times `work` steps. `Int`s have at most
 /// `int_limbs` 32-bit limbs and strings at most `string_bytes` bytes. Past any of them the
 /// evaluation stops with `EvalError::Unsupported("evaluation budget exhausted")`.
@@ -367,6 +383,12 @@ fn run(
             .spawn_scoped(scope, || {
                 let mut interp = Interp {
                     program,
+                    functions: program
+                        .functions
+                        .iter()
+                        .map(|function| (function.name.as_str(), function))
+                        .collect(),
+                    lambdas: HashMap::new(),
                     depth: 0,
                     nesting: 0,
                     budget,
@@ -403,11 +425,41 @@ type Eval = Result<Value, Signal>;
 
 struct Interp<'p> {
     program: &'p CoreProgram,
+    /// The program's functions by name.
+    functions: HashMap<&'p str, &'p CoreFunction>,
+    /// Each lambda of the program evaluated so far (keyed by its body's address in `program`),
+    /// prepared once: its parameters, its shared body and the locals the body uses.
+    lambdas: HashMap<*const Expr, Lambda>,
     depth: usize,
     /// Expressions under evaluation (see [`MAX_NESTING`]).
     nesting: usize,
     /// The remaining budget, if bounded (`work` counts down).
     budget: Option<Budget>,
+}
+
+/// A lambda of the program, prepared for building closures (see [`Interp::lambdas`]).
+#[derive(Clone)]
+struct Lambda {
+    params: Arc<[LocalId]>,
+    body: Arc<Expr>,
+    /// Every local the body reads, sorted, without repetitions: what a closure captures
+    /// (those bound inside the body are never in scope where the lambda is evaluated).
+    uses: Arc<[LocalId]>,
+}
+
+/// The locals `expr` reads (`Local` nodes), sorted, without repetitions.
+fn used_locals(expr: &Expr) -> Vec<LocalId> {
+    let mut output = Vec::new();
+    let mut pending = vec![expr];
+    while let Some(expr) = pending.pop() {
+        if let ExprKind::Local(id) = expr.kind {
+            output.push(id);
+        }
+        pending.extend(super::specialize::children(expr));
+    }
+    output.sort_unstable();
+    output.dedup();
+    output
 }
 
 fn exhausted() -> EvalError {
@@ -497,21 +549,17 @@ impl Interp<'_> {
     fn call_inner(&mut self, callee: Value, args: Vec<Value>) -> Eval {
         match callee {
             Value::Function(name) => {
-                let function = self
-                    .program
+                let function = *self
                     .functions
-                    .iter()
-                    .find(|function| function.name == name)
+                    .get(name.as_str())
                     .ok_or_else(|| unsupported(&format!("no function `{name}`")))?;
                 let mut env = bind_params(function.params.iter().map(|(id, _, _)| *id), args)?;
                 self.eval(&function.body, &mut env)
             }
-            Value::Closure {
-                params,
-                body,
-                mut env,
-            } => {
-                for (id, value) in bind_params(params.into_iter(), args)? {
+            Value::Closure { params, body, env } => {
+                self.charge(env.len() as u64)?;
+                let mut env = Arc::unwrap_or_clone(env);
+                for (id, value) in bind_params(params.iter().copied(), args)? {
                     env.insert(id, value);
                 }
                 self.eval(&body, &mut env)
@@ -535,7 +583,13 @@ impl Interp<'_> {
     fn eval_nested(&mut self, expr: &Expr, env: &mut Env) -> Eval {
         match &expr.kind {
             ExprKind::Lit(literal) => literal_value(literal, &expr.ty).map_err(Signal::Error),
-            ExprKind::Local(id) => local(env, *id),
+            ExprKind::Local(id) => {
+                // Copying an `Int` copies its limbs (everything else is shared).
+                if let Some(Value::Int(value)) = env.get(id) {
+                    self.charge(value.limb_count() as u64 / 64)?;
+                }
+                local(env, *id)
+            }
             ExprKind::Global { name, .. } => Ok(Value::Function(name.clone())),
             ExprKind::Builtin { name, instance } => Ok(Value::Builtin {
                 name: name.clone(),
@@ -637,11 +691,30 @@ impl Interp<'_> {
 
     #[inline(never)]
     fn lambda(&mut self, params: &[(LocalId, String, Type)], body: &Expr, env: &mut Env) -> Eval {
-        self.charge(env.len() as u64)?;
+        let lambda = match self.lambdas.get(&std::ptr::from_ref(body)) {
+            Some(lambda) => lambda.clone(),
+            None => {
+                // Once per lambda of the program: bounded by the program's size.
+                let lambda = Lambda {
+                    params: params.iter().map(|(id, _, _)| *id).collect(),
+                    body: Arc::new(body.clone()),
+                    uses: used_locals(body).into(),
+                };
+                self.lambdas
+                    .insert(std::ptr::from_ref(body), lambda.clone());
+                lambda
+            }
+        };
+        self.charge(lambda.uses.len() as u64)?;
+        let captured: Env = lambda
+            .uses
+            .iter()
+            .filter_map(|id| env.get(id).map(|value| (*id, value.clone())))
+            .collect();
         Ok(Value::Closure {
-            params: params.iter().map(|(id, _, _)| *id).collect(),
-            body: Arc::new(body.clone()),
-            env: env.clone(),
+            params: lambda.params,
+            body: lambda.body,
+            env: Arc::new(captured),
         })
     }
 
@@ -699,6 +772,20 @@ impl Interp<'_> {
         {
             return Err(not_modelled("UI argument that is", bad.kind()).into());
         }
+        let mut texts = Vec::with_capacity(args.len());
+        for arg in args {
+            texts.push(match arg {
+                Value::Int(value) => {
+                    // The cost of `DisplayInt`, paid once for every render of the node.
+                    let size = value.limb_count().max(1) as u64;
+                    self.charge(size * size / 8)?;
+                    UiArgValue::Int(value.to_string().into())
+                }
+                Value::Str(text) => UiArgValue::Str(text),
+                _ => unreachable!("checked above"),
+            });
+        }
+        let args = texts;
         let children = match self.eval(children, env)? {
             Value::List(items) => items,
             other => return Err(not_modelled("UI children in", other.kind()).into()),
@@ -1507,6 +1594,65 @@ mod tests {
         assert_eq!(
             call("aninhado", int("20000")),
             Err(EvalError::RecursionLimit)
+        );
+    }
+
+    /// `n` lambdas in one scope (`fK = { x -> x + K }`), then `f{n-1}(1)`. Each closure once
+    /// captured the whole environment by deep copy, so the last one held 2^n copies: 22 took
+    /// 4 GB, 40 never finished.
+    fn many_lambdas(n: usize) -> String {
+        let mut source = String::from("fun f(): Int {\n");
+        for k in 0..n {
+            source.push_str(&format!(
+                "    val f{k}: (Int) -> Int = {{ x -> x + {k} }}\n"
+            ));
+        }
+        source.push_str(&format!("    return f{}(1)\n}}\n", n - 1));
+        source
+    }
+
+    #[test]
+    fn closures_capture_only_what_they_use_and_stay_linear() {
+        let started = std::time::Instant::now();
+        let program = compile(&many_lambdas(60));
+        let value = eval_function_within(&program, "f", Vec::new(), PRERENDER_BUDGET);
+        assert_eq!(value.map(|value| value.render()), Ok("60".into()));
+        assert_eq!(rendered(&many_lambdas(60), Vec::new()), "60");
+        // Closures that capture closures, and a closure built in one call and run in another.
+        let nested = "fun twice(g: (Int) -> Int): (Int) -> Int = { x -> g(g(x)) }\nfun f(n: Int): Int {\n    val a: (Int) -> Int = { x -> x + n }\n    val b = twice(a)\n    val c = twice(b)\n    val d: (Int) -> Int = { x -> c(x) * b(x) }\n    return fold(map(listOf(1, 2), d), 0, { s, x -> s + x })\n}";
+        // d(1) = (1 + 4n) * (1 + 2n), d(2) = (2 + 4n) * (2 + 2n); n = 1: 15 + 24.
+        assert_eq!(rendered(nested, vec![int("1")]), "39");
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+    }
+
+    #[test]
+    fn int_arguments_of_shared_subtrees_are_converted_once() {
+        // A 1024-limb `Int` as a heading level, in a subtree shared 2^17 times: rendering
+        // converted it to decimal at every visit (over a minute in a release build).
+        let mut source = String::from("fun f(): Ui {\n    val x0 = 2\n");
+        for k in 0..14 {
+            source.push_str(&format!("    val x{} = x{k} * x{k}\n", k + 1));
+        }
+        source.push_str("    val y = x14 * (x14 - 1)\n    val t0 = UI { Heading(y) }\n");
+        for k in 0..17 {
+            source.push_str(&format!(
+                "    val t{} = UI {{ Div {{ t{k}; t{k} }} }}\n",
+                k + 1
+            ));
+        }
+        source.push_str("    return t17\n}\n");
+        let started = std::time::Instant::now();
+        let value = eval_function_within(&compile(&source), "f", Vec::new(), PRERENDER_BUDGET)
+            .expect("within the budget");
+        assert_eq!(value.render_html_within(PRERENDER_BUDGET.html_bytes), None);
+        let elapsed = started.elapsed();
+        assert!(elapsed < std::time::Duration::from_secs(10), "{elapsed:?}");
+        // The converted text keeps the argument an `Int`: a level, not a class.
+        let small = "fun f(): Ui {\n    val t = UI { Heading(1 + 2, \"c\") { Text(10 * 10) } }\n    return UI { Div { t; t } }\n}";
+        assert_eq!(
+            rendered(small, Vec::new()),
+            "<div><h3 class=\"c\">100</h3><h3 class=\"c\">100</h3></div>"
         );
     }
 
