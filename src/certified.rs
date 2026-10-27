@@ -5,7 +5,7 @@ use crate::ast::{TypeDecl, TypeKind, TypeRef};
 use crate::backend::js::page::{WebBuild, page_meta, web_build};
 use crate::backend::rust::SsrPage;
 use crate::compiler::{VerifiedApplication, json, json_array};
-use crate::config::{Backend, Mode, ProjectConfig, TargetConfig};
+use crate::config::{Backend, Mode, Pooler, ProjectConfig, TargetConfig};
 use crate::diagnostic::Span;
 use crate::parser::expr::parse_type_text;
 use crate::syntax::expr::TypeExpr;
@@ -26,6 +26,7 @@ const NUM_BIGINT: &str = "0.4.6";
 const BIGDECIMAL: &str = "0.4.8";
 const RUST_DECIMAL: &str = "1.37.2";
 const CHRONO: &str = "0.4.41";
+const STACKER: &str = "0.1.25";
 /// The runtime of the generated server, written to its `src/bind_runtime.rs`.
 const RUNTIME_SOURCE: &str = include_str!("../runtime/bind-runtime/src/lib.rs");
 const LAMBDA_HTTP: &str = "1.3.1";
@@ -134,6 +135,7 @@ fn workspace_files(
         add("src/lib.rs", STATIC_LIBRARY.to_string());
     }
     let database_environment = config.database_url_env.as_deref().unwrap_or("DATABASE_URL");
+    let pooler = config.database_pooler;
     let entry = Entry {
         ssr: target_config.mode == Some(Mode::Ssr),
         ssr_page: layout.ssr_page,
@@ -141,7 +143,10 @@ fn workspace_files(
     };
     match target_config.deployment.as_str() {
         "aws-lambda" if layout.server => {
-            add("src/main.rs", aws_main(database_environment, &entry));
+            add(
+                "src/main.rs",
+                with_pooler(aws_main(database_environment, &entry), pooler),
+            );
             add(
                 "template.yaml",
                 aws_template(app, database_environment, entry.ssr),
@@ -152,16 +157,22 @@ fn workspace_files(
             for rpc in &app.rpc_contracts {
                 add(
                     &format!("api/{}.rs", rpc.name),
-                    vercel_rpc_main(&rpc.path, database_environment, entry.cors),
+                    with_pooler(
+                        vercel_rpc_main(&rpc.path, database_environment, entry.cors),
+                        pooler,
+                    ),
                 );
             }
             if layout.ssr_page {
                 add(
                     &format!("api/{VERCEL_PAGE_FUNCTION}.rs"),
-                    vercel_page_main(database_environment),
+                    with_pooler(vercel_page_main(database_environment), pooler),
                 );
             }
-            add("vercel.json", vercel_json(layout.ssr_page));
+            add(
+                "vercel.json",
+                vercel_json(layout.ssr_page, &static_headers(&layout, target_config)),
+            );
         }
         other => return Err(format!("Unsupported certified deployment `{other}`")),
     }
@@ -171,6 +182,12 @@ fn workspace_files(
     add("contracts/schema.json", contract_schema(app));
     add("contracts/vectors.json", contract_vectors(app));
     add("bind-manifest.json", generated_manifest(app, target_config));
+    if hosted_elsewhere(target_config, &layout) {
+        add(
+            STATIC_HEADERS_FILE,
+            static_headers_json(&static_headers(&layout, target_config)),
+        );
+    }
     add("README.md", generated_readme(target_config, &layout));
     Ok(files)
 }
@@ -243,7 +260,7 @@ pub fn workspace_lock(config: &ProjectConfig) -> String {
 /// The `[dependencies]` table of `bind.lock` and the target locks: every pinned version.
 fn locked_dependencies() -> String {
     format!(
-        "[dependencies]\nserde = \"{SERDE}\"\nserdeJson = \"{SERDE_JSON}\"\ntokio = \"{TOKIO}\"\nuuid = \"{UUID}\"\nsqlx = \"{SQLX}\"\nnumBigint = \"{NUM_BIGINT}\"\nbigdecimal = \"{BIGDECIMAL}\"\nrustDecimal = \"{RUST_DECIMAL}\"\nchrono = \"{CHRONO}\"\nlambdaHttp = \"{LAMBDA_HTTP}\"\nvercelRuntime = \"{VERCEL_RUNTIME}\"\nhttpBodyUtil = \"{HTTP_BODY_UTIL}\"\n"
+        "[dependencies]\nserde = \"{SERDE}\"\nserdeJson = \"{SERDE_JSON}\"\ntokio = \"{TOKIO}\"\nuuid = \"{UUID}\"\nsqlx = \"{SQLX}\"\nnumBigint = \"{NUM_BIGINT}\"\nbigdecimal = \"{BIGDECIMAL}\"\nrustDecimal = \"{RUST_DECIMAL}\"\nchrono = \"{CHRONO}\"\nstacker = \"{STACKER}\"\nlambdaHttp = \"{LAMBDA_HTTP}\"\nvercelRuntime = \"{VERCEL_RUNTIME}\"\nhttpBodyUtil = \"{HTTP_BODY_UTIL}\"\n"
     )
 }
 
@@ -252,7 +269,7 @@ fn locked_dependencies() -> String {
 /// `Arc<Vec<T>>`) and `uuid` with `serde` (generated types hold `Uuid`s).
 pub(crate) fn server_dependencies() -> String {
     format!(
-        "serde = {{ version = \"={SERDE}\", features = [\"derive\", \"rc\"] }}\nserde_json = \"={SERDE_JSON}\"\ntokio = {{ version = \"={TOKIO}\", features = [\"rt-multi-thread\", \"macros\", \"sync\"] }}\nsqlx = {{ version = \"={SQLX}\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"uuid\", \"chrono\", \"bigdecimal\", \"rust_decimal\"] }}\nuuid = {{ version = \"={UUID}\", features = [\"serde\"] }}\nnum-bigint = \"={NUM_BIGINT}\"\nbigdecimal = \"={BIGDECIMAL}\"\nrust_decimal = {{ version = \"={RUST_DECIMAL}\", features = [\"serde-str\"] }}\nchrono = {{ version = \"={CHRONO}\", features = [\"serde\"] }}\n"
+        "serde = {{ version = \"={SERDE}\", features = [\"derive\", \"rc\"] }}\nserde_json = \"={SERDE_JSON}\"\ntokio = {{ version = \"={TOKIO}\", features = [\"rt-multi-thread\", \"macros\", \"sync\"] }}\nsqlx = {{ version = \"={SQLX}\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"uuid\", \"chrono\", \"bigdecimal\", \"rust_decimal\"] }}\nuuid = {{ version = \"={UUID}\", features = [\"serde\"] }}\nnum-bigint = \"={NUM_BIGINT}\"\nbigdecimal = \"={BIGDECIMAL}\"\nrust_decimal = {{ version = \"={RUST_DECIMAL}\", features = [\"serde-str\"] }}\nchrono = {{ version = \"={CHRONO}\", features = [\"serde\"] }}\nstacker = \"={STACKER}\"\n"
     )
 }
 
@@ -590,6 +607,35 @@ struct Entry {
 /// 64 MiB stacks, and every request runs on one of them (`serve_rpc`/`serve_page` spawn it), so
 /// deep Bind recursion reaches `RecursionLimit` instead of overflowing a stack. `HEAD` is
 /// answered like `GET`, without a body.
+/// `main` (an entry point's source) for the `[database.main].pooler` of the project: behind a
+/// transaction-mode pooler the connection options drop the prepared-statement cache (the
+/// runtime's `transaction_pooler_options`).
+fn with_pooler(main: String, pooler: Pooler) -> String {
+    const OPTIONS: &str = "::bind_runtime::database_options(&database_url)?;\n";
+    if pooler == Pooler::Session {
+        return main;
+    }
+    let Some(at) = main.find(OPTIONS) else {
+        return main;
+    };
+    let line_start = main[..at].rfind('\n').map_or(0, |index| index + 1);
+    let indent: String = main[line_start..]
+        .chars()
+        .take_while(|character| *character == ' ')
+        .collect();
+    let path = main[line_start..at]
+        .rsplit(' ')
+        .next()
+        .unwrap_or("bind_app")
+        .to_string();
+    let end = at + OPTIONS.len();
+    format!(
+        "{}{indent}// `[database.main].pooler = \"transaction\"`: no prepared-statement cache.\n{indent}let options = {path}::bind_runtime::transaction_pooler_options(options);\n{}",
+        &main[..end],
+        &main[end..]
+    )
+}
+
 fn aws_main(database_environment: &str, entry: &Entry) -> String {
     let mut constants = String::new();
     let mut routes = String::new();
@@ -660,8 +706,8 @@ fn main() -> Result<(), Error> {
 
 async fn serve() -> Result<(), Error> {
     let database_url = std::env::var(__BIND_DATABASE_ENV__)?;
-    // TLS `verify-full` unless the URL sets `sslmode`; a statement timeout; a bounded wait for a
-    // connection (see the runtime's `database_options`).
+    // TLS `verify-full` unless the URL sets `sslmode`; a bounded wait for a connection (see the
+    // runtime's `database_options`; the statement timeout is per transaction).
     let options = bind_app::bind_runtime::database_options(&database_url)?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
@@ -732,7 +778,7 @@ __BIND_ROUTES__}
 /// security headers); `handler` is the function's own.
 fn vercel_function(database_environment: &str, uses: &str, handler: &str) -> String {
     format!(
-        "// GENERATED BY BINDC. DO NOT EDIT.\n#![forbid(unsafe_code)]\n#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]\n\n{uses}use sqlx::{{PgPool, postgres::PgPoolOptions}};\nuse vercel_runtime::{{Error, Request, Response, run, service_fn}};\n\nfn main() -> Result<(), Error> {{\n    let runtime = tokio::runtime::Builder::new_multi_thread()\n        .enable_all()\n        .thread_stack_size(64 * 1024 * 1024)\n        .build()?;\n    runtime.block_on(serve())\n}}\n\nasync fn serve() -> Result<(), Error> {{\n    let database_url = std::env::var({database})?;\n    // TLS `verify-full` unless the URL sets `sslmode`; a statement timeout; a bounded wait for a\n    // connection (see the runtime's `database_options`).\n    let options = {package}::bind_runtime::database_options(&database_url)?;\n    let pool = PgPoolOptions::new()\n        .max_connections(5)\n        .acquire_timeout({package}::bind_runtime::DATABASE_ACQUIRE_TIMEOUT)\n        .connect_lazy_with(options);\n    run(service_fn(move |request| {{\n        let pool = pool.clone();\n        async move {{ handler(request, pool).await }}\n    }})).await\n}}\n\n/// A response with the security headers of its content type (the runtime's\n/// `security_headers`), then `headers`.\nfn respond(\n    status: u16,\n    content_type: &str,\n    body: String,\n    headers: &[(&'static str, String)],\n) -> Result<Response<String>, Error> {{\n    let mut response = Response::builder()\n        .status(status)\n        .header(\"content-type\", content_type);\n    for (name, value) in {package}::bind_runtime::security_headers(content_type) {{\n        response = response.header(name, value);\n    }}\n    for (name, value) in headers {{\n        response = response.header(*name, value.as_str());\n    }}\n    Ok(response.body(body)?)\n}}\n\n{handler}",
+        "// GENERATED BY BINDC. DO NOT EDIT.\n#![forbid(unsafe_code)]\n#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]\n\n{uses}use sqlx::{{PgPool, postgres::PgPoolOptions}};\nuse vercel_runtime::{{Error, Request, Response, run, service_fn}};\n\nfn main() -> Result<(), Error> {{\n    let runtime = tokio::runtime::Builder::new_multi_thread()\n        .enable_all()\n        .thread_stack_size(64 * 1024 * 1024)\n        .build()?;\n    runtime.block_on(serve())\n}}\n\nasync fn serve() -> Result<(), Error> {{\n    let database_url = std::env::var({database})?;\n    // TLS `verify-full` unless the URL sets `sslmode`; a bounded wait for a connection (see the\n    // runtime's `database_options`; the statement timeout is per transaction).\n    let options = {package}::bind_runtime::database_options(&database_url)?;\n    let pool = PgPoolOptions::new()\n        .max_connections(5)\n        .acquire_timeout({package}::bind_runtime::DATABASE_ACQUIRE_TIMEOUT)\n        .connect_lazy_with(options);\n    run(service_fn(move |request| {{\n        let pool = pool.clone();\n        async move {{ handler(request, pool).await }}\n    }})).await\n}}\n\n/// A response with the security headers of its content type (the runtime's\n/// `security_headers`), then `headers`.\nfn respond(\n    status: u16,\n    content_type: &str,\n    body: String,\n    headers: &[(&'static str, String)],\n) -> Result<Response<String>, Error> {{\n    let mut response = Response::builder()\n        .status(status)\n        .header(\"content-type\", content_type);\n    for (name, value) in {package}::bind_runtime::security_headers(content_type) {{\n        response = response.header(name, value);\n    }}\n    for (name, value) in headers {{\n        response = response.header(*name, value.as_str());\n    }}\n    Ok(response.body(body)?)\n}}\n\n{handler}",
         database = rust_string(database_environment),
         package = package_name_for_code(),
     )
@@ -778,7 +824,8 @@ fn vercel_page_main(database_environment: &str) -> String {
 
 /// `vercel.json`: `web/` is served as is (no build step); in the `ssr` mode `/` is rewritten to
 /// the page function (static files win over rewrites, and `web/` then has no `index.html`).
-fn vercel_json(ssr_page: bool) -> String {
+/// The static files get `headers` (see [`static_headers`]); the functions set their own.
+fn vercel_json(ssr_page: bool, headers: &[(String, String)]) -> String {
     let rewrites = if ssr_page {
         format!(
             ",\n  \"rewrites\": [{{ \"source\": \"/\", \"destination\": \"/api/{VERCEL_PAGE_FUNCTION}\" }}]"
@@ -786,15 +833,91 @@ fn vercel_json(ssr_page: bool) -> String {
     } else {
         String::new()
     };
-    // The static files of `web/` get the security headers the functions set themselves
-    // (`security_headers`); the `split` page's inline boot script rules out a `script-src`
-    // here, so its CSP only forbids framing, `<base>`, plugins and foreign form targets.
+    let headers = headers
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "        {{ \"key\": {}, \"value\": {} }}",
+                json(name),
+                json(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
     format!(
-        "{{\n  \"$schema\": \"https://openapi.vercel.sh/vercel.json\",\n  \"outputDirectory\": \"web\"{rewrites},\n  \"headers\": [\n    {{\n      \"source\": \"/(.*)\",\n      \"headers\": [\n        {{ \"key\": \"X-Content-Type-Options\", \"value\": \"nosniff\" }},\n        {{ \"key\": \"Referrer-Policy\", \"value\": \"no-referrer\" }},\n        {{ \"key\": \"X-Frame-Options\", \"value\": \"DENY\" }},\n        {{ \"key\": \"Content-Security-Policy\", \"value\": \"frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'\" }}\n      ]\n    }}\n  ]\n}}\n"
+        "{{\n  \"$schema\": \"https://openapi.vercel.sh/vercel.json\",\n  \"outputDirectory\": \"web\"{rewrites},\n  \"headers\": [\n    {{\n      \"source\": \"/(.*)\",\n      \"headers\": [\n{headers}\n      ]\n    }}\n  ]\n}}\n"
     )
 }
 
+/// The file listing the response headers `web/` must be served with when Bind does not host it
+/// (see [`hosted_elsewhere`]): outside `web/`, so uploading `web/` does not publish it.
+const STATIC_HEADERS_FILE: &str = "static-headers.json";
+
+/// Whether `web/` is served by a host Bind does not configure: an `aws-lambda` target whose
+/// Lambda does not serve the page (the `split` mode, or no server at all).
+fn hosted_elsewhere(target: &TargetConfig, layout: &Layout) -> bool {
+    target.deployment == "aws-lambda" && (target.mode != Some(Mode::Ssr) || !layout.server)
+}
+
+/// The response headers of the static files of `web/`: the Cloudflare profile's
+/// (`asset_headers`), whose CSP allows exactly the inline boot script of the `split` page by
+/// its SHA-256 (no `'unsafe-inline'`) and, when `api_url` is on another origin, that origin in
+/// `connect-src`.
+fn static_headers(layout: &Layout, target: &TargetConfig) -> Vec<(String, String)> {
+    let index = layout
+        .web
+        .files
+        .iter()
+        .find(|(path, _)| path == "web/index.html")
+        .map_or("", |(_, content)| content.as_str());
+    let api_origin = url_origin(&target.api_url);
+    crate::backend::js::worker::asset_headers(index, api_origin)
+        .lines()
+        .filter_map(|line| line.trim().split_once(": "))
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+/// The origin (`scheme://host[:port]`) of an absolute `http(s)` URL; `None` for a path.
+fn url_origin(url: &str) -> Option<&str> {
+    let scheme_end = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .map(|rest| url.len() - rest.len())?;
+    let host_end = url[scheme_end..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |index| scheme_end + index);
+    (host_end > scheme_end).then(|| &url[..host_end])
+}
+
+/// [`STATIC_HEADERS_FILE`]: the headers of every path of `web/`, machine-readable.
+fn static_headers_json(headers: &[(String, String)]) -> String {
+    let entries = headers
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "    {{ \"key\": {}, \"value\": {} }}",
+                json(name),
+                json(value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("{{\n  \"source\": \"/*\",\n  \"headers\": [\n{entries}\n  ]\n}}\n")
+}
+
 fn generated_readme(target: &TargetConfig, layout: &Layout) -> String {
+    let headers = if hosted_elsewhere(target, layout) {
+        let list = static_headers(layout, target)
+            .iter()
+            .map(|(name, value)| format!("- `{name}: {value}`\n"))
+            .collect::<String>();
+        format!(
+            "\n## Static host headers\n\nBind does not configure the host of `web/` (for example S3 and CloudFront: a CloudFront response headers policy). Serve every file of `web/` with exactly these response headers (also in `{STATIC_HEADERS_FILE}`, outside `web/`):\n\n{list}\nThe `script-src` hash is the SHA-256 of the inline boot script of `web/index.html`: it changes when the page does, so update the host after every `bind generate`.\n"
+        )
+    } else {
+        String::new()
+    };
     let page = if layout.web.is_static {
         "The page is static: `web/index.html` was rendered at compile time and loads no JavaScript."
     } else if target.mode == Some(Mode::Ssr) {
@@ -815,7 +938,7 @@ fn generated_readme(target: &TargetConfig, layout: &Layout) -> String {
         }
     };
     format!(
-        "# Generated Bind application\n\nProfile: `{PROFILE_VERSION}`  \nMode: `{}`  \nDeployment: `{}`\n\nThis directory is generated. `bind build` compiles and tests the Rust server; `bind certify` also lints it and writes an artifact attestation.\n\n{page}\n\n{deployment}\n",
+        "# Generated Bind application\n\nProfile: `{PROFILE_VERSION}`  \nMode: `{}`  \nDeployment: `{}`\n\nThis directory is generated. `bind build` compiles and tests the Rust server; `bind certify` also lints it and writes an artifact attestation.\n\n{page}\n\n{deployment}\n{headers}",
         target.mode_name(),
         target.deployment
     )
@@ -957,6 +1080,184 @@ mod tests {
             .find(|(candidate, _)| candidate == path)
             .map(|(_, content)| content.as_str())
             .unwrap_or_else(|| panic!("no {path}"))
+    }
+
+    /// `[database.main].pooler = "transaction"`: every entry point drops the prepared-statement
+    /// cache; the default (`session`) keeps it. The statement timeout is never a startup option.
+    #[test]
+    fn transaction_poolers_get_no_statement_cache() {
+        let cache = "transaction_pooler_options(options)";
+        for deployment in ["aws-lambda", "vercel"] {
+            let mut p = project(
+                &format!("pooler-{deployment}"),
+                CUSTOMER_SOURCE,
+                CUSTOMER_SCHEMA,
+                &format!("deployment = \"{deployment}\"\nmode = \"ssr\"\n"),
+            );
+            let mains = |files: &[(String, String)]| -> Vec<String> {
+                files
+                    .iter()
+                    .filter(|(path, _)| path == "src/main.rs" || path.starts_with("api/"))
+                    .map(|(_, content)| content.clone())
+                    .collect()
+            };
+            let session =
+                mains(&workspace_files(&p.app, &p.config, &p.config.targets["t"]).unwrap());
+            assert!(!session.is_empty(), "{deployment}");
+            assert!(
+                session.iter().all(|main| !main.contains(cache)),
+                "{deployment}"
+            );
+            p.config.database_pooler = Pooler::Transaction;
+            let transaction =
+                mains(&workspace_files(&p.app, &p.config, &p.config.targets["t"]).unwrap());
+            assert_eq!(transaction.len(), session.len());
+            for main in &transaction {
+                assert!(
+                    main.contains(&format!("::bind_runtime::database_options(&database_url)?;\n    // `[database.main].pooler = \"transaction\"`: no prepared-statement cache.\n    let options = bind_app::bind_runtime::{cache};\n")),
+                    "{deployment}: {main}"
+                );
+                assert!(!main.contains("statement_timeout"));
+            }
+        }
+    }
+
+    /// The static files of `web/` get the Cloudflare profile's headers: on Vercel through
+    /// `vercel.json`, on `aws-lambda` split (a host Bind does not configure) as a README section
+    /// and `static-headers.json`. The CSP allows the page's one inline script by its SHA-256.
+    #[test]
+    fn static_hosts_get_the_exact_headers_of_the_page() {
+        use sha2::Digest;
+        for (deployment, api_url) in [
+            ("aws-lambda", "https://api.example.com/api"),
+            ("vercel", "/api"),
+        ] {
+            let frontend = if api_url.starts_with("https://") {
+                "frontend_origin = \"https://app.example.com\"\n"
+            } else {
+                ""
+            };
+            let p = project(
+                &format!("headers-{deployment}"),
+                CUSTOMER_SOURCE,
+                CUSTOMER_SCHEMA,
+                &format!(
+                    "deployment = \"{deployment}\"\nmode = \"split\"\napi_url = \"{api_url}\"\n{frontend}"
+                ),
+            );
+            let files = workspace_files(&p.app, &p.config, &p.config.targets["t"]).unwrap();
+            let index = file(&files, "web/index.html");
+            // One inline script (the boot module), no inline style or event handler.
+            let scripts: Vec<&str> = index
+                .split("<script")
+                .skip(1)
+                .filter_map(|tag| {
+                    let (open, rest) = tag.split_once('>')?;
+                    let body = rest.split_once("</script>")?.0;
+                    (!open.contains("src=") || !body.is_empty()).then_some(body)
+                })
+                .filter(|body| !body.is_empty())
+                .collect();
+            assert_eq!(scripts.len(), 1, "{index}");
+            assert!(
+                !index.contains("<style") && !index.contains(" style="),
+                "{index}"
+            );
+            assert!(
+                !index.contains(" onclick=") && !index.contains(" onload="),
+                "{index}"
+            );
+            let digest = sha2::Sha256::digest(scripts[0].as_bytes());
+            let expected = crate::backend::js::worker::asset_headers(index, url_origin(api_url));
+            let csp = expected
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("Content-Security-Policy: "))
+                .unwrap()
+                .to_string();
+            assert!(
+                csp.starts_with("default-src 'self'; script-src 'self' 'sha256-"),
+                "{csp}"
+            );
+            assert_eq!(csp.matches("'sha256-").count(), 1, "{csp}");
+            // An independent base64 of the digest: the CSP names exactly this script.
+            let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            let mut encoded = String::new();
+            for chunk in digest.chunks(3) {
+                let n = chunk.iter().enumerate().fold(0u32, |n, (index, byte)| {
+                    n | (u32::from(*byte) << (16 - 8 * index))
+                });
+                for index in 0..4 {
+                    encoded.push(if index <= chunk.len() {
+                        char::from(alphabet[((n >> (18 - 6 * index)) & 63) as usize])
+                    } else {
+                        '='
+                    });
+                }
+            }
+            assert!(
+                csp.contains(&format!("script-src 'self' 'sha256-{encoded}';")),
+                "{csp}"
+            );
+            if deployment == "aws-lambda" {
+                assert!(
+                    csp.contains("connect-src 'self' https://api.example.com;"),
+                    "{csp}"
+                );
+                let readme = file(&files, "README.md");
+                assert!(readme.contains("## Static host headers"), "{readme}");
+                assert!(
+                    readme.contains(&format!("- `Content-Security-Policy: {csp}`")),
+                    "{readme}"
+                );
+                for header in [
+                    "X-Content-Type-Options: nosniff",
+                    "X-Frame-Options: DENY",
+                    "Referrer-Policy: no-referrer",
+                ] {
+                    assert!(readme.contains(&format!("- `{header}`")), "{readme}");
+                }
+                let listed = file(&files, STATIC_HEADERS_FILE);
+                assert!(
+                    listed.contains(&format!(
+                        "{{ \"key\": \"Content-Security-Policy\", \"value\": {} }}",
+                        json(&csp)
+                    )),
+                    "{listed}"
+                );
+                assert!(
+                    !paths(&files)
+                        .iter()
+                        .any(|path| path.starts_with("web/") && path.ends_with(".json"))
+                );
+            } else {
+                assert!(csp.contains("connect-src 'self';"), "{csp}");
+                let vercel = file(&files, "vercel.json");
+                assert!(
+                    vercel.contains(&format!(
+                        "{{ \"key\": \"Content-Security-Policy\", \"value\": {} }}",
+                        json(&csp)
+                    )),
+                    "{vercel}"
+                );
+                assert!(!paths(&files).contains(&STATIC_HEADERS_FILE));
+                assert!(!file(&files, "README.md").contains("Static host headers"));
+            }
+        }
+        // The Lambda serves the page itself in the `ssr` mode: no static host to configure.
+        let p = project(
+            "headers-aws-ssr",
+            CUSTOMER_SOURCE,
+            CUSTOMER_SCHEMA,
+            "deployment = \"aws-lambda\"\nmode = \"ssr\"\n",
+        );
+        let files = workspace_files(&p.app, &p.config, &p.config.targets["t"]).unwrap();
+        assert!(!paths(&files).contains(&STATIC_HEADERS_FILE));
+        assert_eq!(
+            url_origin("https://api.example.com:8443/v1/api"),
+            Some("https://api.example.com:8443")
+        );
+        assert_eq!(url_origin("/api"), None);
+        assert_eq!(url_origin("https://"), None);
     }
 
     #[test]

@@ -472,9 +472,12 @@ pub fn duration_neg(a: &chrono::TimeDelta) -> Result<chrono::TimeDelta, AppError
 // - drop is iterative: the last handle of a value moves it to a per-thread queue instead of
 //   dropping it in place, and the outermost `Rec` being dropped empties the queue one value at
 //   a time, after its own value (so a chain of any length is freed in constant stack);
-// - serialization fails with an error past `MAX_VALUE_DEPTH` nested `Rec`s, instead of
-//   overflowing the stack (decoding is bounded by serde_json's nesting limit of 128).
-// Equality still recurses: comparing two very deep values is the program's choice.
+// - equality, ordering, hashing, `Debug`, serialization and deserialization recurse once per
+//   level, each step through [`deeper`]: when the thread's stack runs low it continues on a
+//   new heap-allocated segment (the `stacker` crate), so a comparison of two values a million
+//   levels deep needs memory, not a large stack;
+// - serialization still fails with an error past `MAX_VALUE_DEPTH` nested `Rec`s: the wire
+//   contract (decoding is bounded by serde_json's nesting limit of 128).
 // ---------------------------------------------------------------------------------------------
 
 /// Most nested `Rec` fields a value may have to be serialized (a response, a server call of the
@@ -489,6 +492,17 @@ thread_local! {
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// `Rec` fields being serialized on this thread, nested.
     static SERIALIZING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Stack left below which [`deeper`] continues on a new segment.
+const STACK_RED_ZONE: usize = 64 * 1024;
+/// Size of each stack segment [`deeper`] allocates.
+const STACK_SEGMENT: usize = 1024 * 1024;
+
+/// Runs one level of a recursive walk of a value (`Rec`'s trait implementations), on a new
+/// stack segment when the current one has less than [`STACK_RED_ZONE`] left.
+pub fn deeper<R>(step: impl FnOnce() -> R) -> R {
+    stacker::maybe_grow(STACK_RED_ZONE, STACK_SEGMENT, step)
 }
 
 /// A recursive field: a shared handle on its value, dropped without recursion (see above).
@@ -576,13 +590,13 @@ impl<T: 'static> Clone for Rec<T> {
 
 impl<T: fmt::Debug + 'static> fmt::Debug for Rec<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.value.fmt(f)
+        deeper(|| self.value.fmt(f))
     }
 }
 
 impl<T: PartialEq + 'static> PartialEq for Rec<T> {
     fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.value, &other.value) || *self.value == *other.value
+        Arc::ptr_eq(&self.value, &other.value) || deeper(|| *self.value == *other.value)
     }
 }
 
@@ -590,19 +604,22 @@ impl<T: Eq + 'static> Eq for Rec<T> {}
 
 impl<T: PartialOrd + 'static> PartialOrd for Rec<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.value.partial_cmp(&other.value)
+        deeper(|| self.value.partial_cmp(&other.value))
     }
 }
 
 impl<T: Ord + 'static> Ord for Rec<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.value.cmp(&other.value)
+        if Arc::ptr_eq(&self.value, &other.value) {
+            return std::cmp::Ordering::Equal;
+        }
+        deeper(|| self.value.cmp(&other.value))
     }
 }
 
 impl<T: std::hash::Hash + 'static> std::hash::Hash for Rec<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.value.hash(state);
+        deeper(|| self.value.hash(state));
     }
 }
 
@@ -620,7 +637,7 @@ impl<T: serde::Serialize + 'static> serde::Serialize for Rec<T> {
                 "value nested too deeply to serialize",
             ))
         } else {
-            self.value.serialize(serializer)
+            deeper(|| self.value.serialize(serializer))
         };
         let _ = SERIALIZING.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
         result
@@ -629,7 +646,7 @@ impl<T: serde::Serialize + 'static> serde::Serialize for Rec<T> {
 
 impl<'de, T: serde::Deserialize<'de> + 'static> serde::Deserialize<'de> for Rec<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        T::deserialize(deserializer).map(Rec::new)
+        deeper(|| T::deserialize(deserializer).map(Rec::new))
     }
 }
 
@@ -2156,14 +2173,38 @@ pub fn security_headers(content_type: &str) -> Vec<(&'static str, &'static str)>
 /// How long a request waits for a database connection before failing (500).
 pub const DATABASE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// PostgreSQL's `statement_timeout` for the server's connections, unless the URL sets it.
+/// PostgreSQL's `statement_timeout` for each transaction of the server, unless one is already
+/// configured (see [`begin_transaction`]).
 pub const DATABASE_STATEMENT_TIMEOUT: &str = "30s";
+
+/// Run first in every transaction: `statement_timeout` for this transaction only (`SET LOCAL`,
+/// so it holds through a transaction-mode pooler, which gives no session of its own), when no
+/// timeout is set yet (`0`, PostgreSQL's default). A timeout chosen by the user (the URL's
+/// `options`, `ALTER ROLE … SET`, `ALTER DATABASE … SET`) is kept.
+const STATEMENT_TIMEOUT_SQL: &str = "SELECT set_config('statement_timeout', '30s', true) WHERE current_setting('statement_timeout') = '0'";
+
+/// Opens a transaction of the server (`BEGIN READ ONLY` when `read_only`: the `ssr` page) with
+/// its statement timeout (see [`STATEMENT_TIMEOUT_SQL`]).
+pub async fn begin_transaction(
+    pool: &sqlx::PgPool,
+    read_only: bool,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, AppError> {
+    let mut transaction = if read_only {
+        pool.begin_with("BEGIN READ ONLY").await?
+    } else {
+        pool.begin().await?
+    };
+    sqlx::raw_sql(STATEMENT_TIMEOUT_SQL)
+        .execute(&mut *transaction)
+        .await?;
+    Ok(transaction)
+}
 
 /// The connection options of `url`. TLS: when neither the URL (`sslmode`) nor the
 /// environment (`PGSSLMODE`) chooses a mode, `verify-full` (certificate checked against the
 /// Mozilla roots and the host name; a server with a private CA needs `sslrootcert` or an
-/// explicit `sslmode`). `statement_timeout` is [`DATABASE_STATEMENT_TIMEOUT`] unless the
-/// URL's `options` sets one.
+/// explicit `sslmode`). Nothing is set at connection startup (a transaction-mode pooler may
+/// refuse or drop startup parameters): the statement timeout is per transaction.
 pub fn database_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, sqlx::Error> {
     let mut options: sqlx::postgres::PgConnectOptions = url.parse()?;
     let query = url.split_once('?').map_or("", |(_, query)| query);
@@ -2172,16 +2213,16 @@ pub fn database_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, s
     if !has("sslmode") && !has("ssl-mode") && std::env::var_os("PGSSLMODE").is_none() {
         options = options.ssl_mode(sqlx::postgres::PgSslMode::VerifyFull);
     }
-    let timeout_set = parameters.pairs.iter().any(|(key, value)| {
-        key == "options"
-            && value
-                .as_deref()
-                .is_some_and(|value| value.contains("statement_timeout"))
-    });
-    if !timeout_set {
-        options = options.options([("statement_timeout", DATABASE_STATEMENT_TIMEOUT)]);
-    }
     Ok(options)
+}
+
+/// [`database_options`] for a transaction-mode pooler (`[database.main].pooler =
+/// "transaction"`): no prepared-statement cache, since the next transaction may run on another
+/// server connection that never saw the statement.
+pub fn transaction_pooler_options(
+    options: sqlx::postgres::PgConnectOptions,
+) -> sqlx::postgres::PgConnectOptions {
+    options.statement_cache_capacity(0)
 }
 
 /// Writes an internal error (status 500) to standard error, where the platforms' logs collect
@@ -2896,9 +2937,51 @@ mod tests {
     }
 
     #[test]
-    fn deep_recursive_values_fail_to_serialize() {
+    fn deep_recursive_values_compare_and_hash_on_a_small_stack() {
+        use std::hash::{Hash, Hasher};
+        #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        enum Nat {
+            Succ { prev: Rec<Nat> },
+            Zero,
+        }
+        fn nat(n: usize) -> Nat {
+            let mut value = Nat::Zero;
+            for _ in 0..n {
+                value = Nat::Succ {
+                    prev: Rec::new(value),
+                };
+            }
+            value
+        }
+        fn hash(value: &Nat) -> u64 {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.hash(&mut hasher);
+            hasher.finish()
+        }
         let handle = std::thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                // Distinct allocations: the comparison walks both values to the bottom.
+                let a = nat(1_000_000);
+                let b = nat(1_000_000);
+                let shorter = nat(999_999);
+                assert!(a == b);
+                assert!(a != shorter);
+                assert_eq!(a.cmp(&b), std::cmp::Ordering::Equal);
+                assert_eq!(shorter.cmp(&a), std::cmp::Ordering::Greater);
+                assert_eq!(a.partial_cmp(&shorter), Some(std::cmp::Ordering::Less));
+                assert_eq!(hash(&a), hash(&b));
+                assert!(format!("{:?}", nat(100_000)).contains("{ prev: Zero }"));
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn deep_recursive_values_fail_to_serialize() {
+        // A small stack: serialization up to the bound grows it on the heap.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
             .spawn(|| {
                 let fits = chain(MAX_VALUE_DEPTH as usize);
                 let text = serde_json::to_string(&fits).unwrap();
@@ -3036,6 +3119,20 @@ mod tests {
         assert!(matches!(default.get_ssl_mode(), PgSslMode::VerifyFull));
         let explicit = database_options("postgresql://u:p@db.example/app?sslmode=require").unwrap();
         assert!(matches!(explicit.get_ssl_mode(), PgSslMode::Require));
+        // Nothing at startup: the statement timeout is set per transaction.
+        assert_eq!(default.get_options(), None);
+        let user =
+            database_options("postgresql://db.example/app?options=-c%20statement_timeout%3D5s")
+                .unwrap();
+        assert!(
+            user.get_options()
+                .is_some_and(|options| options.contains("statement_timeout"))
+        );
+        assert!(STATEMENT_TIMEOUT_SQL.contains("set_config('statement_timeout', '30s', true)"));
+        assert!(STATEMENT_TIMEOUT_SQL.contains(DATABASE_STATEMENT_TIMEOUT));
+        assert!(
+            STATEMENT_TIMEOUT_SQL.ends_with("WHERE current_setting('statement_timeout') = '0'")
+        );
     }
 
     #[test]

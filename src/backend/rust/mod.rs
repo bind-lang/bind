@@ -761,7 +761,7 @@ pub(crate) mod tests {
         let program = crate::core::lower::tests::compile_with(commerce, &schema);
         assert!(ssr_page_problems(&program, "CustomerPage").is_empty());
         let library = library_with(&program, &schema, Some(&page("CustomerPage"))).unwrap();
-        assert!(library.contains("pool.begin_with(\"BEGIN READ ONLY\")"));
+        assert!(library.contains("begin_transaction(pool, true)"));
         assert!(!library.contains("transaction.commit().await {\n                ::std::result::Result::Ok(()) => page_result"));
         let writer = format!(
             "{commerce}\nclient component Novo(nome: String, email: Email, saldo: Money) {{\n    val c = server.cadastrar(nome, email, saldo)\n    UI {{ Text(c.name) }}\n}}\n"

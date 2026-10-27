@@ -17,6 +17,8 @@ pub struct ProjectConfig {
     pub database_schema: Option<PathBuf>,
     pub database_url_env: Option<String>,
     pub database_verification: String,
+    /// `[database.main].pooler`: what sits between the server and PostgreSQL.
+    pub database_pooler: Pooler,
     pub web_title: String,
     pub web_description: String,
     pub web_language: String,
@@ -39,6 +41,18 @@ pub struct TargetConfig {
     pub frontend_origin: Option<String>,
     pub certified: bool,
     pub capabilities: Vec<String>,
+}
+
+/// The connection pooler in front of PostgreSQL (`[database.main].pooler`).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Pooler {
+    /// `"session"`: a direct connection or a session-mode pooler; a connection is the
+    /// server's for its lifetime, so sqlx caches prepared statements on it.
+    #[default]
+    Session,
+    /// `"transaction"`: a transaction-mode pooler (PgBouncer, Supavisor, RDS Proxy…) that may
+    /// hand each transaction to a different server connection; no prepared-statement cache.
+    Transaction,
 }
 
 /// How a web target is deployed.
@@ -171,6 +185,7 @@ const DATABASE_KEYS: &[(&str, Kind)] = &[
     ("schema", Kind::String),
     ("env", Kind::String),
     ("verification", Kind::String),
+    ("pooler", Kind::String),
 ];
 const WEB_KEYS: &[(&str, Kind)] = &[
     ("title", Kind::String),
@@ -224,6 +239,15 @@ impl ProjectConfig {
                 "`[database.main].engine` must be \"postgresql\", found \"{engine}\""
             )));
         }
+        let database_pooler = match string(database, "pooler").as_deref() {
+            None | Some("session") => Pooler::Session,
+            Some("transaction") => Pooler::Transaction,
+            Some(other) => {
+                return Err(fail(format!(
+                    "`[database.main].pooler` must be \"session\" or \"transaction\", found \"{other}\""
+                )));
+            }
+        };
         let mut targets = BTreeMap::new();
         for (key, properties) in &tables {
             let [first, name] = key.as_slice() else {
@@ -294,6 +318,7 @@ impl ProjectConfig {
             database_url_env,
             database_verification: string(database, "verification")
                 .unwrap_or_else(|| "static".into()),
+            database_pooler,
             web_title: string(web, "title").unwrap_or_else(|| "Bind application".into()),
             web_description: string(web, "description").unwrap_or_default(),
             web_language: string(web, "language").unwrap_or_else(|| "en".into()),
@@ -831,6 +856,19 @@ mod tests {
     }
 
     #[test]
+    fn the_database_pooler_is_session_unless_transaction_is_chosen() {
+        assert_eq!(load("").unwrap().database_pooler, Pooler::Session);
+        for (value, pooler) in [
+            ("session", Pooler::Session),
+            ("transaction", Pooler::Transaction),
+        ] {
+            let manifest =
+                format!("[database.main]\nengine = \"postgresql\"\npooler = \"{value}\"\n");
+            assert_eq!(load(&manifest).unwrap().database_pooler, pooler, "{value}");
+        }
+    }
+
+    #[test]
     fn web_targets_have_a_mode_an_api_url_and_an_optional_frontend_origin() {
         let config = load(
             "[target.a]\nclient = \"web\"\nmode = \"ssr\"\n[target.b]\nclient = \"web\"\nmode = \"split\"\napi_url = \"https://api.example.com/api\"\nfrontend_origin = \"https://app.example.com\"\n[target.c]\nclient = \"web\"\n",
@@ -872,6 +910,11 @@ mod tests {
                 "environment variable name",
             ),
             ("[database.main]\nengine = \"mysql\"\n", "postgresql"),
+            (
+                "[database.main]\npooler = \"statement\"\n",
+                "`[database.main].pooler` must be \"session\" or \"transaction\"",
+            ),
+            ("[database.main]\npooler = true\n", "must be a string"),
         ] {
             let error = load(manifest).unwrap_err();
             assert!(error.contains(expected), "{manifest:?}: {error}");

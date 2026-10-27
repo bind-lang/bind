@@ -196,7 +196,7 @@ async fn finish<T: ::serde::Serialize>(
 }
 
 /// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
-/// and builds the call's context.
+/// (with its statement timeout: the runtime's `begin_transaction`) and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
     body: &[u8],
     pool: &::sqlx::PgPool,
@@ -204,10 +204,9 @@ async fn begin<I: ::serde::de::DeserializeOwned>(
     let text = crate::bind_runtime::request_text(body).map_err(|error| error_result(&error))?;
     let input = ::serde_json::from_str(text)
     .map_err(|error| error_result(&crate::bind_runtime::AppError::BadRequest(error.to_string())))?;
-    let transaction = pool
-    .begin()
+    let transaction = crate::bind_runtime::begin_transaction(pool, false)
     .await
-    .map_err(|error| error_result(&crate::bind_runtime::AppError::from(error)))?;
+    .map_err(|error| error_result(&error))?;
     ::std::result::Result::Ok((input, crate::bind_runtime::Ctx::with_transaction(transaction)))
 }
 

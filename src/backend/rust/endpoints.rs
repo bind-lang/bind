@@ -81,7 +81,7 @@ error_result(&error)
 }}
 
 /// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
-/// and builds the call's context.
+/// (with its statement timeout: the runtime's `begin_transaction`) and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
 body: &[u8],
 pool: &::sqlx::PgPool,
@@ -89,10 +89,9 @@ pool: &::sqlx::PgPool,
 let text = {RUNTIME}::request_text(body).map_err(|error| error_result(&error))?;
 let input = ::serde_json::from_str(text)
 .map_err(|error| error_result(&{RUNTIME}::AppError::BadRequest(error.to_string())))?;
-let transaction = pool
-.begin()
+let transaction = {RUNTIME}::begin_transaction(pool, false)
 .await
-.map_err(|error| error_result(&{RUNTIME}::AppError::from(error)))?;
+.map_err(|error| error_result(&error))?;
 ::std::result::Result::Ok((input, {RUNTIME}::Ctx::with_transaction(transaction)))
 }}
 
@@ -261,9 +260,9 @@ pub fn page(
         format!(
             "// `GET /` never writes: the server calls share one read-only transaction (a write
 // fails in PostgreSQL), rolled back once the page is rendered, never committed.
-let transaction = match pool.begin_with(\"BEGIN READ ONLY\").await {{
+let transaction = match {RUNTIME}::begin_transaction(pool, true).await {{
 ::std::result::Result::Ok(transaction) => transaction,
-::std::result::Result::Err(error) => return page_error(&{RUNTIME}::AppError::from(error)),
+::std::result::Result::Err(error) => return page_error(&error),
 }};
 let ctx = {RUNTIME}::Ctx::with_transaction(transaction);
 let result = {};

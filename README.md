@@ -45,6 +45,24 @@ capabilities = ["ui.dom"]
 
 A program may have only one `client component` per web target (E8301).
 
+### Database configuration
+
+```toml
+[database.main]
+engine = "postgresql"         # the only engine
+schema = "schema/main.csv"
+env = "DATABASE_URL"          # the variable holding the connection URL (default DATABASE_URL)
+verification = "static"
+# pooler = "session"          # default; or "transaction"
+```
+
+`pooler` says what sits between the generated server and PostgreSQL:
+
+- `"session"` (default): a direct connection or a session-mode pooler. sqlx caches prepared statements on each connection.
+- `"transaction"`: a transaction-mode pooler (PgBouncer `pool_mode = transaction`, Supavisor's transaction port, RDS Proxy…) that may run each transaction on a different server connection. The generated pool disables the prepared-statement cache (`statement_cache_capacity(0)`).
+
+Any other value is an error. In both modes the server sets nothing at connection startup: every transaction begins with `SET LOCAL`-scoped `statement_timeout = '30s'` (`set_config(…, true)`), unless a timeout is already configured (the URL's `options`, `ALTER ROLE … SET` or `ALTER DATABASE … SET`), which is kept. TLS is `verify-full` unless the URL sets `sslmode` or `PGSSLMODE` is set.
+
 The compiler owns all generated dependencies and pins them. Certified applications cannot add arbitrary target dependencies, raw SQL, target code, or untyped network calls. Cargo remains the underlying resolver, while `bind.lock`, target-specific locks, hashes, and generated contract tests form Bind's reproducibility boundary. A separate package manager is therefore not needed for this profile.
 
 Vercel's Rust runtime is currently Beta. Bind treats that as a deployment-platform limitation, not as a silently stronger guarantee.
@@ -150,7 +168,9 @@ sam build --beta-features
 sam deploy --guided
 ```
 
-Vercel generation includes root Rust functions under `api/`, `vercel.json`, and the static frontend in `web/` (in `ssr` mode `/` is rewritten to the `bind-page` function):
+In `split` mode (or without a server) the Lambda does not serve `web/`, and Bind cannot configure the static host (S3 and CloudFront, for example). The generated `README.md` lists the exact response headers to configure there, also written to `static-headers.json` next to `web/`. They include a CSP whose `script-src` allows the page's inline boot script by its SHA-256, so update them after every generation that changes the page.
+
+Vercel generation includes root Rust functions under `api/`, `vercel.json` (which carries the same static headers and CSP for `web/`), and the static frontend in `web/` (in `ssr` mode `/` is rewritten to the `bind-page` function):
 
 ```sh
 cd .bind/generated/vercel-split   # or the name of your target
