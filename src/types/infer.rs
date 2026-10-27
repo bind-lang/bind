@@ -1370,8 +1370,43 @@ impl<'a> Checker<'a> {
         self.level -= 1;
         let (scheme, ambiguous) = generalize(&self.table, self.level, &ty);
         self.report_constraints(ambiguous, span);
+        // Value restriction: only a syntactic value is generalized. Any other right-hand side
+        // (a call, which may perform effects, an `if`, a `when`, ...) is evaluated once, so its
+        // type is monomorphic and its variables are fixed by the uses that follow.
+        let scheme = if is_syntactic_value(value) {
+            scheme
+        } else {
+            self.monomorphic(&scheme.ty);
+            Scheme::mono(scheme.ty)
+        };
         if name != "_" {
             self.locals.push((name.to_string(), scheme));
+        }
+    }
+
+    /// Moves the variables of a type that is not generalized to the current level, so that no
+    /// later generalization (of an enclosing `val`) quantifies them.
+    fn monomorphic(&mut self, ty: &Type) {
+        for id in free_vars(&self.table, ty) {
+            if let VarState::Unbound { level, constraint } = self.table.state(id).clone()
+                && level > self.level
+            {
+                self.table.set(
+                    id,
+                    VarState::Unbound {
+                        level: self.level,
+                        constraint,
+                    },
+                );
+            }
+        }
+        for id in free_row_vars(&self.table, ty) {
+            if let RowState::Unbound { level } = self.table.row_state(id).clone()
+                && level > self.level
+            {
+                self.table
+                    .set_row(id, RowState::Unbound { level: self.level });
+            }
         }
     }
 
@@ -2437,6 +2472,25 @@ impl<'a> Checker<'a> {
 }
 
 /// How to resolve a variable left ambiguous under `constraint`: an example of an accepted type.
+/// Whether a `val`'s right-hand side is a syntactic value (generalized by `bind_val`): a
+/// literal, a name, a lambda, or a field of one. Evaluating it performs no effect.
+fn is_syntactic_value(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Double(_)
+        | ExprKind::Float(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::Name(_)
+        | ExprKind::Lambda { .. } => true,
+        ExprKind::Field { target, .. } | ExprKind::SafeField { target, .. } => {
+            is_syntactic_value(target)
+        }
+        _ => false,
+    }
+}
+
 fn ambiguity_hint(constraint: Constraint) -> &'static str {
     match constraint {
         Constraint::Eq | Constraint::Ord | Constraint::Add | Constraint::Sub | Constraint::Num => {
@@ -3223,6 +3277,38 @@ mod tests {
                 "fatorial"
             ),
             "(Int) -> Int"
+        );
+    }
+
+    #[test]
+    fn only_syntactic_values_are_generalized() {
+        // A lambda, a name or a literal is generalized.
+        assert_eq!(
+            scheme(
+                "fun f(): Boolean {\n    val id = { x -> x }\n    val alias = id\n    val n = alias(1)\n    alias(n == 1)\n}",
+                "f"
+            ),
+            "() -> Boolean"
+        );
+        // A call (possibly effectful) is evaluated once: its type is monomorphic.
+        assert_eq!(
+            errors(
+                "fun mk() = emptyList()\nfun f(): Int {\n    val xs = mk()\n    val a: List<Int> = xs\n    val b: List<String> = xs\n    return 1\n}"
+            ),
+            vec!["E7101"]
+        );
+        assert!(
+            infer(
+                "fun mk() = emptyList()\nfun f(): Int {\n    val xs = mk()\n    val a: List<Int> = xs\n    return length(xs)\n}"
+            )
+            .is_ok()
+        );
+        // Its variables are not generalized later through a lambda that captures it.
+        assert_eq!(
+            errors(
+                "fun mk() = emptyList()\nfun f(): Int {\n    val xs = mk()\n    val g = { -> xs }\n    val a: List<Int> = g()\n    val b: List<String> = g()\n    return 1\n}"
+            ),
+            vec!["E7101"]
         );
     }
 

@@ -214,8 +214,8 @@ const STRING_PIECES: &[(&str, &str)] = &[
     ("é", "é"),
     ("😀", "😀"),
     ("\\u2028", "\u{2028}"),
-    // A lone surrogate escape is kept as its six source characters.
-    ("\\uD800", "\\uD800"),
+    // A surrogate pair escape is one character, as in Kotlin (a lone surrogate is E1006).
+    ("\\uD83D\\uDE00", "😀"),
     ("{", "{"),
     ("}", "}"),
 ];
@@ -240,7 +240,7 @@ const WEB_STRING_PIECES: &[(&str, &str)] = &[
     ("ção", "ção"),
     ("😀", "😀"),
     ("\\u2028", "\u{2028}"),
-    ("\\uD800", "\\uD800"),
+    ("\\uD83D\\uDE00", "😀"),
     ("{", "{"),
     ("<", "<"),
     (">", ">"),
@@ -578,7 +578,7 @@ impl Gen {
         }
     }
 
-    /// An integer literal as source (decimal, hex, binary, underscores, `L`; up to 40 digits),
+    /// An integer literal as source (decimal, hex, binary, underscores; up to 40 digits),
     /// in an expression position (negative ones parenthesized), and its value.
     fn int_literal(&mut self) -> (String, BigInt) {
         self.count("integer literal");
@@ -619,9 +619,11 @@ impl Gen {
                 let n = self.rng.range(0, 64);
                 (format!("0b{n:b}"), BigInt::from(n))
             }
+            // Formerly `{n}L`; Long literals are now rejected (E7004). Kept as a branch so the
+            // generator's draws are unchanged.
             7 => {
                 let n = self.rng.range(0, 99);
-                (format!("{n}L"), BigInt::from(n))
+                (n.to_string(), BigInt::from(n))
             }
             _ => {
                 let length = self.rng.range(10, 40) as usize;
@@ -3107,13 +3109,15 @@ fn fnv(text: &str) -> u64 {
 }
 
 /// The server's programs are exactly those of before the three-way test's additions to the
-/// generator (same seed, same draws): the hash of their source as of commit 5d426aa.
+/// generator (same seed, same draws): the hash of their source as of commit 5d426aa, updated
+/// when Long literals (`42L`) and lone surrogate escapes became errors and their spellings left
+/// the generator.
 #[test]
 fn server_programs_are_unchanged_by_the_web_generator() {
     let (programs, _) = programs();
     let source = source(&programs);
-    assert_eq!(source.len(), 1_110_786);
-    assert_eq!(fnv(&source), 0x9d0b_ccc1_1fa1_e1ee);
+    assert_eq!(source.len(), 1_102_804);
+    assert_eq!(fnv(&source), 0x9145_cf02_0f4b_c91e);
 }
 
 /// The three-way test's generator is deterministic, produces well-typed programs only and

@@ -1344,22 +1344,15 @@ client component CustomerPage(id: CustomerId) {
     }
 
     #[test]
-    fn effectful_generalized_val_used_at_two_types_is_an_internal_error() {
-        // The checker accepts it, but the lowering cannot copy an effectful value per instance,
-        // so the IR is inconsistent and `verify` stops with E9001 instead of generating code.
+    fn effectful_val_used_at_two_types_is_a_type_error() {
+        // Value restriction: a `val` whose right-hand side is not a syntactic value is not
+        // generalized, so using it at two types is a user error, never E9001.
         let source = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nfun load(id: CustomerId): Customer effects [db.read] = db.customers.require(id)\nserver fun f(id: CustomerId): Int effects [db.read] {\n    val xs = if (load(id).name == \"a\") emptyList() else emptyList()\n    val a = length(map(xs, { x -> x + 1 }))\n    return length(map(xs, { x -> x == \"b\" }))\n}\n";
         let (root, config) = fixture(source, SCHEMA);
         let result = verify(&config, "aws-lambda");
         assert!(result.application.is_none());
         let found = codes(&result);
-        assert_eq!(found, vec!["E9001"], "{:?}", result.diagnostics);
-        assert!(
-            result.diagnostics[0]
-                .message
-                .starts_with("Internal compiler error: the core IR is inconsistent ("),
-            "{}",
-            result.diagnostics[0].message
-        );
+        assert_eq!(found, vec!["E7101"], "{:?}", result.diagnostics);
         fs::remove_dir_all(root).unwrap();
     }
 
