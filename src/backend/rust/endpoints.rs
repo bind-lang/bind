@@ -1,6 +1,6 @@
 //! Endpoints of the generated server: request types, the RPC router and the per-call
 //! transaction (commit on `Ok`, rollback on `Err`); in the `ssr` mode, the page at `GET /`
-//! (`handle_page`, same transaction discipline) and the request router `serve`.
+//! (`handle_page`: one read-only transaction, never committed) and the request router `serve`.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -80,12 +80,14 @@ error_result(&error)
 }}
 }}
 
-/// Decodes the request, opens the transaction and builds the call's context.
+/// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
+/// and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
 body: &[u8],
 pool: &::sqlx::PgPool,
 ) -> ::std::result::Result<(I, {RUNTIME}::Ctx), HttpResult> {{
-let input = ::serde_json::from_slice(body)
+let text = {RUNTIME}::request_text(body).map_err(|error| error_result(&error))?;
+let input = ::serde_json::from_str(text)
 .map_err(|error| error_result(&{RUNTIME}::AppError::BadRequest(error.to_string())))?;
 let transaction = pool
 .begin()
@@ -105,15 +107,21 @@ pub status: u16,
 pub body: ::std::string::String,
 }}
 
-/// `{{\"error\": message}}` with the error's status; the message never exposes internals.
+/// `{{\"error\": message}}` with the error's status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn error_result(error: &{RUNTIME}::AppError) -> HttpResult {{
+{RUNTIME}::log_error(error);
 let body = ::serde_json::json!({{ \"error\": error.public_message() }}).to_string();
 HttpResult {{ status: error.status(), body }}
 }}
 
-{helpers}/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+{helpers}/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction. The path's
+/// percent-escapes are decoded first (a browser sends `/api/café` as `/api/caf%C3%A9`).
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {{
-match path.trim_end_matches('/') {{
+let ::std::option::Option::Some(path) = {RUNTIME}::decode_path(path) else {{
+return error_result(&{RUNTIME}::AppError::BadRequest(::std::string::String::from(\"malformed request path\")));
+}};
+match {RUNTIME}::rpc_route(&path) {{
 ",
         helpers = helpers
     );
@@ -251,7 +259,9 @@ pub fn page(
     };
     let run = if uses_server {
         format!(
-            "let transaction = match pool.begin().await {{
+            "// `GET /` never writes: the server calls share one read-only transaction (a write
+// fails in PostgreSQL), rolled back once the page is rendered, never committed.
+let transaction = match pool.begin_with(\"BEGIN READ ONLY\").await {{
 ::std::result::Result::Ok(transaction) => transaction,
 ::std::result::Result::Err(error) => return page_error(&{RUNTIME}::AppError::from(error)),
 }};
@@ -262,16 +272,11 @@ let transaction = match ctx.take_transaction().await {{
 ::std::result::Result::Err(error) => return page_error(&error),
 }};
 ::std::mem::drop(ctx);
-match result {{
-::std::result::Result::Ok(node) => match transaction.commit().await {{
-::std::result::Result::Ok(()) => page_result(&node),
-::std::result::Result::Err(error) => page_error(&{RUNTIME}::AppError::from(error)),
-}},
-::std::result::Result::Err(error) => {{
-// The error is the page; a failed rollback leaves nothing committed either.
+// Nothing to keep: a failed rollback only closes the connection's transaction.
 let _ = transaction.rollback().await;
-page_error(&error)
-}}
+match result {{
+::std::result::Result::Ok(node) => page_result(&node),
+::std::result::Result::Err(error) => page_error(&error),
 }}",
             call("ctx.clone()")
         )
@@ -300,8 +305,10 @@ language: {language:?},
 stylesheet: {stylesheet:?},
 }};
 
-/// The error page of `error`, with its status; the message never exposes internals.
+/// The error page of `error`, with its status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn page_error(error: &{RUNTIME}::AppError) -> HttpResult {{
+{RUNTIME}::log_error(error);
 let (status, body) = {RUNTIME}::error_page(error, &PAGE_META);
 HttpResult {{ status, body }}
 }}
@@ -314,8 +321,9 @@ HttpResult {{ status: 200, body }}
 
 /// `GET /`: the page of component `{name}` (HTML, `PAGE_CONTENT_TYPE`). Its parameters come
 /// from the query string `query` (absent, repeated or invalid: a 400 page naming the
-/// parameter); server calls run in one transaction, committed when the page renders and rolled
-/// back on an error, whose page has the error's status.
+/// parameter); server calls run in one read-only transaction, always rolled
+/// back (the page is read-only: `GET` and `HEAD` never commit); an error's page has the
+/// error's status.
 pub async fn handle_page(query: &str, pool: &::sqlx::PgPool) -> HttpResult {{
 {decode}{run}
 }}
@@ -478,6 +486,91 @@ assert_eq!(missing.status, 404);
 }}
 {extra}}}
 "
+    )
+}
+
+/// The RPC request policy of the target (`rpc_refusal`, the runtime's): `POST` with a JSON body
+/// only, and, when `same_origin` (no `frontend_origin`), an `Origin` header naming the request's
+/// own origin; with `frontend_origin`, `cors` checks the origin. The entry points call it before
+/// routing an RPC request; and its tests.
+pub fn rpc_policy(endpoints: &[&CoreFunction], same_origin: bool) -> String {
+    let origin_rule = if same_origin {
+        "an `Origin` header, when present, must be the request's own origin (403, first)"
+    } else {
+        "the origin is `cors`'s (only `FRONTEND_ORIGIN`, checked before this)"
+    };
+    let procedures: Vec<String> = endpoints
+        .iter()
+        .map(|endpoint| format!("{:?}", format!("/api/{}", endpoint.name)))
+        .collect();
+    let cross_origin_test = if same_origin {
+        "let foreign = headers(::std::option::Option::Some(\"https://evil.example\"));
+assert_eq!(super::rpc_refusal(\"POST\", PATH, &foreign).map(|refusal| refusal.status), ::std::option::Option::Some(403));
+let own = headers(::std::option::Option::Some(\"https://app.example\"));
+assert_ne!(super::rpc_refusal(\"POST\", PATH, &own).map(|refusal| refusal.status), ::std::option::Option::Some(403));
+"
+    } else {
+        ""
+    };
+    let first = endpoints.first().map_or_else(
+        || "/api/bindMissingProcedure".to_string(),
+        |endpoint| format!("/api/{}", endpoint.name),
+    );
+    let known_test = if endpoints.is_empty() {
+        "assert_eq!(super::rpc_refusal(\"POST\", PATH, &direct).map(|refusal| refusal.status), ::std::option::Option::Some(404));\n"
+            .to_string()
+    } else {
+        "assert!(super::rpc_refusal(\"POST\", PATH, &direct).is_none());
+assert_eq!(super::rpc_refusal(\"POST\", \"/api/bindMissingProcedure\", &direct).map(|refusal| refusal.status), ::std::option::Option::Some(404));
+assert_eq!(super::rpc_refusal(\"POST\", \"/api/%E0%A4\", &direct).map(|refusal| refusal.status), ::std::option::Option::Some(400));
+let get = super::rpc_refusal(\"GET\", PATH, &direct);
+assert_eq!(get.as_ref().map(|refusal| refusal.status), ::std::option::Option::Some(405));
+assert!(get.iter().any(|refusal| refusal.headers.iter().any(|(name, value)| *name == \"allow\" && value == \"POST, OPTIONS\")));
+let form = crate::bind_runtime::RequestHeaders { content_type: ::std::option::Option::Some(\"text/plain\"), ..direct };
+assert_eq!(super::rpc_refusal(\"POST\", PATH, &form).map(|refusal| refusal.status), ::std::option::Option::Some(415));
+let huge = crate::bind_runtime::RequestHeaders { content_length: ::std::option::Option::Some(\"1048577\"), ..direct };
+assert_eq!(super::rpc_refusal(\"POST\", PATH, &huge).map(|refusal| refusal.status), ::std::option::Option::Some(413));
+let bogus = crate::bind_runtime::RequestHeaders { content_length: ::std::option::Option::Some(\"12a\"), ..direct };
+assert_eq!(super::rpc_refusal(\"POST\", PATH, &bogus).map(|refusal| refusal.status), ::std::option::Option::Some(400));
+"
+            .to_string()
+    };
+    format!(
+        "/// The RPC routes of this server (`handle_rpc`).
+const PROCEDURES: &[&str] = &[{procedures}];
+
+/// The response that ends an RPC request at `path` before it runs, if any (the runtime's
+/// `rpc_refusal`): {origin_rule}; `OPTIONS` is 204; an unknown procedure 404 (a malformed
+/// escape 400); `POST` only (405); a JSON body only (415); a `Content-Length` up to
+/// `MAX_BODY_BYTES` (413). Called by the entry points before routing a request to
+/// `serve_rpc` (CSRF protection: a cross-site form or \"simple\" request never qualifies).
+pub fn rpc_refusal(method: &str, path: &str, headers: &{RUNTIME}::RequestHeaders<'_>) -> ::std::option::Option<{RUNTIME}::Refusal> {{
+{RUNTIME}::rpc_refusal(method, path, headers, {same_origin}, &|route| PROCEDURES.contains(&route))
+}}
+
+#[cfg(test)]
+mod rpc_policy_tests {{
+const PATH: &str = {first:?};
+
+fn headers(origin: ::std::option::Option<&str>) -> crate::bind_runtime::RequestHeaders<'_> {{
+crate::bind_runtime::RequestHeaders {{
+content_type: ::std::option::Option::Some(\"Application/JSON; charset=utf-8\"),
+content_length: ::std::option::Option::Some(\"2\"),
+origin,
+host: ::std::option::Option::Some(\"app.example\"),
+forwarded_host: ::std::option::Option::None,
+forwarded_proto: ::std::option::Option::Some(\"https\"),
+}}
+}}
+
+#[test]
+fn only_json_posts_to_a_procedure_may_call_the_api() {{
+let direct = headers(::std::option::Option::None);
+assert_eq!(super::rpc_refusal(\"OPTIONS\", PATH, &direct).map(|refusal| refusal.status), ::std::option::Option::Some(204));
+{known_test}{cross_origin_test}}}
+}}
+",
+        procedures = procedures.join(", ")
     )
 }
 

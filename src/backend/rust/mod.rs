@@ -98,6 +98,18 @@ pub fn server_library_with(
     frontend_origin: Option<&str>,
 ) -> Result<String, String> {
     let mut library = library_with(&app.core, &app.database, ssr)?;
+    let mut endpoint_functions: Vec<&CoreFunction> = app
+        .core
+        .functions
+        .iter()
+        .filter(|function| function.endpoint)
+        .collect();
+    endpoint_functions.sort_by(|a, b| a.name.cmp(&b.name));
+    library.push('\n');
+    library.push_str(&indent(&endpoints::rpc_policy(
+        &endpoint_functions,
+        frontend_origin.is_none(),
+    )));
     if let Some(origin) = frontend_origin {
         library.push('\n');
         library.push_str(&indent(&endpoints::cors(origin)));
@@ -254,7 +266,49 @@ fn page_plan<'p>(
             ));
         }
     }
+    if let Some(problem) = ssr_page_problems(program, page.component).first() {
+        return Err(problem.clone());
+    }
     Ok((component, client))
+}
+
+/// Why the `ssr` page of `component` cannot be rendered: every server function its client
+/// code calls that writes to the database (`insert`, directly or through the functions it
+/// calls). The page is `GET /`, rendered in one read-only transaction that is never
+/// committed, so a write would fail at run time; it is refused here instead (a `split` page
+/// may call it).
+pub fn ssr_page_problems(program: &CoreProgram, component: &str) -> Vec<String> {
+    let profile = crate::certified::profile_version();
+    let names = crate::core::lower::client_functions(program, component);
+    let mut called = BTreeSet::new();
+    for function in program
+        .functions
+        .iter()
+        .filter(|function| names.contains(&function.name))
+    {
+        server_calls_in(&function.body, &mut called);
+    }
+    let mut problems = Vec::new();
+    for name in called {
+        let Some(endpoint) = program
+            .functions
+            .iter()
+            .find(|function| function.name == name && function.endpoint)
+        else {
+            continue;
+        };
+        let operations = db::operations(&reachable(program, &[endpoint]));
+        let table = operations.iter().find_map(|key| match key {
+            db::DbKey::Insert(table, _) => Some(table.as_str()),
+            _ => None,
+        });
+        if let Some(table) = table {
+            problems.push(format!(
+                "Component `{component}` calls server function `{name}`, which writes to the database (`db.{table}.insert`). The `ssr` page is rendered on `GET /` in a read-only transaction, so it cannot call a function that writes in profile {profile}."
+            ));
+        }
+    }
+    problems
 }
 
 /// Whether `expr` or one of its subexpressions satisfies `test`.
@@ -686,6 +740,38 @@ pub(crate) mod tests {
         assert!(item.starts_with("pub fn bind_f(ctx: crate::bind_runtime::Ctx, v0_x: "));
         assert!(render_functions(&program, &["f".to_string()]).contains(&item));
         assert_eq!(types::type_declarations(&program), "");
+    }
+
+    /// The `ssr` page is read-only: a component that calls a server function that writes is
+    /// refused at generation time (`ssr_page_problems`), one that only reads is served.
+    #[test]
+    fn ssr_pages_cannot_call_functions_that_write() {
+        let csv = include_str!("../../../examples/commerce/schema/main.csv");
+        let schema = crate::core::lower::tests::schema(csv);
+        let commerce = include_str!("../../../examples/commerce/src/customer.bd");
+        fn page(component: &str) -> SsrPage<'_> {
+            SsrPage {
+                component,
+                title: "t",
+                description: None,
+                language: "en",
+                stylesheet: "/styles.css",
+            }
+        }
+        let program = crate::core::lower::tests::compile_with(commerce, &schema);
+        assert!(ssr_page_problems(&program, "CustomerPage").is_empty());
+        let library = library_with(&program, &schema, Some(&page("CustomerPage"))).unwrap();
+        assert!(library.contains("pool.begin_with(\"BEGIN READ ONLY\")"));
+        assert!(!library.contains("transaction.commit().await {\n                ::std::result::Result::Ok(()) => page_result"));
+        let writer = format!(
+            "{commerce}\nclient component Novo(nome: String, email: Email, saldo: Money) {{\n    val c = server.cadastrar(nome, email, saldo)\n    UI {{ Text(c.name) }}\n}}\n"
+        );
+        let program = crate::core::lower::tests::compile_with(&writer, &schema);
+        let problems = ssr_page_problems(&program, "Novo");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("`cadastrar`") && problems[0].contains("db.customers.insert"));
+        let error = library_with(&program, &schema, Some(&page("Novo"))).unwrap_err();
+        assert_eq!(error, problems[0]);
     }
 
     #[test]
@@ -1136,15 +1222,15 @@ fn rpc_round_trip_against_postgres() {
     const SHAPES_TEST: &str = r##"#![allow(clippy::unwrap_used)]
 use std::sync::Arc;
 
-use bind_codegen_snapshots::bind_runtime::{AppError, BindMap, BindResult, BindSet, Ctx, Int};
+use bind_codegen_snapshots::bind_runtime::{AppError, BindMap, BindResult, BindSet, Ctx, Int, Rec};
 use bind_codegen_snapshots::{adt, arithmetic, collections, control, lambdas, records, returns};
 
 fn json<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap()
 }
 
-fn leaf() -> Box<adt::Arvore> {
-    Box::new(adt::Arvore::Folha)
+fn leaf() -> Rec<adt::Arvore> {
+    Rec::new(adt::Arvore::Folha)
 }
 
 #[test]
@@ -1162,10 +1248,10 @@ fn wire_shapes() {
     let config = records::Config {
         r#type: "t".to_string(),
         r#match: Int::from_i64(3),
-        filho: Box::new(None),
+        filho: Rec::new(None),
     };
     assert_eq!(json(&config), r#"{"type":"t","match":"3","filho":null}"#);
-    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Arc::new(vec![]) };
+    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Rec::new(Arc::new(vec![])) };
     assert_eq!(json(&tree), r#"{"nodo":{"v":"1","filhos":[]}}"#);
     // Unused type parameters leave the JSON shape unchanged.
     assert_eq!(json(&records::Opt::<Int>::Nada), r#""nada""#);
@@ -1184,7 +1270,7 @@ fn wire_shapes() {
 fn generated_functions_run() {
     let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
     let left = adt::Arvore::No { esq: leaf(), valor: Int::from_i64(1), dir: leaf() };
-    let tree = adt::Arvore::No { esq: Box::new(left), valor: Int::from_i64(2), dir: leaf() };
+    let tree = adt::Arvore::No { esq: Rec::new(left), valor: Int::from_i64(2), dir: leaf() };
     assert_eq!(rt.block_on(adt::bind_soma(Ctx::pure(), tree)).unwrap(), Int::from_i64(3));
     let xs = Arc::new(vec![Int::from_i64(1), Int::from_i64(2), Int::from_i64(3)]);
     assert_eq!(rt.block_on(lambdas::bind_f(Ctx::pure(), xs)).unwrap(), Int::from_i64(12));
@@ -1204,8 +1290,8 @@ fn generated_functions_run() {
 ".to_string())).unwrap(),
         Int::from_i64(2)
     );
-    let child = records::Arv::Nodo { v: Int::from_i64(2), filhos: Arc::new(vec![]) };
-    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Arc::new(vec![child.clone(), child]) };
+    let child = records::Arv::Nodo { v: Int::from_i64(2), filhos: Rec::new(Arc::new(vec![])) };
+    let tree = records::Arv::Nodo { v: Int::from_i64(1), filhos: Rec::new(Arc::new(vec![child.clone(), child])) };
     assert_eq!(rt.block_on(records::bind_total(Ctx::pure(), tree)).unwrap(), Int::from_i64(5));
     assert_eq!(rt.block_on(lambdas::bind_usaIgnora(Ctx::pure())).unwrap(), Int::from_i64(1));
 }

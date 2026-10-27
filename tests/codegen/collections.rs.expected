@@ -47,7 +47,7 @@ pub struct Ponto {
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Pagina<T> {
+pub struct Pagina<T: 'static> {
     pub itens: ::std::sync::Arc<::std::vec::Vec<T>>,
     pub total: crate::bind_runtime::Int,
 }
@@ -93,7 +93,7 @@ pub fn bind_troca(ctx: crate::bind_runtime::Ctx, v0_xs: crate::bind_runtime::Bin
 pub fn bind_tem(ctx: crate::bind_runtime::Ctx, v0_xs: crate::bind_runtime::BindSet<crate::bind_runtime::Int>, v1_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<bool> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(crate::bind_runtime::set_contains(&v0_xs, &v1_x.add(&crate::bind_runtime::Int::from_i64(1))) && (crate::bind_runtime::set_size(&v0_xs) > crate::bind_runtime::Int::from_i64(0)))
+        ::std::result::Result::Ok(crate::bind_runtime::set_contains(&v0_xs, &v1_x.add(&crate::bind_runtime::Int::from_i64(1))?) && (crate::bind_runtime::set_size(&v0_xs) > crate::bind_runtime::Int::from_i64(0)))
     })
 }
 
@@ -209,12 +209,12 @@ pub fn bind_area(ctx: crate::bind_runtime::Ctx, v0_f: Forma) -> crate::bind_runt
         ::std::result::Result::Ok(match &v0_f {
             Forma::Circulo { raio: p0 } => {
                 let v1_r = p0.clone();
-                v1_r.mul(&v1_r).mul(&crate::bind_runtime::Int::from_i64(3))
+                v1_r.mul(&v1_r)?.mul(&crate::bind_runtime::Int::from_i64(3))?
             }
             Forma::Retangulo { largura: p1, altura: p2 } => {
                 let v2_l = p1.clone();
                 let v3_a = p2.clone();
-                v2_l.mul(&v3_a)
+                v2_l.mul(&v3_a)?
             }
             Forma::Vazia => {
                 crate::bind_runtime::Int::from_i64(0)

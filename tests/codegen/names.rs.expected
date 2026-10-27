@@ -162,7 +162,7 @@ pub mod app {
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub struct Caixa<r#type, Self_> {
+    pub struct Caixa<r#type: 'static, Self_: 'static> {
         pub x: r#type,
         pub __phantom: crate::bind_runtime::Int,
         #[serde(skip)]
@@ -207,7 +207,7 @@ pub mod app {
                     v3_n.clone()
                 }
             };
-            let v5_q: crate::bind_runtime::Int = bind_classifica(ctx.clone(), S::r#fn { crate_: v4_z.clone() }).await?.add(&bind_classifica(ctx.clone(), S::crate_).await?).add(&bind_classifica(ctx.clone(), S::r#type).await?);
+            let v5_q: crate::bind_runtime::Int = bind_classifica(ctx.clone(), S::r#fn { crate_: v4_z.clone() }).await?.add(&bind_classifica(ctx.clone(), S::crate_).await?)?.add(&bind_classifica(ctx.clone(), S::r#type).await?)?;
             let v6_u: crate::bind_runtime::Int = bind_usa(ctx.clone(), r#match { __: crate::bind_runtime::Int::from_i64(1), self_: crate::bind_runtime::Int::from_i64(2) }, Self_ { a: crate::bind_runtime::Int::from_i64(3) }, self_ { a: crate::bind_runtime::Int::from_i64(4) }, __ { a: crate::bind_runtime::Int::from_i64(5) }, Caixa::<crate::bind_runtime::Int, ::std::string::String> { x: crate::bind_runtime::Int::from_i64(6), __phantom: crate::bind_runtime::Int::from_i64(7), __phantom_: ::std::marker::PhantomData }).await?;
             let v8_w: crate::bind_runtime::Int = match &v1_x {
                 finish { value: p1 } => {
@@ -215,7 +215,7 @@ pub mod app {
                     v7_n.clone()
                 }
             };
-            ::std::result::Result::Ok(HttpResult { status: v5_q.add(&v6_u).add(&v8_w) })
+            ::std::result::Result::Ok(HttpResult { status: v5_q.add(&v6_u)?.add(&v8_w)? })
         })
     }
 
@@ -240,7 +240,7 @@ pub mod app {
     pub fn bind_dobro(ctx: crate::bind_runtime::Ctx, v0_a: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
         ::std::boxed::Box::pin(async move {
             let ctx = ctx.enter()?;
-            ::std::result::Result::Ok(v0_a.mul(&crate::bind_runtime::Int::from_i64(2)))
+            v0_a.mul(&crate::bind_runtime::Int::from_i64(2))
         })
     }
 
@@ -254,7 +254,7 @@ pub mod app {
     pub fn bind_usa(ctx: crate::bind_runtime::Ctx, v0_m: r#match, v1_k: Self_, v2_j: self_, v3_u: __, v4_c: Caixa<crate::bind_runtime::Int, ::std::string::String>) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
         ::std::boxed::Box::pin(async move {
             let ctx = ctx.enter()?;
-            ::std::result::Result::Ok(v0_m.__.add(&v0_m.self_).add(&v1_k.a).add(&v2_j.a).add(&v3_u.a).add(&v4_c.x).add(&v4_c.__phantom))
+            v0_m.__.add(&v0_m.self_)?.add(&v1_k.a)?.add(&v2_j.a)?.add(&v3_u.a)?.add(&v4_c.x)?.add(&v4_c.__phantom)
         })
     }
 }
@@ -296,8 +296,10 @@ pub struct HttpResult {
     pub body: ::std::string::String,
 }
 
-/// `{"error": message}` with the error's status; the message never exposes internals.
+/// `{"error": message}` with the error's status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn error_result(error: &crate::bind_runtime::AppError) -> HttpResult {
+    crate::bind_runtime::log_error(error);
     let body = ::serde_json::json!({ "error": error.public_message() }).to_string();
     HttpResult { status: error.status(), body }
 }
@@ -328,12 +330,14 @@ async fn finish<T: ::serde::Serialize>(
     }
 }
 
-/// Decodes the request, opens the transaction and builds the call's context.
+/// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
+/// and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
     body: &[u8],
     pool: &::sqlx::PgPool,
 ) -> ::std::result::Result<(I, crate::bind_runtime::Ctx), HttpResult> {
-    let input = ::serde_json::from_slice(body)
+    let text = crate::bind_runtime::request_text(body).map_err(|error| error_result(&error))?;
+    let input = ::serde_json::from_str(text)
     .map_err(|error| error_result(&crate::bind_runtime::AppError::BadRequest(error.to_string())))?;
     let transaction = pool
     .begin()
@@ -342,9 +346,13 @@ async fn begin<I: ::serde::de::DeserializeOwned>(
     ::std::result::Result::Ok((input, crate::bind_runtime::Ctx::with_transaction(transaction)))
 }
 
-/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction. The path's
+/// percent-escapes are decoded first (a browser sends `/api/café` as `/api/caf%C3%A9`).
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {
-    match path.trim_end_matches('/') {
+    let ::std::option::Option::Some(path) = crate::bind_runtime::decode_path(path) else {
+        return error_result(&crate::bind_runtime::AppError::BadRequest(::std::string::String::from("malformed request path")));
+    };
+    match crate::bind_runtime::rpc_route(&path) {
         "/api/calcula" => {
             let (input, ctx) = match begin::<CalculaInput>(body, pool).await {
                 ::std::result::Result::Ok(started) => started,

@@ -21,12 +21,12 @@ pub fn bind_f(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::vec:
         crate::bind_runtime::fold(ctx.clone(), crate::bind_runtime::map(ctx.clone(), v0_xs.clone(), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v1_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
             ::std::boxed::Box::pin(async move {
                 let ctx = ctx.enter()?;
-                ::std::result::Result::Ok(v1_x.mul(&crate::bind_runtime::Int::from_i64(2)))
+                v1_x.mul(&crate::bind_runtime::Int::from_i64(2))
             })
         }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>).await?, crate::bind_runtime::Int::from_i64(0), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v2_s: crate::bind_runtime::Int, v3_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
             ::std::boxed::Box::pin(async move {
                 let ctx = ctx.enter()?;
-                ::std::result::Result::Ok(v2_s.add(&v3_x))
+                v2_s.add(&v3_x)
             })
         }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>).await
     })
@@ -41,7 +41,7 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::v
                 let v1_k = v1_k.clone();
                 ::std::boxed::Box::pin(async move {
                     let ctx = ctx.enter()?;
-                    ::std::result::Result::Ok(v2_x.add(&v1_k))
+                    v2_x.add(&v1_k)
                 })
             }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>
         }).await
@@ -51,7 +51,7 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::v
 pub fn bind_dobro(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.mul(&crate::bind_runtime::Int::from_i64(2)))
+        v0_x.mul(&crate::bind_runtime::Int::from_i64(2))
     })
 }
 

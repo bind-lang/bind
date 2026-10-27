@@ -593,9 +593,7 @@ struct Entry {
 fn aws_main(database_environment: &str, entry: &Entry) -> String {
     let mut constants = String::new();
     let mut routes = String::new();
-    if entry.cors || !entry.ssr_page {
-        constants.push_str("\n/// Content type of the RPC responses.\nconst RPC_CONTENT_TYPE: &str = \"application/json; charset=utf-8\";\n");
-    }
+    constants.push_str("\n/// Content type of the RPC responses.\nconst RPC_CONTENT_TYPE: &str = \"application/json; charset=utf-8\";\n");
     if entry.ssr {
         routes.push_str("    let read = head || method == \"GET\";\n");
         constants.push_str("\n/// The stylesheet the page links (`/styles.css`).\nconst STYLESHEET: &str = include_str!(\"../web/styles.css\");\n");
@@ -606,13 +604,32 @@ fn aws_main(database_environment: &str, entry: &Entry) -> String {
         }
     }
     let mut headers = "&[]";
+    let mut refusal_headers = "Vec::new()";
     if entry.cors {
         routes.push_str("    let origin = request.headers().get(\"origin\").and_then(|value| value.to_str().ok());\n    let cors = bind_app::cors(&method, origin);\n    if let Some(result) = cors.response {\n        return respond(result.status, RPC_CONTENT_TYPE, result.body, &cors.headers);\n    }\n");
         headers = "&cors.headers";
+        refusal_headers = "cors.headers.clone()";
+    }
+    // Every RPC request (the page excepted) passes the library's policy, then the body limit.
+    let checks = format!(
+        "let policy = bind_app::rpc_refusal(&method, &path, &request_headers(&request));\nif let Some(refusal) = policy {{\n    let mut headers = {refusal_headers};\n    headers.extend(refusal.headers);\n    return respond(refusal.status, RPC_CONTENT_TYPE, refusal.body, &headers);\n}}\nif request.body().len() > bind_app::bind_runtime::MAX_BODY_BYTES {{\n    return respond(413, RPC_CONTENT_TYPE, String::from(\"{{\\\"error\\\":\\\"request body too large\\\"}}\"), {headers});\n}}\n"
+    );
+    if entry.ssr_page {
+        routes.push_str(
+            "    let page = read && (path.is_empty() || path == \"/\");\n    if !page {\n",
+        );
+        for line in checks.lines() {
+            routes.push_str(&format!("        {line}\n"));
+        }
+        routes.push_str("    }\n");
+    } else {
+        for line in checks.lines() {
+            routes.push_str(&format!("    {line}\n"));
+        }
     }
     let serve = if entry.ssr_page {
         format!(
-            "    let query = request.uri().query().unwrap_or(\"\").to_string();\n    let method = if head {{ \"GET\" }} else {{ method.as_str() }};\n    let response = bind_app::serve(method, path, query, body(&request), pool).await;\n    respond(response.status, response.content_type, if head {{ String::new() }} else {{ response.body }}, {headers})\n"
+            "    let query = request.uri().query().unwrap_or(\"\").to_string();\n    let method = if head {{ \"GET\" }} else {{ method.as_str() }};\n    let body = if page {{ Vec::new() }} else {{ body(&request) }};\n    let response = bind_app::serve(method, path, query, body, pool).await;\n    respond(response.status, response.content_type, if head {{ String::new() }} else {{ response.body }}, {headers})\n"
         )
     } else {
         format!(
@@ -643,7 +660,13 @@ fn main() -> Result<(), Error> {
 
 async fn serve() -> Result<(), Error> {
     let database_url = std::env::var(__BIND_DATABASE_ENV__)?;
-    let pool = PgPoolOptions::new().max_connections(5).connect_lazy(&database_url)?;
+    // TLS `verify-full` unless the URL sets `sslmode`; a statement timeout; a bounded wait for a
+    // connection (see the runtime's `database_options`).
+    let options = bind_app::bind_runtime::database_options(&database_url)?;
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(bind_app::bind_runtime::DATABASE_ACQUIRE_TIMEOUT)
+        .connect_lazy_with(options);
     run(service_fn(move |request: Request| {
         let pool = pool.clone();
         async move { handle(request, pool).await }
@@ -660,6 +683,25 @@ fn body(request: &Request) -> Vec<u8> {
     }
 }
 
+/// The header `name` of `request`, when present and valid text.
+fn header<'r>(request: &'r Request, name: &str) -> Option<&'r str> {
+    request.headers().get(name).and_then(|value| value.to_str().ok())
+}
+
+/// The headers the RPC policy (`rpc_refusal`) reads.
+fn request_headers(request: &Request) -> bind_app::bind_runtime::RequestHeaders<'_> {
+    bind_app::bind_runtime::RequestHeaders {
+        content_type: header(request, "content-type"),
+        content_length: header(request, "content-length"),
+        origin: header(request, "origin"),
+        host: header(request, "host"),
+        forwarded_host: header(request, "x-forwarded-host"),
+        forwarded_proto: header(request, "x-forwarded-proto"),
+    }
+}
+
+/// A response with the security headers of its content type (the runtime's
+/// `security_headers`), then `headers`.
 fn respond(
     status: u16,
     content_type: &str,
@@ -669,6 +711,9 @@ fn respond(
     let mut response = Response::builder()
         .status(status)
         .header("content-type", content_type);
+    for (name, value) in bind_app::bind_runtime::security_headers(content_type) {
+        response = response.header(name, value);
+    }
     for (name, value) in headers {
         response = response.header(*name, value.as_str());
     }
@@ -683,43 +728,49 @@ __BIND_ROUTES__}
 "#;
 
 /// The common part of a Vercel function: a hand-built tokio runtime with 64 MiB worker stacks,
-/// as in `AWS_MAIN`, a lazy pool and `respond`; `handler` is the function's own.
+/// as in `AWS_MAIN`, a lazy pool with the runtime's connection options and `respond` (with the
+/// security headers); `handler` is the function's own.
 fn vercel_function(database_environment: &str, uses: &str, handler: &str) -> String {
     format!(
-        "// GENERATED BY BINDC. DO NOT EDIT.\n#![forbid(unsafe_code)]\n#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]\n\n{uses}use sqlx::{{PgPool, postgres::PgPoolOptions}};\nuse vercel_runtime::{{Error, Request, Response, run, service_fn}};\n\nfn main() -> Result<(), Error> {{\n    let runtime = tokio::runtime::Builder::new_multi_thread()\n        .enable_all()\n        .thread_stack_size(64 * 1024 * 1024)\n        .build()?;\n    runtime.block_on(serve())\n}}\n\nasync fn serve() -> Result<(), Error> {{\n    let database_url = std::env::var({})?;\n    let pool = PgPoolOptions::new().max_connections(5).connect_lazy(&database_url)?;\n    run(service_fn(move |request| {{\n        let pool = pool.clone();\n        async move {{ handler(request, pool).await }}\n    }})).await\n}}\n\nfn respond(\n    status: u16,\n    content_type: &str,\n    body: String,\n    headers: &[(&'static str, String)],\n) -> Result<Response<String>, Error> {{\n    let mut response = Response::builder()\n        .status(status)\n        .header(\"content-type\", content_type);\n    for (name, value) in headers {{\n        response = response.header(*name, value.as_str());\n    }}\n    Ok(response.body(body)?)\n}}\n\n{handler}",
-        rust_string(database_environment),
+        "// GENERATED BY BINDC. DO NOT EDIT.\n#![forbid(unsafe_code)]\n#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unreachable)]\n\n{uses}use sqlx::{{PgPool, postgres::PgPoolOptions}};\nuse vercel_runtime::{{Error, Request, Response, run, service_fn}};\n\nfn main() -> Result<(), Error> {{\n    let runtime = tokio::runtime::Builder::new_multi_thread()\n        .enable_all()\n        .thread_stack_size(64 * 1024 * 1024)\n        .build()?;\n    runtime.block_on(serve())\n}}\n\nasync fn serve() -> Result<(), Error> {{\n    let database_url = std::env::var({database})?;\n    // TLS `verify-full` unless the URL sets `sslmode`; a statement timeout; a bounded wait for a\n    // connection (see the runtime's `database_options`).\n    let options = {package}::bind_runtime::database_options(&database_url)?;\n    let pool = PgPoolOptions::new()\n        .max_connections(5)\n        .acquire_timeout({package}::bind_runtime::DATABASE_ACQUIRE_TIMEOUT)\n        .connect_lazy_with(options);\n    run(service_fn(move |request| {{\n        let pool = pool.clone();\n        async move {{ handler(request, pool).await }}\n    }})).await\n}}\n\n/// A response with the security headers of its content type (the runtime's\n/// `security_headers`), then `headers`.\nfn respond(\n    status: u16,\n    content_type: &str,\n    body: String,\n    headers: &[(&'static str, String)],\n) -> Result<Response<String>, Error> {{\n    let mut response = Response::builder()\n        .status(status)\n        .header(\"content-type\", content_type);\n    for (name, value) in {package}::bind_runtime::security_headers(content_type) {{\n        response = response.header(name, value);\n    }}\n    for (name, value) in headers {{\n        response = response.header(*name, value.as_str());\n    }}\n    Ok(response.body(body)?)\n}}\n\n{handler}",
+        database = rust_string(database_environment),
+        package = package_name_for_code(),
     )
 }
 
-/// The Vercel function of the endpoint at `path` (CORS first when `cors`).
+/// The Vercel function of the endpoint at `path`: CORS first when `cors`, then the library's
+/// RPC policy (`rpc_refusal`), then the body, read up to the runtime's `MAX_BODY_BYTES` (413
+/// beyond).
 fn vercel_rpc_main(path: &str, database_environment: &str, cors: bool) -> String {
-    let (check, headers) = if cors {
+    let (check, headers, refusal_headers) = if cors {
         (
-            "    let origin = request.headers().get(\"origin\").and_then(|value| value.to_str().ok()).map(str::to_string);\n    let cors = bind_app::cors(request.method().as_str(), origin.as_deref());\n    if let Some(result) = cors.response {\n        return respond(result.status, \"application/json; charset=utf-8\", result.body, &cors.headers);\n    }\n",
+            "    let origin = request.headers().get(\"origin\").and_then(|value| value.to_str().ok()).map(str::to_string);\n    let cors = bind_app::cors(request.method().as_str(), origin.as_deref());\n    if let Some(result) = cors.response {\n        return respond(result.status, JSON, result.body, &cors.headers);\n    }\n",
             "&cors.headers",
+            "cors.headers.clone()",
         )
     } else {
-        ("", "&[]")
+        ("", "&[]", "Vec::new()")
     };
+    let package = package_name_for_code();
     vercel_function(
         database_environment,
-        "use http_body_util::BodyExt;\n",
+        "use http_body_util::{BodyExt, LengthLimitError, Limited};\n",
         &format!(
-            "async fn handler(request: Request, pool: PgPool) -> Result<Response<String>, Error> {{\n{check}    let bytes = request.into_body().collect().await?.to_bytes();\n    let result = {}::serve_rpc({}.to_string(), bytes.to_vec(), pool).await;\n    respond(result.status, \"application/json; charset=utf-8\", result.body, {headers})\n}}\n",
-            package_name_for_code(),
+            "/// Content type of the RPC responses.\nconst JSON: &str = \"application/json; charset=utf-8\";\n\n/// The path of this function's procedure.\nconst PATH: &str = {};\n\n/// The header `name` of `request`, when present and valid text.\nfn header<'r>(request: &'r Request, name: &str) -> Option<&'r str> {{\n    request.headers().get(name).and_then(|value| value.to_str().ok())\n}}\n\nasync fn handler(request: Request, pool: PgPool) -> Result<Response<String>, Error> {{\n{check}    let policy = {package}::rpc_refusal(\n        request.method().as_str(),\n        PATH,\n        &{package}::bind_runtime::RequestHeaders {{\n            content_type: header(&request, \"content-type\"),\n            content_length: header(&request, \"content-length\"),\n            origin: header(&request, \"origin\"),\n            host: header(&request, \"host\"),\n            forwarded_host: header(&request, \"x-forwarded-host\"),\n            forwarded_proto: header(&request, \"x-forwarded-proto\"),\n        }},\n    );\n    if let Some(refusal) = policy {{\n        let mut headers = {refusal_headers};\n        headers.extend(refusal.headers);\n        return respond(refusal.status, JSON, refusal.body, &headers);\n    }}\n    let bytes = match Limited::new(request.into_body(), {package}::bind_runtime::MAX_BODY_BYTES).collect().await {{\n        Ok(collected) => collected.to_bytes(),\n        Err(error) if error.downcast_ref::<LengthLimitError>().is_some() => {{\n            return respond(413, JSON, String::from(\"{{\\\"error\\\":\\\"request body too large\\\"}}\"), {headers});\n        }}\n        Err(error) => return Err(Error::from(error)),\n    }};\n    let result = {package}::serve_rpc(PATH.to_string(), bytes.to_vec(), pool).await;\n    respond(result.status, JSON, result.body, {headers})\n}}\n",
             rust_string(path)
         ),
     )
 }
 
 /// The Vercel page function of the `ssr` mode (`vercel.json` rewrites `/` to it): `serve` with
-/// the request's query string; `HEAD` like `GET`, without a body.
+/// the request's query string; `HEAD` like `GET`, without a body. The body is never read: the
+/// page has none, and any other method is answered by `serve` without one (404).
 fn vercel_page_main(database_environment: &str) -> String {
     vercel_function(
         database_environment,
-        "use http_body_util::BodyExt;\n",
+        "",
         &format!(
-            "async fn handler(request: Request, pool: PgPool) -> Result<Response<String>, Error> {{\n    let head = request.method() == \"HEAD\";\n    let method = if head {{ \"GET\".to_string() }} else {{ request.method().as_str().to_string() }};\n    let query = request.uri().query().unwrap_or(\"\").to_string();\n    let bytes = request.into_body().collect().await?.to_bytes();\n    let response = {}::serve(&method, \"/\".to_string(), query, bytes.to_vec(), pool).await;\n    respond(response.status, response.content_type, if head {{ String::new() }} else {{ response.body }}, &[])\n}}\n",
+            "async fn handler(request: Request, pool: PgPool) -> Result<Response<String>, Error> {{\n    let head = request.method() == \"HEAD\";\n    let method = if head {{ \"GET\".to_string() }} else {{ request.method().as_str().to_string() }};\n    let query = request.uri().query().unwrap_or(\"\").to_string();\n    let response = {}::serve(&method, \"/\".to_string(), query, Vec::new(), pool).await;\n    respond(response.status, response.content_type, if head {{ String::new() }} else {{ response.body }}, &[])\n}}\n",
             package_name_for_code()
         ),
     )
@@ -735,8 +786,11 @@ fn vercel_json(ssr_page: bool) -> String {
     } else {
         String::new()
     };
+    // The static files of `web/` get the security headers the functions set themselves
+    // (`security_headers`); the `split` page's inline boot script rules out a `script-src`
+    // here, so its CSP only forbids framing, `<base>`, plugins and foreign form targets.
     format!(
-        "{{\n  \"$schema\": \"https://openapi.vercel.sh/vercel.json\",\n  \"outputDirectory\": \"web\"{rewrites}\n}}\n"
+        "{{\n  \"$schema\": \"https://openapi.vercel.sh/vercel.json\",\n  \"outputDirectory\": \"web\"{rewrites},\n  \"headers\": [\n    {{\n      \"source\": \"/(.*)\",\n      \"headers\": [\n        {{ \"key\": \"X-Content-Type-Options\", \"value\": \"nosniff\" }},\n        {{ \"key\": \"Referrer-Policy\", \"value\": \"no-referrer\" }},\n        {{ \"key\": \"X-Frame-Options\", \"value\": \"DENY\" }},\n        {{ \"key\": \"Content-Security-Policy\", \"value\": \"frame-ancestors 'none'; base-uri 'none'; object-src 'none'; form-action 'self'\" }}\n      ]\n    }}\n  ]\n}}\n"
     )
 }
 
@@ -935,7 +989,13 @@ mod tests {
         );
         assert!(file(&files, "src/lib.rs").contains("pub async fn handle_page("));
         let main = file(&files, "src/main.rs");
-        assert!(main.contains("bind_app::serve(method, path, query, body(&request), pool)"));
+        assert!(main.contains("bind_app::serve(method, path, query, body, pool)"));
+        // Every RPC request passes the library's policy and the body bound; responses carry the
+        // security headers; the pool gets the runtime's TLS and timeout options.
+        assert!(main.contains("bind_app::rpc_refusal(&method, &path, &request_headers(&request))"));
+        assert!(main.contains("bind_app::bind_runtime::MAX_BODY_BYTES"));
+        assert!(main.contains("bind_app::bind_runtime::security_headers(content_type)"));
+        assert!(main.contains("bind_app::bind_runtime::database_options(&database_url)?"));
         assert!(main.contains("include_str!(\"../web/styles.css\")"));
         assert!(file(&files, "template.yaml").contains("Path: /{proxy+}"));
         assert!(file(&files, "README.md").contains("Mode: `ssr`"));

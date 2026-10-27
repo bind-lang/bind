@@ -111,7 +111,7 @@ pub mod app {
         ::std::boxed::Box::pin(async move {
             let ctx = ctx.enter()?;
             let v11_checks: bool = ((((bind_admin(ctx.clone(), v0_a.clone()).await? && bind_nulo(ctx.clone(), v8_x.clone()).await?) && bind_presente(ctx.clone(), v8_x.clone()).await?) && bind_passaOpcional(ctx.clone(), v9_y, v10_z).await?) && bind_impossivel(ctx.clone(), v5_f).await?) && (bind_flutua(ctx.clone()).await? > 3.0_f32);
-            let v12_total: crate::bind_runtime::Int = bind_sete(ctx.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone()).await?.add(&bind_tamanho(ctx.clone(), Grande::Vazio).await?);
+            let v12_total: crate::bind_runtime::Int = bind_sete(ctx.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone(), v2_c.clone()).await?.add(&bind_tamanho(ctx.clone(), Grande::Vazio).await?)?;
             let v13_w: Wide = crate::db_insert_wide(ctx.clone(), bind_vazio(ctx.clone(), v0_a.clone()).await?, v1_b.clone(), v12_total.clone(), v3_d, v11_checks, bind_constantes(ctx.clone()).await? + v5_f, v6_g, v7_h.clone()).await?;
             crate::db_require_wide(ctx.clone(), v13_w.id.clone()).await
         })
@@ -150,7 +150,7 @@ pub mod app {
     pub fn bind_sete(ctx: crate::bind_runtime::Ctx, v0_a: crate::bind_runtime::Int, v1_b: crate::bind_runtime::Int, v2_c: crate::bind_runtime::Int, v3_d: crate::bind_runtime::Int, v4_e: crate::bind_runtime::Int, v5_f: crate::bind_runtime::Int, v6_g: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
         ::std::boxed::Box::pin(async move {
             let ctx = ctx.enter()?;
-            ::std::result::Result::Ok(v0_a.add(&v1_b).add(&v2_c).add(&v3_d).add(&v4_e).add(&v5_f).add(&v6_g))
+            v0_a.add(&v1_b)?.add(&v2_c)?.add(&v3_d)?.add(&v4_e)?.add(&v5_f)?.add(&v6_g)
         })
     }
 
@@ -257,8 +257,10 @@ pub struct HttpResult {
     pub body: ::std::string::String,
 }
 
-/// `{"error": message}` with the error's status; the message never exposes internals.
+/// `{"error": message}` with the error's status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn error_result(error: &crate::bind_runtime::AppError) -> HttpResult {
+    crate::bind_runtime::log_error(error);
     let body = ::serde_json::json!({ "error": error.public_message() }).to_string();
     HttpResult { status: error.status(), body }
 }
@@ -289,12 +291,14 @@ async fn finish<T: ::serde::Serialize>(
     }
 }
 
-/// Decodes the request, opens the transaction and builds the call's context.
+/// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
+/// and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
     body: &[u8],
     pool: &::sqlx::PgPool,
 ) -> ::std::result::Result<(I, crate::bind_runtime::Ctx), HttpResult> {
-    let input = ::serde_json::from_slice(body)
+    let text = crate::bind_runtime::request_text(body).map_err(|error| error_result(&error))?;
+    let input = ::serde_json::from_str(text)
     .map_err(|error| error_result(&crate::bind_runtime::AppError::BadRequest(error.to_string())))?;
     let transaction = pool
     .begin()
@@ -303,9 +307,13 @@ async fn begin<I: ::serde::de::DeserializeOwned>(
     ::std::result::Result::Ok((input, crate::bind_runtime::Ctx::with_transaction(transaction)))
 }
 
-/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction. The path's
+/// percent-escapes are decoded first (a browser sends `/api/café` as `/api/caf%C3%A9`).
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {
-    match path.trim_end_matches('/') {
+    let ::std::option::Option::Some(path) = crate::bind_runtime::decode_path(path) else {
+        return error_result(&crate::bind_runtime::AppError::BadRequest(::std::string::String::from("malformed request path")));
+    };
+    match crate::bind_runtime::rpc_route(&path) {
         "/api/largo" => {
             let (input, ctx) = match begin::<LargoInput>(body, pool).await {
                 ::std::result::Result::Ok(started) => started,

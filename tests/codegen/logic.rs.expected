@@ -78,7 +78,7 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_p: Par) -> crate::bind_runtim
             Par { a: p0, b: p1 } => {
                 let v1_a = p0.clone();
                 let v2_b = p1.clone();
-                v1_a.add(&v2_b)
+                v1_a.add(&v2_b)?
             }
         })
     })
@@ -143,7 +143,7 @@ pub fn bind_duplo(ctx: crate::bind_runtime::Ctx, v0_b: bool) -> crate::bind_runt
 pub fn bind_constante(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.mul(&crate::bind_runtime::Int::from_i64(0)))
+        v0_x.mul(&crate::bind_runtime::Int::from_i64(0))
     })
 }
 
@@ -151,7 +151,7 @@ pub fn bind_seta(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) 
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         let _ = v0_x.clone();
-        ::std::result::Result::Ok(v0_x.add(&crate::bind_runtime::Int::from_i64(1)))
+        v0_x.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 

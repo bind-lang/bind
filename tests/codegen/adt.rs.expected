@@ -20,9 +20,9 @@
 pub enum Arvore {
     #[serde(rename = "no")]
     No {
-        esq: ::std::boxed::Box<Arvore>,
+        esq: crate::bind_runtime::Rec<Arvore>,
         valor: crate::bind_runtime::Int,
-        dir: ::std::boxed::Box<Arvore>,
+        dir: crate::bind_runtime::Rec<Arvore>,
     },
     #[serde(rename = "folha")]
     Folha,
@@ -46,7 +46,7 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_a: Arvore) -> crate::bind_run
                 let v1_e = (**p0).clone();
                 let v2_v = p1.clone();
                 let v3_d = (**p2).clone();
-                bind_soma(ctx.clone(), v1_e.clone()).await?.add(&v2_v).add(&bind_soma(ctx.clone(), v3_d.clone()).await?)
+                bind_soma(ctx.clone(), v1_e.clone()).await?.add(&v2_v)?.add(&bind_soma(ctx.clone(), v3_d.clone()).await?)?
             }
         })
     })
@@ -66,7 +66,7 @@ pub fn bind_folhaUnica(ctx: crate::bind_runtime::Ctx, v0_a: Arvore) -> crate::bi
 pub fn bind_raiz(ctx: crate::bind_runtime::Ctx, v0_v: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<Arvore> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(Arvore::No { esq: ::std::boxed::Box::new(Arvore::Folha), valor: v0_v.clone(), dir: ::std::boxed::Box::new(Arvore::Folha) })
+        ::std::result::Result::Ok(Arvore::No { esq: crate::bind_runtime::Rec::new(Arvore::Folha), valor: v0_v.clone(), dir: crate::bind_runtime::Rec::new(Arvore::Folha) })
     })
 }
 

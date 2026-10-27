@@ -247,16 +247,25 @@ impl Int {
         ))
     }
 
-    pub fn add(&self, o: &Int) -> Int {
-        Int(&self.0 + &o.0)
+    /// `self + o`; `Overflow` past [`MAX_INT_BITS`].
+    pub fn add(&self, o: &Int) -> Result<Int, AppError> {
+        capped(&self.0 + &o.0, "addition")
     }
 
-    pub fn sub(&self, o: &Int) -> Int {
-        Int(&self.0 - &o.0)
+    /// `self - o`; `Overflow` past [`MAX_INT_BITS`].
+    pub fn sub(&self, o: &Int) -> Result<Int, AppError> {
+        capped(&self.0 - &o.0, "subtraction")
     }
 
-    pub fn mul(&self, o: &Int) -> Int {
-        Int(&self.0 * &o.0)
+    /// `self * o`; `Overflow` past [`MAX_INT_BITS`].
+    pub fn mul(&self, o: &Int) -> Result<Int, AppError> {
+        // A product has at most the sum of the operands' bits: refused before it is computed
+        // when even the smallest possible product is too large.
+        let (a, b) = (self.0.bits(), o.0.bits());
+        if a > 0 && b > 0 && a + b - 1 > MAX_INT_BITS {
+            return Err(int_overflow("multiplication"));
+        }
+        capped(&self.0 * &o.0, "multiplication")
     }
 
     pub fn neg(&self) -> Int {
@@ -283,6 +292,25 @@ impl Int {
 
     pub fn to_index(&self) -> Option<usize> {
         usize::try_from(&self.0).ok()
+    }
+}
+
+/// Largest magnitude of an `Int` produced by arithmetic, in bits (1024 limbs of 32 bits): a
+/// sum, difference or product beyond it is `AppError::Overflow`. The same bound as the
+/// evaluator's `core::bigint::MAX_INT_LIMBS` and the JS runtime's `MAX_INT_BITS`, so every
+/// mode fails the same computation. It bounds the memory and time untrusted input can make
+/// `Int` arithmetic take.
+pub const MAX_INT_BITS: u64 = 32 * 1024;
+
+fn int_overflow(what: &str) -> AppError {
+    AppError::Overflow(format!("Int {what} beyond {MAX_INT_BITS} bits"))
+}
+
+fn capped(value: num_bigint::BigInt, what: &str) -> Result<Int, AppError> {
+    if value.bits() > MAX_INT_BITS {
+        Err(int_overflow(what))
+    } else {
+        Ok(Int(value))
     }
 }
 
@@ -434,6 +462,175 @@ pub fn duration_neg(a: &chrono::TimeDelta) -> Result<chrono::TimeDelta, AppError
     chrono::TimeDelta::zero()
         .checked_sub(a)
         .ok_or_else(|| AppError::Overflow("duration negation overflowed".to_string()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// `Rec<T>`: the field of a recursive type (one that reaches back to the type declaring it).
+// A value built by a fold or a long list can nest such fields millions of levels deep, so
+// nothing that walks a whole value may use the call stack per level:
+// - clone is shallow (a shared handle: Bind values are immutable);
+// - drop is iterative: the last handle of a value moves it to a per-thread queue instead of
+//   dropping it in place, and the outermost `Rec` being dropped empties the queue one value at
+//   a time, after its own value (so a chain of any length is freed in constant stack);
+// - serialization fails with an error past `MAX_VALUE_DEPTH` nested `Rec`s, instead of
+//   overflowing the stack (decoding is bounded by serde_json's nesting limit of 128).
+// Equality still recurses: comparing two very deep values is the program's choice.
+// ---------------------------------------------------------------------------------------------
+
+/// Most nested `Rec` fields a value may have to be serialized (a response, a server call of the
+/// SSR page): beyond, `AppError::Serialization`. The same bound as call nesting.
+pub const MAX_VALUE_DEPTH: u32 = MAX_DEPTH;
+
+thread_local! {
+    /// Values whose last `Rec` handle was dropped, waiting to be dropped by [`Drain`].
+    static DEFERRED: std::cell::RefCell<Vec<Box<dyn std::any::Any>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// Whether a `Drain` of this thread is emptying `DEFERRED`.
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// `Rec` fields being serialized on this thread, nested.
+    static SERIALIZING: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A recursive field: a shared handle on its value, dropped without recursion (see above).
+/// Read through `Deref` (`*field`).
+pub struct Rec<T: 'static> {
+    // Dropped first: the value goes to `DEFERRED` (by `Rec::drop`) when this was its last handle.
+    value: Arc<T>,
+    // Dropped second: empties `DEFERRED`, unless an outer `Drain` of this thread already is.
+    _drain: Drain,
+}
+
+impl<T: 'static> Rec<T> {
+    pub fn new(value: T) -> Rec<T> {
+        Rec {
+            value: Arc::new(value),
+            _drain: Drain,
+        }
+    }
+}
+
+impl<T: 'static> Drop for Rec<T> {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.value) != 1 {
+            return;
+        }
+        // The last handle: keep the value alive in the queue, so `value` is only released here
+        // and the value's own fields are dropped by the drain loop, not nested in this drop.
+        let handle: Box<dyn std::any::Any> = Box::new(Arc::clone(&self.value));
+        let deferred = DEFERRED.try_with(|queue| match queue.try_borrow_mut() {
+            Ok(mut queue) => {
+                queue.push(handle);
+                None
+            }
+            Err(_) => Some(handle),
+        });
+        // The queue is unavailable (the thread is exiting): the value is dropped in place.
+        drop(deferred);
+    }
+}
+
+/// Empties [`DEFERRED`] when dropped, unless an outer `Drain` of the thread is doing it.
+struct Drain;
+
+impl Drop for Drain {
+    fn drop(&mut self) {
+        if DRAINING.try_with(|draining| draining.replace(true)) != Ok(false) {
+            return;
+        }
+        loop {
+            let next = DEFERRED
+                .try_with(|queue| {
+                    queue
+                        .try_borrow_mut()
+                        .ok()
+                        .and_then(|mut queue| queue.pop())
+                })
+                .ok()
+                .flatten();
+            // Dropping a value may queue more values (its own `Rec` fields): the loop takes them.
+            match next {
+                Some(value) => drop(value),
+                None => break,
+            }
+        }
+        let _ = DRAINING.try_with(|draining| draining.set(false));
+    }
+}
+
+impl<T: 'static> std::ops::Deref for Rec<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T: 'static> Clone for Rec<T> {
+    fn clone(&self) -> Self {
+        Rec {
+            value: Arc::clone(&self.value),
+            _drain: Drain,
+        }
+    }
+}
+
+impl<T: fmt::Debug + 'static> fmt::Debug for Rec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+impl<T: PartialEq + 'static> PartialEq for Rec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.value, &other.value) || *self.value == *other.value
+    }
+}
+
+impl<T: Eq + 'static> Eq for Rec<T> {}
+
+impl<T: PartialOrd + 'static> PartialOrd for Rec<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.value.partial_cmp(&other.value)
+    }
+}
+
+impl<T: Ord + 'static> Ord for Rec<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.value.cmp(&other.value)
+    }
+}
+
+impl<T: std::hash::Hash + 'static> std::hash::Hash for Rec<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.value.hash(state);
+    }
+}
+
+impl<T: serde::Serialize + 'static> serde::Serialize for Rec<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let depth = SERIALIZING
+            .try_with(|depth| {
+                let next = depth.get().saturating_add(1);
+                depth.set(next);
+                next
+            })
+            .unwrap_or(u32::MAX);
+        let result = if depth > MAX_VALUE_DEPTH {
+            Err(serde::ser::Error::custom(
+                "value nested too deeply to serialize",
+            ))
+        } else {
+            self.value.serialize(serializer)
+        };
+        let _ = SERIALIZING.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
+        result
+    }
+}
+
+impl<'de, T: serde::Deserialize<'de> + 'static> serde::Deserialize<'de> for Rec<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Rec::new)
+    }
 }
 
 /// Bind's `Result<T, E>`.
@@ -1778,6 +1975,244 @@ fn js_decodable_numbers(json: &serde_json::Value) -> bool {
 // Page parameters (SSR): the query string of `GET /`, decoded like the JS runtime's `readParams`.
 // ---------------------------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------------------------
+// HTTP: the request policy of the RPC routes, the security headers of every response, the
+// database connection options and the server-side log of internal errors. The entry points
+// (the Lambda's `main`, the Vercel functions) call these; the JS/Worker server applies the
+// same policy.
+// ---------------------------------------------------------------------------------------------
+
+/// The request headers the RPC policy reads (`None` when absent or not valid text).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RequestHeaders<'a> {
+    pub content_type: Option<&'a str>,
+    pub content_length: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub host: Option<&'a str>,
+    /// `X-Forwarded-Host`, set by some proxies in front of the function.
+    pub forwarded_host: Option<&'a str>,
+    /// `X-Forwarded-Proto` (the platforms terminate TLS in front of the function).
+    pub forwarded_proto: Option<&'a str>,
+}
+
+/// The response that ends an RPC request before it runs: a refusal, or the answer to a
+/// preflight (`OPTIONS`, 204).
+#[derive(Debug, PartialEq, Eq)]
+pub struct Refusal {
+    pub status: u16,
+    /// `{"error": message}` (empty for a 204).
+    pub body: String,
+    pub headers: Vec<(&'static str, String)>,
+}
+
+fn refusal(status: u16, message: &str, headers: Vec<(&'static str, String)>) -> Refusal {
+    Refusal {
+        status,
+        body: serde_json::json!({ "error": message }).to_string(),
+        headers,
+    }
+}
+
+/// Whether the media type of `content_type` (before any `;`, trimmed, ASCII case-insensitive)
+/// is `application/json`.
+pub fn is_json_content_type(content_type: &str) -> bool {
+    content_type
+        .split(';')
+        .next()
+        .is_some_and(|media| media.trim().eq_ignore_ascii_case("application/json"))
+}
+
+/// The first value of a comma-separated header, trimmed.
+fn first_value(value: &str) -> &str {
+    value.split(',').next().unwrap_or(value).trim()
+}
+
+/// The origin (`scheme://host[:port]`) the request was sent to: `X-Forwarded-Host` or `Host`,
+/// with `X-Forwarded-Proto` (`https` when absent: the platforms only serve HTTPS).
+pub fn request_origin(headers: &RequestHeaders) -> Option<String> {
+    let host = headers.forwarded_host.or(headers.host).map(first_value)?;
+    if host.is_empty() {
+        return None;
+    }
+    let scheme = headers
+        .forwarded_proto
+        .map(first_value)
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("https");
+    Some(format!("{scheme}://{host}"))
+}
+
+/// Largest request body of an RPC call, in bytes (declared by `Content-Length` or actual):
+/// beyond, 413 without decoding it. The JS/Worker server uses the same bound.
+pub const MAX_BODY_BYTES: usize = 1_048_576;
+
+/// The policy of an RPC request at `path` (CSRF protection and request hygiene), checked
+/// before anything else runs, in this order (the JS/Worker server's):
+/// 1. when `same_origin` (no `frontend_origin`), an `Origin` header, if any, must be the
+///    request's own origin (403); with `frontend_origin`, the entry point's `cors` has already
+///    refused every other origin and answered the allowed one's preflight;
+/// 2. `OPTIONS` is answered here (204);
+/// 3. the percent-decoded path must name a procedure (`known`): a malformed escape is 400, an
+///    unknown name 404;
+/// 4. the method must be `POST` (405, `Allow: POST, OPTIONS`);
+/// 5. the `Content-Type` media type must be `application/json` (415): a browser sends that type
+///    cross-origin only after a CORS preflight, which a form or a "simple" `fetch` never gets;
+/// 6. a `Content-Length` must be a number (400) of at most [`MAX_BODY_BYTES`] (413).
+///
+/// `None`: the request may run (the entry point still bounds the actual body, 413).
+pub fn rpc_refusal(
+    method: &str,
+    path: &str,
+    headers: &RequestHeaders,
+    same_origin: bool,
+    known: &dyn Fn(&str) -> bool,
+) -> Option<Refusal> {
+    if same_origin && let Some(origin) = headers.origin {
+        let own = request_origin(headers);
+        if !own.is_some_and(|own| own.eq_ignore_ascii_case(origin.trim())) {
+            return Some(refusal(403, "origin not allowed", Vec::new()));
+        }
+    }
+    if method == "OPTIONS" {
+        return Some(Refusal {
+            status: 204,
+            body: String::new(),
+            headers: Vec::new(),
+        });
+    }
+    let Some(decoded) = decode_path(path) else {
+        return Some(refusal(400, "malformed request path", Vec::new()));
+    };
+    if !known(rpc_route(&decoded)) {
+        return Some(refusal(404, "not found", Vec::new()));
+    }
+    if method != "POST" {
+        return Some(refusal(
+            405,
+            "method not allowed",
+            vec![("allow", String::from("POST, OPTIONS"))],
+        ));
+    }
+    if !headers.content_type.is_some_and(is_json_content_type) {
+        return Some(refusal(415, "unsupported media type", Vec::new()));
+    }
+    if let Some(length) = headers.content_length.map(str::trim) {
+        if length.is_empty() || !length.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(refusal(400, "invalid content length", Vec::new()));
+        }
+        if !length
+            .parse::<usize>()
+            .is_ok_and(|length| length <= MAX_BODY_BYTES)
+        {
+            return Some(refusal(413, "request body too large", Vec::new()));
+        }
+    }
+    None
+}
+
+/// The route of a decoded RPC path: without its trailing slashes (`/` stays `/`).
+pub fn rpc_route(path: &str) -> &str {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() && !path.is_empty() {
+        "/"
+    } else {
+        trimmed
+    }
+}
+
+/// The text of an RPC request body: strict UTF-8 without a byte order mark, else
+/// `BadRequest` (400).
+pub fn request_text(body: &[u8]) -> Result<&str, AppError> {
+    if body.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return Err(AppError::BadRequest(
+            "request body starts with a byte order mark".to_string(),
+        ));
+    }
+    std::str::from_utf8(body)
+        .map_err(|_| AppError::BadRequest("request body is not valid UTF-8".to_string()))
+}
+
+/// The policy of the page content security: the SSR page loads no script, only its stylesheet
+/// (`/styles.css`) and its inline SVG icon.
+pub const PAGE_CONTENT_SECURITY_POLICY: &str = "default-src 'none'; style-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+
+/// The security headers of a response with `content_type`: `nosniff` and no referrer for all;
+/// for HTML (the page) a strict CSP and no framing; for JSON (the API) no caching.
+pub fn security_headers(content_type: &str) -> Vec<(&'static str, &'static str)> {
+    let mut headers = vec![
+        ("x-content-type-options", "nosniff"),
+        ("referrer-policy", "no-referrer"),
+    ];
+    let media = content_type.split(';').next().unwrap_or("").trim();
+    if media.eq_ignore_ascii_case("text/html") {
+        headers.push(("content-security-policy", PAGE_CONTENT_SECURITY_POLICY));
+        headers.push(("x-frame-options", "DENY"));
+    } else if media.eq_ignore_ascii_case("application/json") {
+        headers.push(("cache-control", "no-store"));
+    }
+    headers
+}
+
+/// How long a request waits for a database connection before failing (500).
+pub const DATABASE_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// PostgreSQL's `statement_timeout` for the server's connections, unless the URL sets it.
+pub const DATABASE_STATEMENT_TIMEOUT: &str = "30s";
+
+/// The connection options of `url`. TLS: when neither the URL (`sslmode`) nor the
+/// environment (`PGSSLMODE`) chooses a mode, `verify-full` (certificate checked against the
+/// Mozilla roots and the host name; a server with a private CA needs `sslrootcert` or an
+/// explicit `sslmode`). `statement_timeout` is [`DATABASE_STATEMENT_TIMEOUT`] unless the
+/// URL's `options` sets one.
+pub fn database_options(url: &str) -> Result<sqlx::postgres::PgConnectOptions, sqlx::Error> {
+    let mut options: sqlx::postgres::PgConnectOptions = url.parse()?;
+    let query = url.split_once('?').map_or("", |(_, query)| query);
+    let parameters = QueryParams::parse(query);
+    let has = |name: &str| parameters.pairs.iter().any(|(key, _)| key == name);
+    if !has("sslmode") && !has("ssl-mode") && std::env::var_os("PGSSLMODE").is_none() {
+        options = options.ssl_mode(sqlx::postgres::PgSslMode::VerifyFull);
+    }
+    let timeout_set = parameters.pairs.iter().any(|(key, value)| {
+        key == "options"
+            && value
+                .as_deref()
+                .is_some_and(|value| value.contains("statement_timeout"))
+    });
+    if !timeout_set {
+        options = options.options([("statement_timeout", DATABASE_STATEMENT_TIMEOUT)]);
+    }
+    Ok(options)
+}
+
+/// Writes an internal error (status 500) to standard error, where the platforms' logs collect
+/// it: its full `Display`, which responses never carry (they get `public_message`).
+pub fn log_error(error: &AppError) {
+    if error.status() >= 500 {
+        eprintln!("bind: {error}");
+    }
+}
+
+/// The path of an RPC request with its percent-escapes decoded (`/api/caf%C3%A9` is
+/// `/api/café`: the JS frontend writes the name as is and the browser escapes it); `None` for
+/// a `%` not followed by two hex digits or escapes that are not UTF-8.
+pub fn decode_path(path: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !path.contains('%') {
+        return Some(std::borrow::Cow::Borrowed(path));
+    }
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut input = path.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let high = (input.next()? as char).to_digit(16)?;
+            let low = (input.next()? as char).to_digit(16)?;
+            bytes.push((high * 16 + low) as u8);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok().map(std::borrow::Cow::Owned)
+}
+
 /// The public message of a page parameter that is absent, repeated or invalid; the JS runtime's
 /// `errorBody("BadParameter", name)` shows the same text.
 pub fn bad_parameter_message(name: &str) -> String {
@@ -2252,9 +2687,9 @@ mod tests {
         assert_eq!(a.rem_checked(&b), Some(Int::from_i64(-1)));
         assert_eq!(a.div_checked(&Int::from_i64(0)), None);
         assert_eq!(a.rem_checked(&Int::from_i64(0)), None);
-        assert_eq!(a.add(&b), Int::from_i64(-5));
-        assert_eq!(a.sub(&b), Int::from_i64(-9));
-        assert_eq!(a.mul(&b), Int::from_i64(-14));
+        assert_eq!(a.add(&b).unwrap(), Int::from_i64(-5));
+        assert_eq!(a.sub(&b).unwrap(), Int::from_i64(-9));
+        assert_eq!(a.mul(&b).unwrap(), Int::from_i64(-14));
         assert_eq!(a.neg(), Int::from_i64(7));
         assert_eq!(Int::from_i64(3).to_index(), Some(3));
         assert_eq!(a.to_index(), None);
@@ -2406,6 +2841,215 @@ mod tests {
     }
 
     #[test]
+    fn int_arithmetic_is_bounded() {
+        let half = Int(num_bigint::BigInt::from(1) << 16384);
+        let one = Int::from_i64(1);
+        let below = half.sub(&one).unwrap();
+        // x * (x - 1) + (x - 1) = 2^32768 - 1: the largest Int.
+        let top = half.mul(&below).unwrap().add(&below).unwrap();
+        assert_eq!(top.0.bits(), MAX_INT_BITS);
+        assert!(matches!(top.add(&one), Err(AppError::Overflow(_))));
+        assert!(matches!(top.neg().sub(&one), Err(AppError::Overflow(_))));
+        assert!(matches!(half.mul(&half), Err(AppError::Overflow(_))));
+        assert!(matches!(top.mul(&top), Err(AppError::Overflow(_))));
+        assert_eq!(top.mul(&Int::from_i64(0)).unwrap(), Int::from_i64(0));
+    }
+
+    /// A recursive value as the generated code builds it: `Rec` fields.
+    #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+    enum Chain {
+        Link { next: Rec<Chain> },
+        End,
+    }
+
+    fn chain(length: usize) -> Chain {
+        let mut value = Chain::End;
+        for _ in 0..length {
+            value = Chain::Link {
+                next: Rec::new(value),
+            };
+        }
+        value
+    }
+
+    #[test]
+    fn deep_recursive_values_clone_and_drop_without_recursion() {
+        // On a 256 KiB stack: a recursive drop of a million links would overflow it.
+        let handle = std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(|| {
+                let value = chain(1_000_000);
+                let copy = value.clone();
+                drop(value);
+                assert!(matches!(&copy, Chain::Link { .. }));
+                drop(copy);
+                // Shared subtrees: only the last handle frees them.
+                let shared = Rec::new(chain(10));
+                let a = Chain::Link {
+                    next: shared.clone(),
+                };
+                drop(shared);
+                drop(a);
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn deep_recursive_values_fail_to_serialize() {
+        let handle = std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(|| {
+                let fits = chain(MAX_VALUE_DEPTH as usize);
+                let text = serde_json::to_string(&fits).unwrap();
+                assert!(text.starts_with("{\"Link\":{\"next\":"));
+                let too_deep = chain(MAX_VALUE_DEPTH as usize + 1);
+                assert!(serde_json::to_string(&too_deep).is_err());
+                // The counter is back to zero after an error.
+                assert!(serde_json::to_string(&chain(3)).is_ok());
+                assert_eq!(
+                    serde_json::from_str::<Chain>("{\"Link\":{\"next\":\"End\"}}").unwrap(),
+                    chain(1)
+                );
+            })
+            .unwrap();
+        handle.join().unwrap();
+    }
+
+    fn json_post(origin: Option<&str>) -> RequestHeaders<'_> {
+        RequestHeaders {
+            content_type: Some("application/json; charset=utf-8"),
+            content_length: Some("2"),
+            origin,
+            host: Some("app.example"),
+            forwarded_host: None,
+            forwarded_proto: Some("https"),
+        }
+    }
+
+    #[test]
+    fn rpc_policy_in_order() {
+        let known = |route: &str| route == "/api/ping" || route == "/api/café";
+        let status = |method: &str, path: &str, headers: &RequestHeaders, same_origin: bool| {
+            rpc_refusal(method, path, headers, same_origin, &known).map(|refusal| refusal.status)
+        };
+        let direct = json_post(None);
+        assert_eq!(status("POST", "/api/ping", &direct, true), None);
+        assert_eq!(status("POST", "/api/ping/", &direct, true), None);
+        assert_eq!(status("POST", "/api/caf%C3%A9", &direct, true), None);
+        let own = json_post(Some("https://app.example"));
+        assert_eq!(status("POST", "/api/ping", &own, true), None);
+        // 1. a foreign origin, before anything else (even OPTIONS and unknown paths)
+        let foreign = json_post(Some("https://evil.example"));
+        assert_eq!(status("OPTIONS", "/api/nope", &foreign, true), Some(403));
+        assert_eq!(status("POST", "/api/ping", &foreign, false), None);
+        let http = RequestHeaders {
+            forwarded_proto: Some("http"),
+            ..own
+        };
+        assert_eq!(status("POST", "/api/ping", &http, true), Some(403));
+        // 2. a preflight
+        assert_eq!(status("OPTIONS", "/api/nope", &direct, true), Some(204));
+        // 3. the route
+        assert_eq!(status("GET", "/api/%zz", &direct, true), Some(400));
+        assert_eq!(status("GET", "/api/%FF", &direct, true), Some(400));
+        assert_eq!(status("GET", "/api/nope", &direct, true), Some(404));
+        // 4. the method
+        let get = rpc_refusal("GET", "/api/ping", &direct, true, &known).unwrap();
+        assert_eq!(get.status, 405);
+        assert_eq!(get.headers, vec![("allow", String::from("POST, OPTIONS"))]);
+        assert_eq!(get.body, "{\"error\":\"method not allowed\"}");
+        // 5. the content type
+        for content_type in [Some("text/plain"), Some("application/jsonx"), None] {
+            let form = RequestHeaders {
+                content_type,
+                ..direct
+            };
+            assert_eq!(status("POST", "/api/ping", &form, true), Some(415));
+        }
+        let upper = RequestHeaders {
+            content_type: Some(" Application/JSON ;x=1"),
+            ..direct
+        };
+        assert_eq!(status("POST", "/api/ping", &upper, true), None);
+        // 6. the declared length
+        for (length, expected) in [
+            ("12a", Some(400)),
+            ("", Some(400)),
+            ("-1", Some(400)),
+            ("1048576", None),
+            ("1048577", Some(413)),
+            ("99999999999999999999999", Some(413)),
+        ] {
+            let headers = RequestHeaders {
+                content_length: Some(length),
+                ..direct
+            };
+            assert_eq!(
+                status("POST", "/api/ping", &headers, true),
+                expected,
+                "{length:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_bodies_are_strict_utf8() {
+        assert_eq!(request_text(b"{}").unwrap(), "{}");
+        assert!(matches!(
+            request_text(b"\xEF\xBB\xBF{}"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            request_text(b"{\"a\":\"\xFF\"}"),
+            Err(AppError::BadRequest(_))
+        ));
+        assert_eq!(decode_path("/api/a%2Fb").as_deref(), Some("/api/a/b"));
+        assert_eq!(decode_path("/api/%4"), None);
+        assert_eq!(rpc_route("/api/x//"), "/api/x");
+        assert_eq!(rpc_route("/"), "/");
+    }
+
+    #[test]
+    fn security_headers_by_content_type() {
+        let page = security_headers("text/html; charset=utf-8");
+        assert!(page.contains(&("content-security-policy", PAGE_CONTENT_SECURITY_POLICY)));
+        assert!(page.contains(&("x-frame-options", "DENY")));
+        assert!(page.contains(&("x-content-type-options", "nosniff")));
+        let api = security_headers("application/json; charset=utf-8");
+        assert!(api.contains(&("cache-control", "no-store")));
+        assert!(api.contains(&("referrer-policy", "no-referrer")));
+        assert!(
+            !api.iter()
+                .any(|(name, _)| *name == "content-security-policy")
+        );
+        assert_eq!(security_headers("text/css").len(), 2);
+    }
+
+    #[test]
+    fn database_options_default_to_verified_tls() {
+        use sqlx::postgres::PgSslMode;
+        if std::env::var_os("PGSSLMODE").is_some() {
+            return;
+        }
+        let default = database_options("postgresql://u:p@db.example/app").unwrap();
+        assert!(matches!(default.get_ssl_mode(), PgSslMode::VerifyFull));
+        let explicit = database_options("postgresql://u:p@db.example/app?sslmode=require").unwrap();
+        assert!(matches!(explicit.get_ssl_mode(), PgSslMode::Require));
+    }
+
+    #[test]
+    fn errors_are_logged_without_reaching_clients() {
+        // 4xx errors are the client's: not logged; 500s are (on stderr, not checked here).
+        log_error(&AppError::BadRequest("x".into()));
+        log_error(&AppError::Internal("secret detail".into()));
+        assert_eq!(
+            AppError::Internal("secret detail".into()).public_message(),
+            "internal error"
+        );
+    }
+
+    #[test]
     fn lists() {
         let xs = list_of(vec![10, 20]);
         assert_eq!(first(&xs), Some(10));
@@ -2470,7 +3114,7 @@ mod tests {
             if n == Int::from_i64(0) {
                 Ok(n)
             } else {
-                recurse(ctx, n.sub(&Int::from_i64(1))).await
+                recurse(ctx, n.sub(&Int::from_i64(1))?).await
             }
         })
     }

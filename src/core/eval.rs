@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use super::bigint::BigInt;
+use super::bigint::{BigInt, MAX_INT_LIMBS};
 
 use crate::types::exhaustive::Pat;
 use crate::types::ty::Type;
@@ -170,6 +170,9 @@ impl Drop for Shared {
 pub enum EvalError {
     Unsupported(String),
     RecursionLimit,
+    /// An `Int` sum, difference or product beyond `bigint::MAX_INT_LIMBS` (the runtimes'
+    /// `AppError::Overflow`).
+    Overflow,
 }
 
 impl Value {
@@ -351,7 +354,7 @@ pub struct Budget {
 /// The budget of the static pre-render: a page that needs more is rendered at run time.
 pub const PRERENDER_BUDGET: Budget = Budget {
     work: 2_000_000,
-    int_limbs: 1024,
+    int_limbs: MAX_INT_LIMBS,
     string_bytes: 4 * 1024 * 1024,
     html_bytes: 1024 * 1024,
 };
@@ -1356,15 +1359,31 @@ fn follow(value: &Value, path: &[(String, usize)]) -> Result<Value, EvalError> {
     Ok(current.clone())
 }
 
+/// An `Int` result of arithmetic, or `Overflow` beyond `MAX_INT_LIMBS` (as in the runtimes).
+fn bounded(value: BigInt) -> Result<Value, EvalError> {
+    if value.exceeds_int_bound() {
+        Err(EvalError::Overflow)
+    } else {
+        Ok(Value::Int(value))
+    }
+}
+
 fn prim(op: Prim, args: Vec<Value>) -> Result<Value, EvalError> {
     let bad = || unsupported(&format!("bad operands for {op:?}"));
     let mut args = args.into_iter();
     let (a, b) = (args.next(), args.next());
     let zero = BigInt::from(0);
     Ok(match (op, a, b) {
-        (Prim::IntAdd, Some(Value::Int(a)), Some(Value::Int(b))) => Value::Int(a + b),
-        (Prim::IntSub, Some(Value::Int(a)), Some(Value::Int(b))) => Value::Int(a - b),
-        (Prim::IntMul, Some(Value::Int(a)), Some(Value::Int(b))) => Value::Int(a * b),
+        (Prim::IntAdd, Some(Value::Int(a)), Some(Value::Int(b))) => bounded(a + b)?,
+        (Prim::IntSub, Some(Value::Int(a)), Some(Value::Int(b))) => bounded(a - b)?,
+        (Prim::IntMul, Some(Value::Int(a)), Some(Value::Int(b))) => {
+            // The product has at least `limbs(a) + limbs(b) - 1` limbs: refused unbuilt.
+            let (x, y) = (a.limb_count(), b.limb_count());
+            if x > 0 && y > 0 && x + y - 1 > MAX_INT_LIMBS {
+                return Err(EvalError::Overflow);
+            }
+            bounded(a * b)?
+        }
         (Prim::IntNeg, Some(Value::Int(a)), None) => Value::Int(-a),
         // `BigInt` division truncates toward zero and the remainder follows the dividend.
         (Prim::IntDivChecked, Some(Value::Int(a)), Some(Value::Int(b))) => {

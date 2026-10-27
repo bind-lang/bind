@@ -73,7 +73,7 @@ pub fn bind_getX(ctx: crate::bind_runtime::Ctx, v0_c: Ctx) -> crate::bind_runtim
 pub fn bind_get_x(ctx: crate::bind_runtime::Ctx, v0_c: Ctx) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(bind_getX(ctx.clone(), v0_c.clone()).await?.add(&crate::bind_runtime::Int::from_i64(1)))
+        bind_getX(ctx.clone(), v0_c.clone()).await?.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 

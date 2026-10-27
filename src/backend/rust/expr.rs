@@ -21,7 +21,7 @@ use crate::types::ty::Type;
 use super::db::{DbFunction, DbKey};
 use super::types::{
     ARC, BOX, CtorDef, CtorKind, DISTINCT_FIELD, Layout, OPTION, PHANTOM_FIELD, PHANTOM_VARIANT,
-    RESULT, RUNTIME, STRING, field_ident,
+    REC, RESULT, RUNTIME, STRING, field_ident,
 };
 
 /// One function in the uniform calling convention.
@@ -343,7 +343,7 @@ impl Access {
         }
     }
 
-    /// A pattern binder: `&T`, or `&Box<T>` when `boxed`.
+    /// A pattern binder: `&T`, or `&Rec<T>` when `boxed`.
     fn bound(name: &str, boxed: bool, copy: bool) -> Access {
         if boxed {
             Access {
@@ -759,7 +759,7 @@ impl Generator<'_, '_> {
                 .enumerate()
                 .map(|(index, ((field, _), value))| {
                     let value = if self.layout.is_boxed(def.name, index) {
-                        format!("{BOX}::new({value})")
+                        format!("{REC}::new({value})")
                     } else {
                         value.clone()
                     };
@@ -1011,7 +1011,14 @@ impl Generator<'_, '_> {
                 };
                 let a = self.operand(a);
                 let b = self.borrowed(b);
-                atom(format!("{a}.{method}({b})"))
+                // A sum, difference or product past `MAX_INT_BITS` is `Overflow`; a quotient or
+                // remainder is never larger than its operands.
+                let fallible = if matches!(op, IntAdd | IntSub | IntMul) {
+                    "?"
+                } else {
+                    ""
+                };
+                atom(format!("{a}.{method}({b}){fallible}"))
             }
             (IntNeg, [a]) => atom(format!("{}.neg()", self.operand(a))),
             (

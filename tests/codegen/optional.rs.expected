@@ -72,7 +72,7 @@ pub fn bind_inc(ctx: crate::bind_runtime::Ctx, v0_x: ::std::option::Option<crate
             }
             ::std::option::Option::Some(p0) => {
                 let v1_n = p0.clone();
-                v1_n.add(&crate::bind_runtime::Int::from_i64(1))
+                v1_n.add(&crate::bind_runtime::Int::from_i64(1))?
             }
         })
     })
