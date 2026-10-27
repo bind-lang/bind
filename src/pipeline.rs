@@ -31,6 +31,19 @@ const CARGO_ENVIRONMENT_OVERRIDES: &[&str] = &[
     "CARGO_BUILD_TARGET_DIR",
 ];
 
+/// Prefixes of Cargo configuration variables removed from every Cargo invocation: build,
+/// per-target (linker, runner), profile, source replacement, registry and host settings.
+const CARGO_ENVIRONMENT_OVERRIDE_PREFIXES: &[&str] = &[
+    "CARGO_BUILD_",
+    "CARGO_TARGET_",
+    "CARGO_HOST_",
+    "CARGO_PROFILE_",
+    "CARGO_SOURCE_",
+    "CARGO_REGISTRIES_",
+    "CARGO_REGISTRY_",
+    "CARGO_UNSTABLE_",
+];
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BuildMode {
     Build,
@@ -79,6 +92,7 @@ pub fn build(
     locks.require_present(&locks.target, options)?;
     locks.require_present(&locks.cargo, options)?;
 
+    check_no_project_cargo_config(&config.root, generated)?;
     let environment = CargoEnvironment::new(config, app);
     ensure_tool(
         environment.command("cargo", generated).arg("--version"),
@@ -376,6 +390,11 @@ impl CargoEnvironment {
             .iter()
             .map(|name| name.to_string())
             .collect();
+        removed.extend(
+            std::env::vars_os()
+                .filter_map(|(name, _)| name.into_string().ok())
+                .filter(|name| is_cargo_override(name)),
+        );
         removed.extend(secret_variables(config, app));
         Self { removed }
     }
@@ -388,6 +407,48 @@ impl CargoEnvironment {
         }
         command
     }
+}
+
+/// Whether `name` is a Cargo configuration variable that could change the certified build.
+fn is_cargo_override(name: &str) -> bool {
+    CARGO_ENVIRONMENT_OVERRIDE_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
+/// Refuses a Cargo configuration file (`.cargo/config` or `.cargo/config.toml`) inside the
+/// project on the way to the generated workspace: Cargo reads every such file in the ancestors
+/// of the directory it runs in, and one shipped with the project could set a `rustc` wrapper,
+/// a linker, a runner or a source replacement. The user's own configuration (`$CARGO_HOME`
+/// and the directories above the project) is theirs and stays trusted.
+fn check_no_project_cargo_config(root: &Path, generated: &Path) -> Result<(), String> {
+    // A manifest named without a directory (`bind.toml`) has the empty path as its root.
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve {}: {error}", root.display()))?;
+    let generated = generated
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve {}: {error}", generated.display()))?;
+    for directory in generated.ancestors() {
+        for name in ["config", "config.toml"] {
+            let file = directory.join(".cargo").join(name);
+            if fs::symlink_metadata(&file).is_ok() {
+                return Err(format!(
+                    "Refusing to build: {} would change how Cargo compiles the generated workspace. Certified builds do not read Cargo configuration from the project; remove it.",
+                    file.display()
+                ));
+            }
+        }
+        if directory == root {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// The variables of the application's secrets (and the database credential): never passed to
@@ -728,23 +789,14 @@ pub(crate) fn write_workspace(
     fs::create_dir_all(parent)
         .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
     let name = name.to_string_lossy();
-    let staging = parent.join(format!(".{name}.bind-new-{}", std::process::id()));
-    let previous = parent.join(format!(".{name}.bind-old-{}", std::process::id()));
-    for leftover in [&staging, &previous] {
-        if fs::symlink_metadata(leftover).is_ok() {
-            fs::remove_dir_all(leftover)
-                .map_err(|error| format!("Cannot remove {}: {error}", leftover.display()))?;
-        }
-    }
+    let staging = create_fresh_dir(parent, &format!(".{name}.bind-new"))?;
     let written = (|| {
         for (path, content) in files {
             let path = staging.join(path);
             if let Some(directory) = path.parent() {
-                fs::create_dir_all(directory)
-                    .map_err(|error| format!("Cannot create {}: {error}", directory.display()))?;
+                create_dirs_below(&staging, directory)?;
             }
-            fs::write(&path, content)
-                .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
+            write_new_file(&path, content)?;
         }
         Ok::<(), String>(())
     })();
@@ -753,7 +805,22 @@ pub(crate) fn write_workspace(
         return Err(error);
     }
     let had_previous = resolved_target.exists();
+    // The previous workspace moves to a fresh, unpredictable name, reserved as an empty
+    // directory: on POSIX a directory is renamed over an empty one atomically.
+    let previous = if had_previous {
+        match create_fresh_dir(parent, &format!(".{name}.bind-old")) {
+            Ok(previous) => previous,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&staging);
+                return Err(error);
+            }
+        }
+    } else {
+        PathBuf::new()
+    };
     if had_previous {
+        #[cfg(not(unix))]
+        let _ = fs::remove_dir(&previous);
         fs::rename(&resolved_target, &previous).map_err(|error| {
             let _ = fs::remove_dir_all(&staging);
             format!("Cannot replace {}: {error}", target.display())
@@ -773,9 +840,129 @@ pub(crate) fn write_workspace(
     Ok(())
 }
 
+/// Creates a new directory `<prefix>-<unpredictable suffix>` in `parent`. `create_dir` fails if
+/// the path exists (as a directory, file or link), so a name chosen by someone else is never
+/// reused: another suffix is tried.
+fn create_fresh_dir(parent: &Path, prefix: &str) -> Result<PathBuf, String> {
+    use std::hash::{BuildHasher, Hasher};
+    for _ in 0..64 {
+        let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+        hasher.write_u32(std::process::id());
+        if let Ok(now) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            hasher.write_u128(now.as_nanos());
+        }
+        let path = parent.join(format!("{prefix}-{:016x}", hasher.finish()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("Cannot create {}: {error}", path.display())),
+        }
+    }
+    Err(format!(
+        "Cannot create a temporary directory in {}",
+        parent.display()
+    ))
+}
+
+/// Creates the directories from `base` (exclusive) down to `directory`, refusing any component
+/// that already exists as something other than a real directory (a link planted in `base`).
+fn create_dirs_below(base: &Path, directory: &Path) -> Result<(), String> {
+    let relative = directory.strip_prefix(base).map_err(|_| {
+        format!(
+            "Internal compiler error: {} is outside {}. This is a bug in bindc.",
+            directory.display(),
+            base.display()
+        )
+    })?;
+    let mut current = base.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => return Err(format!("Refusing to write through {}", current.display())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&current)
+                    .map_err(|error| format!("Cannot create {}: {error}", current.display()))?;
+            }
+            Err(error) => return Err(format!("Cannot read {}: {error}", current.display())),
+        }
+    }
+    Ok(())
+}
+
+/// Writes `content` to a file that must not exist yet (never through an existing file or link).
+fn write_new_file(path: &Path, content: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(content))
+        .map_err(|error| format!("Cannot write {}: {error}", path.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_directories_are_fresh_and_never_follow_links() {
+        let parent = std::env::temp_dir().join(format!("bindc-staging-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&parent);
+        fs::create_dir_all(&parent).unwrap();
+        let first = create_fresh_dir(&parent, ".t.bind-new").unwrap();
+        let second = create_fresh_dir(&parent, ".t.bind-new").unwrap();
+        assert_ne!(first, second);
+        assert!(first.is_dir() && second.is_dir());
+        // A link planted inside the staging directory is refused, not followed.
+        let outside = parent.join("outside");
+        fs::create_dir(&outside).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, first.join("web")).unwrap();
+            assert!(create_dirs_below(&first, &first.join("web/x")).is_err());
+            std::os::unix::fs::symlink(outside.join("f"), first.join("f")).unwrap();
+            assert!(write_new_file(&first.join("f"), b"x").is_err());
+            assert!(!outside.join("f").exists());
+        }
+        create_dirs_below(&second, &second.join("a/b")).unwrap();
+        write_new_file(&second.join("a/b/c"), b"ok").unwrap();
+        assert_eq!(fs::read(second.join("a/b/c")).unwrap(), b"ok");
+        assert!(write_new_file(&second.join("a/b/c"), b"again").is_err());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn cargo_configuration_from_the_project_is_refused() {
+        let root = std::env::temp_dir().join(format!("bindc-cargo-config-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let generated = root.join(".bind/generated/t");
+        fs::create_dir_all(&generated).unwrap();
+        assert!(check_no_project_cargo_config(&root, &generated).is_ok());
+        // The root of a manifest named without a directory is the empty path.
+        let current = std::env::current_dir().unwrap();
+        assert!(check_no_project_cargo_config(Path::new(""), &current).is_ok());
+        for directory in [root.clone(), root.join(".bind"), generated.clone()] {
+            fs::create_dir_all(directory.join(".cargo")).unwrap();
+            fs::write(
+                directory.join(".cargo/config.toml"),
+                "[build]\nrustc-wrapper = \"x\"\n",
+            )
+            .unwrap();
+            let error = check_no_project_cargo_config(&root, &generated).unwrap_err();
+            assert!(error.contains("config.toml"), "{error}");
+            fs::remove_dir_all(directory.join(".cargo")).unwrap();
+        }
+        assert!(is_cargo_override(
+            "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER"
+        ));
+        assert!(is_cargo_override("CARGO_BUILD_RUSTC_WRAPPER"));
+        assert!(is_cargo_override("CARGO_SOURCE_CRATES_IO_REPLACE_WITH"));
+        assert!(is_cargo_override("CARGO_PROFILE_RELEASE_DEBUG"));
+        assert!(!is_cargo_override("CARGO_HOME"));
+        assert!(!is_cargo_override("CARGO_NET_OFFLINE"));
+        fs::remove_dir_all(&root).unwrap();
+    }
 
     #[test]
     fn binaries_are_read_from_the_generated_manifest() {
