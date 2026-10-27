@@ -461,6 +461,11 @@ test("record / decodeRecord: no prototype pollution, frozen, strict", () => {
   throwsDecode(() => rt.decodeFloat("0.5"), "float from string");
   eq(rt.decodeDouble(0.1), 0.1);
   throwsDecode(() => rt.decodeDouble("1"), "double from string");
+  // JSON.parse("1e400") is Infinity; serde_json rejects the literal (NumberOutOfRange).
+  throwsDecode(() => rt.decodeDouble(JSON.parse("1e400")), "double out of range");
+  throwsDecode(() => rt.decodeDouble(NaN), "double NaN");
+  throwsDecode(() => rt.decodeFloat(JSON.parse("-1e400")), "float out of range");
+  eq(rt.decodeFloat(1e39), Infinity, "a finite f64 beyond f32 casts to infinity, as serde");
 });
 
 test("decoders with property names; Unit, Long, pairs and some", () => {

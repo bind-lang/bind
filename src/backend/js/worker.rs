@@ -1,14 +1,19 @@
 //! Cloudflare Worker host for Bind RPC endpoints compiled to WebAssembly.
 //!
-//! This backend consumes the same typed core IR as the Rust and browser backends. It emits one
-//! a deliberately small ES module for Cloudflare's V8 isolate. The host owns HTTP and JSON; all
+//! This backend consumes the same typed core IR as the Rust and browser backends. It emits a
+//! deliberately small ES module for Cloudflare's V8 isolate. The host owns HTTP and JSON; all
 //! accepted Bind server computation lives in `app.wasm`. Cloudflare bindings (D1, Hyperdrive,
 //! KV, Durable Objects) need an explicit typed ABI and are rejected by verification until then.
 
 use crate::core::ir::{CoreFunction, CoreProgram};
 
+use sha2::Digest as _;
+
 use super::codecs::Codecs;
 use super::names::js_string;
+
+/// The largest RPC request body the Worker reads, in bytes.
+pub const MAX_BODY_BYTES: usize = 1_048_576;
 
 /// The Worker module. `cors_origin` is the one browser origin accepted when the frontend calls
 /// an API on another origin; `None` is the normal same-origin Worker + assets deployment.
@@ -53,8 +58,8 @@ pub fn render(program: &CoreProgram, cors_origin: Option<&str>) -> String {
         };
         let encoded = codecs.encode(&endpoint.result, "value");
         routes.push_str(&format!(
-            "case {}: {{\nconst input = readInput(json, [{}]);\n{}\nconst wasmValue = bind[{}]({});\nconst value = {result_value};\nreturn jsonResponse(request, 200, {encoded});\n}}\n",
-            js_string(&format!("/api/{}", endpoint.name)),
+            "[{}, (json) => {{\nconst input = readInput(json, [{}]);\n{}\nconst wasmValue = bind[{}]({});\nconst value = {result_value};\nreturn {encoded};\n}}],\n",
+            js_string(&endpoint.name),
             fields.join(", "),
             decoders.join("\n"),
             js_string(&endpoint.name),
@@ -70,10 +75,23 @@ import * as rt from "./bind-runtime.js";
 import bindModule from "./app.wasm";
 
 const CORS_ORIGIN = {cors};
-const bindInstance = await WebAssembly.instantiate(bindModule);
-const bind = bindInstance.exports;
+// The largest request body read, in bytes: larger bodies are 413 before they are parsed.
+const MAX_BODY_BYTES = {MAX_BODY_BYTES};
+// Wrangler imports the precompiled module; instantiating it needs no top-level await.
+const bind = new WebAssembly.Instance(bindModule).exports;
+const SECURITY_HEADERS = {{
+"x-content-type-options": "nosniff",
+"referrer-policy": "no-referrer",
+"cache-control": "no-store",
+}};
 
 {definitions}
+// Endpoint name (percent-decoded path segment after /api/) -> handler of the parsed body.
+const ENDPOINTS = new Map([
+{routes}]);
+
+class RequestTooLarge extends Error {{}}
+
 function isPlainObject(value) {{
 return value !== null && typeof value === "object" && !Array.isArray(value);
 }}
@@ -95,18 +113,23 @@ return {{
 }};
 }}
 
-function jsonResponse(request, status, value) {{
-return new Response(JSON.stringify(value), {{
+function respond(request, status, body, headers) {{
+return new Response(body, {{
 status,
-headers: {{ "content-type": "application/json; charset=utf-8", ...corsHeaders(request) }},
+headers: {{ ...SECURITY_HEADERS, ...corsHeaders(request), ...headers }},
 }});
 }}
 
-function errorResponse(request, status, message) {{
-return jsonResponse(request, status, {{ error: message }});
+function jsonResponse(request, status, value, headers = {{}}) {{
+return respond(request, status, JSON.stringify(value), {{ "content-type": "application/json; charset=utf-8", ...headers }});
+}}
+
+function errorResponse(request, status, message, headers = {{}}) {{
+return jsonResponse(request, status, {{ error: message }}, headers);
 }}
 
 function publicError(request, error) {{
+if (error instanceof RequestTooLarge) return errorResponse(request, 413, "request too large");
 if (error instanceof rt.DecodeError || error instanceof SyntaxError) {{
 return errorResponse(request, 400, "bad request");
 }}
@@ -117,30 +140,76 @@ if (error.kind === "RecursionLimit") return errorResponse(request, 500, "recursi
 return errorResponse(request, 500, "internal error");
 }}
 
-async function rpc(request, pathname) {{
-if (CORS_ORIGIN !== null) {{
-const origin = request.headers.get("origin");
-if (origin !== null && origin !== CORS_ORIGIN) return errorResponse(request, 403, "forbidden");
+// `application/json`, with any parameters, compared case-insensitively.
+function isJsonContentType(value) {{
+return value !== null && value.split(";")[0].trim().toLowerCase() === "application/json";
 }}
+
+// The body as strict UTF-8 (a BOM is kept, so JSON.parse rejects it as serde_json does), read
+// up to MAX_BODY_BYTES whatever Content-Length claims.
+async function readBody(request) {{
+const declared = request.headers.get("content-length");
+if (declared !== null) {{
+if (!/^\d+$/.test(declared)) throw new rt.DecodeError("invalid content-length");
+if (Number(declared) > MAX_BODY_BYTES) throw new RequestTooLarge();
+}}
+if (request.body === null) return "";
+const reader = request.body.getReader();
+const chunks = [];
+let size = 0;
+for (;;) {{
+const {{ done, value }} = await reader.read();
+if (done) break;
+size += value.byteLength;
+if (size > MAX_BODY_BYTES) {{
+await reader.cancel();
+throw new RequestTooLarge();
+}}
+chunks.push(value);
+}}
+const bytes = new Uint8Array(size);
+let offset = 0;
+for (const chunk of chunks) {{
+bytes.set(chunk, offset);
+offset += chunk.byteLength;
+}}
+try {{
+return new TextDecoder("utf-8", {{ fatal: true, ignoreBOM: true }}).decode(bytes);
+}} catch {{
+throw new rt.DecodeError("the request body is not UTF-8");
+}}
+}}
+
+async function rpc(request, url, pathname) {{
+// Same-origin deployment: a browser Origin must be this origin (no cross-site RPC). With a
+// configured CORS origin, that origin is the only one accepted.
+const origin = request.headers.get("origin");
+if (origin !== null && origin !== (CORS_ORIGIN ?? url.origin)) return errorResponse(request, 403, "forbidden");
 if (request.method === "OPTIONS") {{
-if (CORS_ORIGIN === null) return new Response(null, {{ status: 204 }});
-return new Response(null, {{
-status: 204,
-headers: {{
-...corsHeaders(request),
+if (CORS_ORIGIN === null) return respond(request, 204, null, {{}});
+return respond(request, 204, null, {{
 "access-control-allow-methods": "POST, OPTIONS",
 "access-control-allow-headers": "content-type",
-}},
 }});
 }}
-if (request.method !== "POST") return errorResponse(request, 405, "method not allowed");
-let json;
+// Route before reading the body: the endpoint is the percent-decoded segment after /api/.
+let name = null;
+if (pathname.startsWith("/api/")) {{
 try {{
-json = await request.json();
-switch (pathname) {{
-{routes}default:
-return errorResponse(request, 404, "not found");
+name = decodeURIComponent(pathname.slice("/api/".length));
+}} catch {{
+return errorResponse(request, 400, "bad request");
 }}
+}}
+const endpoint = name === null ? undefined : ENDPOINTS.get(name);
+if (endpoint === undefined) return errorResponse(request, 404, "not found");
+if (request.method !== "POST") return errorResponse(request, 405, "method not allowed", {{ allow: "POST, OPTIONS" }});
+if (!isJsonContentType(request.headers.get("content-type"))) {{
+return errorResponse(request, 415, "unsupported media type");
+}}
+try {{
+const json = JSON.parse(await readBody(request));
+return jsonResponse(request, 200, endpoint(json));
 }} catch (error) {{
 return publicError(request, error);
 }}
@@ -150,7 +219,7 @@ export default {{
 async fetch(request, env) {{
 const url = new URL(request.url);
 const pathname = url.pathname.length > 1 ? url.pathname.replace(/\/+$/, "") : url.pathname;
-if (pathname === "/api" || pathname.startsWith("/api/")) return rpc(request, pathname);
+if (pathname === "/api" || pathname.startsWith("/api/")) return rpc(request, url, pathname);
 return env.ASSETS.fetch(request);
 }},
 }};
@@ -159,21 +228,84 @@ return env.ASSETS.fetch(request);
     crate::backend::rust::indent(&module)
 }
 
+/// Cloudflare's static-asset `_headers` file for the generated `public/` directory. `index_html`
+/// is the generated page: the hash of each inline `<script>` is allowed by the CSP (the split page
+/// boots with one), so no `'unsafe-inline'` is needed. `api_origin` is the API's origin when the
+/// frontend calls it cross-origin (`connect-src`).
+// Wired into `public/_headers` by the Cloudflare generator (`src/cloudflare.rs`).
+#[allow(dead_code)]
+pub fn asset_headers(index_html: &str, api_origin: Option<&str>) -> String {
+    let mut scripts = vec!["'self'".to_string()];
+    let mut rest = index_html;
+    while let Some(start) = rest.find("<script") {
+        let after = &rest[start..];
+        let Some(open_end) = after.find('>') else {
+            break;
+        };
+        let body = &after[open_end + 1..];
+        let Some(close) = body.find("</script>") else {
+            break;
+        };
+        let content = &body[..close];
+        if !content.is_empty() {
+            let digest = sha2::Sha256::digest(content.as_bytes());
+            scripts.push(format!("'sha256-{}'", base64(&digest)));
+        }
+        rest = &body[close..];
+    }
+    let connect = match api_origin {
+        Some(origin) => format!("'self' {origin}"),
+        None => "'self'".to_string(),
+    };
+    format!(
+        "/*\n  Content-Security-Policy: default-src 'self'; script-src {}; style-src 'self'; img-src 'self' data:; connect-src {connect}; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'\n  X-Content-Type-Options: nosniff\n  X-Frame-Options: DENY\n  Referrer-Policy: no-referrer\n",
+        scripts.join(" ")
+    )
+}
+
+#[allow(dead_code)]
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for (index, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if index <= chunk.len() {
+                output.push(char::from(ALPHABET[((n >> shift) & 63) as usize]));
+            } else {
+                output.push('=');
+            }
+        }
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
+
+    const PROGRAM: &str = "server fun soma(a: Double, b: Double): Double effects [] = a + b\nserver fun ação(x: Double): Boolean effects [] = x > 1.0\nclient component Home() {\n UI {\n Text(\"hi\")\n }\n}\n";
 
     #[test]
     fn renders_a_thin_wasm_host_without_server_javascript() {
-        let program = crate::core::lower::tests::compile(
-            "server fun soma(a: Double, b: Double): Double effects [] = a + b\nclient component Home() {\n UI {\n Text(\"hi\")\n }\n}\n",
-        );
+        let program = crate::core::lower::tests::compile(PROGRAM);
         let worker = render(&program, None);
-        assert!(worker.contains("case \"/api/soma\":"), "{worker}");
+        assert!(worker.contains("[\"soma\", (json) => {"), "{worker}");
         assert!(
             worker.contains("import bindModule from \"./app.wasm\";"),
             "{worker}"
         );
+        assert!(
+            worker.contains("const bind = new WebAssembly.Instance(bindModule).exports;"),
+            "{worker}"
+        );
+        assert!(!worker.contains("await WebAssembly"), "{worker}");
         assert!(worker.contains("bind[\"soma\"](arg0, arg1)"), "{worker}");
         assert!(worker.contains("rt.decodeDouble(input[\"a\"])"), "{worker}");
         assert!(!worker.contains("async function u_soma"), "{worker}");
@@ -184,4 +316,148 @@ mod tests {
         assert!(!worker.contains("cargo"));
         assert!(!worker.contains("rustc"));
     }
+
+    #[test]
+    fn asset_headers_allow_exactly_the_inline_boot_script() {
+        assert_eq!(base64(b""), "");
+        assert_eq!(base64(b"f"), "Zg==");
+        assert_eq!(base64(b"fo"), "Zm8=");
+        assert_eq!(base64(b"foobar"), "Zm9vYmFy");
+        let headers = asset_headers(
+            "<p>x</p><script type=\"module\">alert(1)</script>",
+            Some("https://api.example"),
+        );
+        // `printf 'alert(1)' | openssl dgst -sha256 -binary | base64`
+        assert!(
+            headers.contains(
+                "script-src 'self' 'sha256-bhHHL3z2vDgxUt0W3dWQOrprscmda2Y5pLsLg4GF+pI='"
+            ),
+            "{headers}"
+        );
+        assert!(headers.contains("connect-src 'self' https://api.example;"));
+        assert!(headers.contains("frame-ancestors 'none'"));
+        assert!(headers.contains("X-Frame-Options: DENY"));
+        assert!(headers.contains("X-Content-Type-Options: nosniff"));
+        let static_page = asset_headers("<p>x</p>", None);
+        assert!(static_page.contains("script-src 'self';"), "{static_page}");
+    }
+
+    /// The generated Worker, run in node with real `Request`s against the generated `app.wasm`:
+    /// routing on the decoded path, the CSRF policy, body limits, strict numbers and headers.
+    #[test]
+    fn the_worker_enforces_its_http_contract_in_node() {
+        let node = Command::new("node").arg("--version").output();
+        if !node.is_ok_and(|output| output.status.success()) {
+            eprintln!("skipped: node not found");
+            return;
+        }
+        let program = crate::core::lower::tests::compile(PROGRAM);
+        let root = std::env::temp_dir().join(format!("bind-worker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("worker.js"), render(&program, None)).unwrap();
+        std::fs::write(root.join("bind-runtime.js"), super::super::RUNTIME).unwrap();
+        std::fs::write(
+            root.join("app.wasm"),
+            crate::backend::wasm::compile(&program).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("harness.mjs"), HARNESS).unwrap();
+        let output = Command::new("node")
+            .arg("harness.mjs")
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success(),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let expected = [
+            "ok sum 200 3",
+            "ok security nosniff no-referrer no-store",
+            "ok decoded-path 200 true",
+            "ok raw-unicode-path 200 false",
+            "ok infinity 400",
+            "ok float-literal-nan 400",
+            "ok text-plain 415",
+            "ok no-content-type 415",
+            "ok json-with-params 200",
+            "ok cross-site 403",
+            "ok same-origin 200",
+            "ok get 405 POST, OPTIONS",
+            "ok unknown-route-before-body 404",
+            "ok bare-api 404",
+            "ok malformed-escape 400",
+            "ok declared-too-large 413",
+            "ok streamed-too-large 413",
+            "ok bom 400",
+            "ok assets ASSET /index.html",
+        ];
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines, expected, "{stdout}");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Loads `worker.js` with `app.wasm` as a precompiled module (as Wrangler does) and prints one
+    /// line per case.
+    const HARNESS: &str = r#"
+import fs from "node:fs";
+const source = fs.readFileSync("worker.js", "utf8").replace(
+  'import bindModule from "./app.wasm";',
+  'const bindModule = new WebAssembly.Module(globalThis.WASM_BYTES);',
+);
+globalThis.WASM_BYTES = fs.readFileSync("app.wasm");
+fs.writeFileSync("worker-node.mjs", source);
+const worker = (await import("./worker-node.mjs")).default;
+const env = { ASSETS: { fetch: (request) => new Response("ASSET " + new URL(request.url).pathname) } };
+const JSON_TYPE = { "content-type": "application/json" };
+async function call(path, init = {}) {
+  const response = await worker.fetch(new Request("https://x.test" + path, init), env);
+  return { response, text: await response.text() };
+}
+function line(name, ...parts) {
+  console.log(["ok", name, ...parts].join(" "));
+}
+const post = (body, headers = JSON_TYPE) => ({ method: "POST", body, headers });
+let r = await call("/api/soma", post('{"a":1,"b":2}'));
+line("sum", r.response.status, r.text);
+line("security", r.response.headers.get("x-content-type-options"), r.response.headers.get("referrer-policy"), r.response.headers.get("cache-control"));
+r = await call("/api/a%C3%A7%C3%A3o", post('{"x":2}'));
+line("decoded-path", r.response.status, r.text);
+r = await call("/api/ação", post('{"x":0.5}'));
+line("raw-unicode-path", r.response.status, r.text);
+r = await call("/api/soma", post('{"a":1e400,"b":2}'));
+line("infinity", r.response.status);
+r = await call("/api/soma", post('{"a":NaN,"b":2}'));
+line("float-literal-nan", r.response.status);
+r = await call("/api/soma", post('{"a":1,"b":2}', { "content-type": "text/plain" }));
+line("text-plain", r.response.status);
+r = await call("/api/soma", { method: "POST", body: new Blob(['{"a":1,"b":2}']) });
+line("no-content-type", r.response.status);
+r = await call("/api/soma", post('{"a":1,"b":2}', { "content-type": "Application/JSON; charset=utf-8" }));
+line("json-with-params", r.response.status);
+r = await call("/api/soma", post('{"a":1,"b":2}', { ...JSON_TYPE, origin: "https://evil.test" }));
+line("cross-site", r.response.status);
+r = await call("/api/soma", post('{"a":1,"b":2}', { ...JSON_TYPE, origin: "https://x.test" }));
+line("same-origin", r.response.status);
+r = await call("/api/soma");
+line("get", r.response.status, r.response.headers.get("allow"));
+r = await call("/api/nope", post("not json"));
+line("unknown-route-before-body", r.response.status);
+r = await call("/api/", post("{}"));
+line("bare-api", r.response.status);
+r = await call("/api/%E0%A4%A", post("{}"));
+line("malformed-escape", r.response.status);
+r = await call("/api/soma", post("{}", { ...JSON_TYPE, "content-length": "2000000" }));
+line("declared-too-large", r.response.status);
+r = await call("/api/soma", { ...post(new ReadableStream({
+  pull(controller) { controller.enqueue(new Uint8Array(65536).fill(32)); },
+}), JSON_TYPE), duplex: "half" });
+line("streamed-too-large", r.response.status);
+r = await call("/api/soma", post('﻿{"a":1,"b":2}'));
+line("bom", r.response.status);
+r = await call("/index.html");
+line("assets", r.text);
+"#;
 }

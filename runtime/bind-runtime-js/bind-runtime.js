@@ -683,8 +683,12 @@ export function decodeDecimal(json) {
   return value === null ? fail("a decimal string") : value;
 }
 
+/**
+ * Double: a finite number. JSON.parse reads an out-of-range literal (`1e400`) as Infinity;
+ * serde_json rejects it (NumberOutOfRange), so it is a DecodeError here too.
+ */
 export function decodeDouble(json) {
-  return typeof json === "number" ? json : fail("a number");
+  return Number.isFinite(json) ? json : fail("a finite number");
 }
 
 /**
@@ -693,7 +697,8 @@ export function decodeDouble(json) {
  * number as f64 and casts it to f32, which is exactly this rounding.
  */
 export function decodeFloat(json) {
-  return typeof json === "number" ? Math.fround(json) : fail("a number");
+  // The JSON number must be a finite f64 (serde_json); its f32 cast may still overflow.
+  return Number.isFinite(json) ? Math.fround(json) : fail("a finite number");
 }
 
 /** Unit: null (serde's `()`); the value is `undefined`. */

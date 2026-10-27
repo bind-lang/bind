@@ -4,6 +4,16 @@
 
 The generated `worker.js` is intentionally a host adapter, not the Bind computation backend. It owns Fetch, strict JSON decoding and encoding, CORS, errors, and Cloudflare bindings. Browser assets use the existing typed JavaScript frontend backend.
 
+## HTTP contract
+
+The Worker answers `/api/<endpoint>`, where `<endpoint>` is the percent-decoded path segment (a malformed escape is `400`, an unknown endpoint `404`, decided before the body is read). Then:
+
+- only `POST` runs an endpoint (`405` with `Allow: POST, OPTIONS` otherwise; `OPTIONS` answers CORS preflights);
+- `Content-Type` must be `application/json`, parameters allowed, compared case-insensitively (`415` otherwise);
+- without a configured `frontend_origin`, a present `Origin` header must equal the Worker's own origin (`403` otherwise); with one, only that origin is accepted and answered with CORS headers;
+- the body is read up to 1 MiB whatever `Content-Length` claims (`413` beyond it), must be strict UTF-8 JSON, and numbers must be finite (`1e400` is `400`, as serde_json rejects it);
+- every API response carries `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer` and `Cache-Control: no-store`. Static assets get a `_headers` file with a `default-src 'self'` CSP (the split page's inline boot script is allowed by its hash), `frame-ancestors 'none'`, `X-Frame-Options: DENY` and `nosniff`.
+
 ## Target
 
 ```toml
@@ -23,7 +33,7 @@ The compatibility date is pinned by the profile. The Worker handles `/api` and `
 This profile accepts a closed subset whose value semantics map exactly to Wasm v1:
 
 - `Boolean` (`i32`), `Float` (`f32`), `Double` (`f64`), and zero-width `Unit`;
-- finite numeric and Boolean literals;
+- Boolean literals, and numeric literals that stay finite in their type: a decimal literal is rounded to the nearest `f32`/`f64` exactly as the reference evaluator rounds it (`16777217f` is `16777216`), and one that rounds to infinity is rejected;
 - locals, `val`, sequencing, `if`/`else`, and explicit returns;
 - direct calls between monomorphic Bind functions;
 - Boolean operators, IEEE Float/Double arithmetic, and supported comparisons;

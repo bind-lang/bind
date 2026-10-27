@@ -127,14 +127,14 @@ fn expression_problem(expr: &Expr, names: &BTreeSet<&str>) -> Option<String> {
                     .ok()
                     .filter(|value| value.is_finite())
                     .is_none()
-                    .then(|| "contains a Double literal that cannot be encoded exactly as a finite WebAssembly f64".into())
+                    .then(|| "contains a Double literal that is not finite as a WebAssembly f64".into())
             }
             Literal::Int(text) | Literal::Float(text) if scalar(&expr.ty) == Some("Float") => text
                 .parse::<f32>()
                 .ok()
                 .filter(|value| value.is_finite())
                 .is_none()
-                .then(|| "contains a Float literal that cannot be encoded exactly as a finite WebAssembly f32".into()),
+                .then(|| "contains a Float literal that is not finite as a WebAssembly f32 (it rounds to infinity)".into()),
             _ => Some("contains a literal whose Bind representation is not implemented by the first Wasm ABI".into()),
         },
         ExprKind::Local(_) => None,
@@ -433,7 +433,7 @@ fn emit_expr(
             );
         }
         ExprKind::Local(local) => {
-            if let Some(index) = locals.get(local).copied().flatten() {
+            if let Some(index) = local_slot(locals, *local)? {
                 out.push(0x20);
                 u32_leb(index, out);
             }
@@ -457,7 +457,7 @@ fn emit_expr(
             local, value, body, ..
         } => {
             emit_expr(value, locals, indices, out)?;
-            if let Some(index) = locals.get(local).copied().flatten() {
+            if let Some(index) = local_slot(locals, *local)? {
                 out.push(0x21);
                 u32_leb(index, out);
             }
@@ -491,6 +491,18 @@ fn emit_expr(
         _ => return Err("unsupported expression reached Wasm generation".into()),
     }
     Ok(())
+}
+
+/// The Wasm slot of `local`: `Ok(None)` for a declared zero-width (`Unit`) local, an internal
+/// error for a local the function never declared (emitting nothing would produce invalid Wasm).
+fn local_slot(
+    locals: &BTreeMap<LocalId, Option<u32>>,
+    local: LocalId,
+) -> Result<Option<u32>, String> {
+    locals
+        .get(&local)
+        .copied()
+        .ok_or_else(|| format!("local {local} reached Wasm generation without a declaration"))
 }
 
 fn emit_prim(
@@ -649,6 +661,19 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].reason.contains("parameter `value` of type `Int`"));
         assert!(compile(&program).is_err());
+    }
+
+    #[test]
+    fn an_undeclared_local_is_an_internal_error_not_invalid_wasm() {
+        let locals = BTreeMap::from([(0, Some(0)), (1, None)]);
+        assert_eq!(local_slot(&locals, 0), Ok(Some(0)));
+        // A declared Unit local has no slot and emits nothing.
+        assert_eq!(local_slot(&locals, 1), Ok(None));
+        assert!(
+            local_slot(&locals, 2)
+                .unwrap_err()
+                .contains("without a declaration")
+        );
     }
 
     #[test]
