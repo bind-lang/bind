@@ -5,7 +5,7 @@ use crate::ast::{TypeDecl, TypeKind, TypeRef};
 use crate::backend::js::page::{WebBuild, page_meta, web_build};
 use crate::backend::rust::SsrPage;
 use crate::compiler::{VerifiedApplication, json, json_array};
-use crate::config::{Mode, ProjectConfig, TargetConfig};
+use crate::config::{Backend, Mode, ProjectConfig, TargetConfig};
 use crate::diagnostic::Span;
 use crate::parser::expr::parse_type_text;
 use crate::syntax::expr::TypeExpr;
@@ -56,67 +56,30 @@ pub fn generate(
         .targets
         .get(&app.target)
         .ok_or_else(|| format!("Target `{}` disappeared from bind.toml", app.target))?;
-    if target_config.client != "web" || target_config.server != "rust" {
+    if !matches!(target_config.backend(), Backend::RustWeb(_)) {
         return Err(format!(
-            "Target `{}` is not the certified Rust + web profile",
+            "Target `{}` is not the certified Rust + web profile (web client, Rust server, aws-lambda or vercel deployment)",
             app.target
-        ));
-    }
-    if !matches!(target_config.deployment.as_str(), "aws-lambda" | "vercel") {
-        return Err(format!(
-            "Unsupported certified deployment `{}`",
-            target_config.deployment
         ));
     }
 
     let target = output_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| config.output.join(&app.target));
-    // A lock resolved for another profile's dependencies is re-resolved instead of kept.
-    let same_profile = fs::read_to_string(target.join("bind-manifest.json"))
-        .is_ok_and(|manifest| manifest.contains(&format!("\"profile\": \"{PROFILE_VERSION}\"")));
-    let previous_cargo_toml = fs::read_to_string(target.join("Cargo.toml")).ok();
-    let preserved_cargo_lock = fs::read_to_string(target.join("Cargo.lock"))
-        .ok()
-        .filter(|_| same_profile);
+        .unwrap_or_else(|| config.target_output(&app.target));
     // Everything that can fail is computed first: a failure leaves the previous output intact.
     let mut files = workspace_files(app, config, target_config)?;
-    let cargo_toml = files
-        .iter()
-        .find(|(path, _)| path == "Cargo.toml")
-        .map(|(_, content)| content.as_str());
-    // A lock resolved for other dependencies would fail `--locked`: it is re-resolved.
-    let preserved_cargo_lock = preserved_cargo_lock
-        .filter(|_| same_dependencies(previous_cargo_toml.as_deref(), cargo_toml));
-    if let Some(lock) = preserved_cargo_lock {
+    // The committed lock of the target (`.bind/locks/<target>.Cargo.lock`) is the resolution the
+    // build uses with `--locked`; without one, `build` resolves and records it.
+    let locks = crate::pipeline::LockFiles::new(config, &app.target);
+    if let Ok(lock) = fs::read_to_string(&locks.cargo) {
         files.push(("Cargo.lock".to_string(), lock));
     }
-    if target.exists() {
-        fs::remove_dir_all(&target)
-            .map_err(|error| format!("Cannot replace {}: {error}", target.display()))?;
-    }
-    for (path, content) in &files {
-        let path = target.join(path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-        }
-        write(&path, content)?;
-    }
+    let files: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|(path, content)| (path, content.into_bytes()))
+        .collect();
+    crate::pipeline::write_workspace(config, &target, &files)?;
     Ok(target)
-}
-
-/// Whether two generated `Cargo.toml`s declare the same `[dependencies]` table (binaries and
-/// profiles do not affect the lock).
-fn same_dependencies(previous: Option<&str>, next: Option<&str>) -> bool {
-    fn table(manifest: &str) -> Option<&str> {
-        let (_, rest) = manifest.split_once("\n[dependencies]\n")?;
-        Some(
-            rest.split_once("\n[")
-                .map_or(rest, |(table, _)| table)
-                .trim(),
-        )
-    }
-    matches!((previous.and_then(table), next.and_then(table)), (Some(a), Some(b)) if a == b)
 }
 
 fn layout(
@@ -245,7 +208,12 @@ pub fn workspace_lock(config: &ProjectConfig) -> String {
         .iter()
         .map(|(name, target)| {
             format!(
-                "[targets.{name}]\nclient = \"{}\"\nserver = \"{}\"\nmode = \"{}\"\ndeployment = \"{}\"\ncertified = {}\n",
+                "[targets.{name}]\nprofile = \"{}\"\nclient = \"{}\"\nserver = \"{}\"\nmode = \"{}\"\ndeployment = \"{}\"\ncertified = {}\n",
+                match target.backend() {
+                    Backend::RustWeb(_) => PROFILE_VERSION,
+                    Backend::CloudflareWasm => crate::cloudflare::PROFILE_VERSION,
+                    Backend::Unsupported => "unsupported",
+                },
                 target.client,
                 target.server,
                 target.mode_name(),
@@ -255,10 +223,21 @@ pub fn workspace_lock(config: &ProjectConfig) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let dependencies = locked_dependencies();
-    format!(
-        "# Generated by bindc. Do not edit.\n\n[bind]\nlanguage = \"0.1.0\"\nprofile = \"{PROFILE_VERSION}\"\n\n[toolchain]\nrust = \"1.98.0\"\nrustEdition = \"2024\"\n\n{dependencies}\n{targets}"
-    )
+    // The Rust toolchain and dependencies only matter to projects with a Rust target.
+    let rust = if config
+        .targets
+        .values()
+        .any(|target| matches!(target.backend(), Backend::RustWeb(_)))
+    {
+        format!(
+            "[toolchain]\nrust = \"{}\"\nrustEdition = \"2024\"\n\n{}\n",
+            crate::pipeline::RUST_TOOLCHAIN,
+            locked_dependencies()
+        )
+    } else {
+        String::new()
+    };
+    format!("# Generated by bindc. Do not edit.\n\n[bind]\nlanguage = \"0.1.0\"\n\n{rust}{targets}")
 }
 
 /// The `[dependencies]` table of `bind.lock` and the target locks: every pinned version.
@@ -275,10 +254,6 @@ pub(crate) fn server_dependencies() -> String {
     format!(
         "serde = {{ version = \"={SERDE}\", features = [\"derive\", \"rc\"] }}\nserde_json = \"={SERDE_JSON}\"\ntokio = {{ version = \"={TOKIO}\", features = [\"rt-multi-thread\", \"macros\", \"sync\"] }}\nsqlx = {{ version = \"={SQLX}\", default-features = false, features = [\"runtime-tokio\", \"tls-rustls\", \"postgres\", \"uuid\", \"chrono\", \"bigdecimal\", \"rust_decimal\"] }}\nuuid = {{ version = \"={UUID}\", features = [\"serde\"] }}\nnum-bigint = \"={NUM_BIGINT}\"\nbigdecimal = \"={BIGDECIMAL}\"\nrust_decimal = {{ version = \"={RUST_DECIMAL}\", features = [\"serde-str\"] }}\nchrono = {{ version = \"={CHRONO}\", features = [\"serde\"] }}\n"
     )
-}
-
-fn write(path: &Path, content: &str) -> Result<(), String> {
-    fs::write(path, content).map_err(|error| format!("Cannot write {}: {error}", path.display()))
 }
 
 /// The binaries of a generated crate: the Lambda's `bootstrap`, or one Vercel function per
@@ -588,8 +563,14 @@ fn aws_template(app: &VerifiedApplication, database_environment: &str, ssr: bool
         "        Api:\n          Type: HttpApi\n          Properties:\n            Path: /api/{proxy+}\n            Method: ANY\n"
     };
     format!(
-        "AWSTemplateFormatVersion: '2010-09-09'\nTransform: AWS::Serverless-2016-10-31\nDescription: Bind certified deployment for {}\nResources:\n  BindApi:\n    Type: AWS::Serverless::Function\n    Metadata:\n      BuildMethod: rust-cargolambda\n      BuildProperties:\n        Binary: bootstrap\n    Properties:\n      Runtime: provided.al2023\n      Architectures: [arm64]\n      Handler: bootstrap\n      CodeUri: ./\n      Events:\n{events}      Environment:\n        Variables:\n          {}: !Ref DatabaseUrl\nParameters:\n  DatabaseUrl:\n    Type: String\n    NoEcho: true\n",
-        app.project_name, database_environment
+        "AWSTemplateFormatVersion: '2010-09-09'\nTransform: AWS::Serverless-2016-10-31\nDescription: {}\nResources:\n  BindApi:\n    Type: AWS::Serverless::Function\n    Metadata:\n      BuildMethod: rust-cargolambda\n      BuildProperties:\n        Binary: bootstrap\n    Properties:\n      Runtime: provided.al2023\n      Architectures: [arm64]\n      Handler: bootstrap\n      CodeUri: ./\n      Events:\n{events}      Environment:\n        Variables:\n          {}: !Ref DatabaseUrl\nParameters:\n  DatabaseUrl:\n    Type: String\n    NoEcho: true\n",
+        // A JSON string is a valid YAML double-quoted scalar: the project name cannot break the
+        // document. The variable name is restricted by the manifest parser and quoted as well.
+        json(&format!(
+            "Bind certified deployment for {}",
+            app.project_name
+        )),
+        json(database_environment)
     )
 }
 
@@ -871,25 +852,6 @@ mod tests {
             );
         }
         assert!(generated.contains("features = [\"derive\", \"rc\"]"));
-    }
-
-    /// A generation that fails leaves the previous output untouched.
-    #[test]
-    fn a_lock_is_kept_only_for_the_same_dependencies() {
-        let manifest = |dependencies: &str, bins: &str| {
-            format!(
-                "[package]\nname = \"bind-app\"\n\n[dependencies]\n{dependencies}\n{bins}\n[profile.release]\nstrip = true\n"
-            )
-        };
-        let old = manifest("serde = \"=1\"\nfutures = \"=0.3.31\"\n", "");
-        let new = manifest("serde = \"=1\"\n", "");
-        let more_bins = manifest(
-            "serde = \"=1\"\n",
-            "[[bin]]\nname = \"a\"\npath = \"api/a.rs\"\n",
-        );
-        assert!(!same_dependencies(Some(&old), Some(&new)));
-        assert!(same_dependencies(Some(&new), Some(&more_bins)));
-        assert!(!same_dependencies(None, Some(&new)));
     }
 
     const CUSTOMER_SOURCE: &str = "distinct type CustomerId = UUID\nentity Customer(val id: CustomerId, val name: String)\nserver fun getCustomer(id: CustomerId): Customer effects [db.read] = db.customers.require(id)\nclient component CustomerPage(id: CustomerId) {\n    val customer = server.getCustomer(id)\n    UI { Text(customer.name) }\n}\n";
@@ -1225,6 +1187,40 @@ mod tests {
         let manifest = file(&files, "bind-manifest.json");
         assert!(manifest.contains("\"mode\": \"split\""));
         assert!(manifest.contains("\"apiUrl\": \"/api\",\n  \"frontendOrigin\": null,"));
+    }
+
+    #[test]
+    fn the_sam_template_quotes_the_project_name() {
+        let mut p = project(
+            "yaml",
+            CUSTOMER_SOURCE,
+            CUSTOMER_SCHEMA,
+            "deployment = \"aws-lambda\"\nmode = \"ssr\"\n",
+        );
+        p.app.project_name = "shop: \"x\" # y".into();
+        let template = aws_template(&p.app, "DATABASE_URL", true);
+        assert!(
+            template
+                .contains("Description: \"Bind certified deployment for shop: \\\"x\\\" # y\"\n"),
+            "{template}"
+        );
+        assert!(template.contains("\"DATABASE_URL\": !Ref DatabaseUrl"));
+    }
+
+    #[test]
+    fn the_workspace_lock_records_each_target_profile() {
+        let p = project(
+            "workspace-lock",
+            CUSTOMER_SOURCE,
+            CUSTOMER_SCHEMA,
+            "deployment = \"vercel\"\nmode = \"split\"\n",
+        );
+        let lock = workspace_lock(&p.config);
+        assert!(
+            lock.contains("[targets.t]\nprofile = \"rust-web-v4\"\n"),
+            "{lock}"
+        );
+        assert!(lock.contains("rust = \"1.98.0\""));
     }
 
     #[test]

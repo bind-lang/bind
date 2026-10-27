@@ -2,7 +2,6 @@
 
 [bind]
 language = "0.1.0"
-profile = "rust-web-v4"
 
 [toolchain]
 rust = "1.98.0"
@@ -23,6 +22,7 @@ vercelRuntime = "2.4.0"
 httpBodyUtil = "0.1.5"
 
 [targets.aws-lambda-split]
+profile = "rust-web-v4"
 client = "web"
 server = "rust"
 mode = "split"
@@ -30,6 +30,7 @@ deployment = "aws-lambda"
 certified = true
 
 [targets.aws-lambda-ssr]
+profile = "rust-web-v4"
 client = "web"
 server = "rust"
 mode = "ssr"
@@ -37,6 +38,7 @@ deployment = "aws-lambda"
 certified = true
 
 [targets.vercel-split]
+profile = "rust-web-v4"
 client = "web"
 server = "rust"
 mode = "split"
@@ -44,6 +46,7 @@ deployment = "vercel"
 certified = true
 
 [targets.vercel-ssr]
+profile = "rust-web-v4"
 client = "web"
 server = "rust"
 mode = "ssr"

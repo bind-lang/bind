@@ -10,8 +10,8 @@ use std::process::{Command, Stdio};
 
 use crate::backend::js::page::web_build;
 use crate::compiler::{VerifiedApplication, json, json_array};
-use crate::config::{ProjectConfig, TargetConfig};
-use crate::pipeline::{BuildMode, hash_file};
+use crate::config::{Backend, ProjectConfig, TargetConfig};
+use crate::pipeline::{BuildMode, BuildOptions, LockFiles, hash_file, relative_name, write_lock};
 
 pub const PROFILE_VERSION: &str = "cloudflare-worker-wasm-v1";
 pub const COMPATIBILITY_DATE: &str = "2026-10-27";
@@ -26,7 +26,7 @@ pub struct BuildReport {
 }
 
 pub fn is_target(target: &TargetConfig) -> bool {
-    target.client == "web" && target.server == "wasm" && target.deployment == "cloudflare-workers"
+    target.backend() == Backend::CloudflareWasm
 }
 
 /// Generates a self-contained Wrangler project. The only deployment tool is Wrangler itself;
@@ -48,7 +48,7 @@ pub fn generate(
     }
     let target = output_override
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| config.output.join(&app.target));
+        .unwrap_or_else(|| config.target_output(&app.target));
     let web = web_build(app, config, target_config)?;
     let cors = crate::backend::js::plan::cors_origin(target_config);
     let wasm = crate::backend::wasm::compile(&app.core)?;
@@ -88,33 +88,42 @@ pub fn generate(
 
     // Compute every file before replacing the previous output. A generation failure therefore
     // leaves the last successful project available.
-    if target.exists() {
-        fs::remove_dir_all(&target)
-            .map_err(|error| format!("Cannot replace {}: {error}", target.display()))?;
-    }
-    for (path, content) in files {
-        let path = target.join(path);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| format!("Cannot create {}: {error}", parent.display()))?;
-        }
-        fs::write(&path, content)
-            .map_err(|error| format!("Cannot write {}: {error}", path.display()))?;
-    }
-    fs::write(target.join("app.wasm"), wasm)
-        .map_err(|error| format!("Cannot write {}/app.wasm: {error}", target.display()))?;
+    let mut files: Vec<(String, Vec<u8>)> = files
+        .into_iter()
+        .map(|(path, content)| (path, content.into_bytes()))
+        .collect();
+    files.push(("app.wasm".to_string(), wasm));
+    crate::pipeline::write_workspace(config, &target, &files)?;
     Ok(target)
 }
+
+/// Files a build writes next to the generated project that are not deployed: never hashed.
+const NOT_DEPLOYED: &[&str] = &[
+    crate::pipeline::WORKSPACE_MARKER,
+    "README.md",
+    crate::compiler::EMITTED_IR,
+    crate::compiler::EMITTED_GRAPH,
+];
 
 pub fn build(
     generated: &Path,
     app: &VerifiedApplication,
     config: &ProjectConfig,
     target: &TargetConfig,
-    mode: BuildMode,
+    options: BuildOptions,
 ) -> Result<BuildReport, String> {
-    if mode == BuildMode::Certify {
-        ensure_node()?;
+    let mode = options.mode;
+    let locks = LockFiles::new(config, &app.target);
+    let workspace_lock = crate::certified::workspace_lock(config);
+    locks.check(&locks.workspace, &workspace_lock, options)?;
+    locks.require_present(&locks.target, options)?;
+
+    // `certify` requires node; `build` validates with it whenever it is installed.
+    let node = node_available();
+    if mode == BuildMode::Certify && !node {
+        return Err("Cloudflare certification requires a usable `node` on PATH".to_string());
+    }
+    if node {
         for relative in javascript_files(generated)? {
             let status = Command::new("node")
                 .args(["--check", relative.to_string_lossy().as_ref()])
@@ -145,22 +154,23 @@ pub fn build(
     let runtime = generated.join("bind-runtime.js");
     let js_runtime_hash = hash_file(&runtime)?;
     let wasm_hash = hash_file(&generated.join("app.wasm"))?;
-    let target_lock_dir = config.root.join(".bind/locks");
-    fs::create_dir_all(&target_lock_dir)
-        .map_err(|error| format!("Cannot create {}: {error}", target_lock_dir.display()))?;
-    let target_lock = target_lock_dir.join(format!("{}.lock", app.target));
     let artifact_hashes = artifacts
         .iter()
-        .map(|path| {
-            let relative = path.strip_prefix(generated).unwrap_or(path);
-            Ok((relative.to_string_lossy().to_string(), hash_file(path)?))
-        })
+        .map(|path| Ok((relative_name(generated, path), hash_file(path)?)))
         .collect::<Result<Vec<_>, String>>()?;
-    fs::write(
-        &target_lock,
-        dependency_lock(target, &js_runtime_hash, &wasm_hash, &artifact_hashes),
-    )
-    .map_err(|error| format!("Cannot write {}: {error}", target_lock.display()))?;
+    // The lock records what the build depends on (profile, host ABI, compiler-owned runtime),
+    // not the application's own artifacts, which change with every source edit and are hashed
+    // in `bind-manifest.json`.
+    let target_lock = dependency_lock(target, &js_runtime_hash);
+    let write_target = locks.check(&locks.target, &target_lock, options)?;
+    let write_workspace = locks.check(&locks.workspace, &workspace_lock, options)?;
+    if write_workspace {
+        write_lock(&locks.workspace, &workspace_lock)?;
+    }
+    if write_target {
+        write_lock(&locks.target, &target_lock)?;
+    }
+    let target_lock = locks.target;
 
     let manifest_path = generated.join("bind-manifest.json");
     let state = if mode == BuildMode::Certify {
@@ -191,17 +201,13 @@ pub fn build(
     })
 }
 
-fn ensure_node() -> Result<(), String> {
-    let status = Command::new("node")
+fn node_available() -> bool {
+    Command::new("node")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .map_err(|_| "Cloudflare certification requires `node` on PATH".to_string())?;
-    status
-        .success()
-        .then_some(())
-        .ok_or_else(|| "Cloudflare certification requires a usable `node`".to_string())
+        .is_ok_and(|status| status.success())
 }
 
 fn validate_wasm(root: &Path) -> Result<(), String> {
@@ -234,28 +240,16 @@ fn javascript_files(root: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn deploy_artifacts(root: &Path) -> Result<Vec<PathBuf>, String> {
-    fn visit(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
-        for entry in fs::read_dir(root)
-            .map_err(|error| format!("Cannot read {}: {error}", root.display()))?
-        {
-            let path = entry
-                .map_err(|error| format!("Cannot read {}: {error}", root.display()))?
-                .path();
-            if path.is_dir() {
-                visit(&path, output)?;
-            } else if !matches!(
-                path.file_name().and_then(|name| name.to_str()),
-                Some("bind-manifest.json" | "README.md")
-            ) {
-                output.push(path);
-            }
-        }
-        Ok(())
-    }
-    let mut files = Vec::new();
-    visit(root, &mut files)?;
-    files.sort();
-    Ok(files)
+    Ok(crate::pipeline::files_under(root)?
+        .into_iter()
+        .filter(|path| {
+            path.parent() != Some(root)
+                || !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| NOT_DEPLOYED.contains(&name))
+        })
+        .collect())
 }
 
 fn worker_name(project: &str, target: &str) -> String {
@@ -294,19 +288,9 @@ fn generated_readme(target: &TargetConfig, static_page: bool) -> String {
     )
 }
 
-fn dependency_lock(
-    target: &TargetConfig,
-    runtime_hash: &str,
-    wasm_hash: &str,
-    artifacts: &[(String, String)],
-) -> String {
-    let entries = artifacts
-        .iter()
-        .map(|(path, hash)| format!("{} = \"{hash}\"", json(path)))
-        .collect::<Vec<_>>()
-        .join("\n");
+fn dependency_lock(target: &TargetConfig, runtime_hash: &str) -> String {
     format!(
-        "# Generated by bindc. Do not edit.\n\n[bind]\nlanguage = \"0.1.0\"\nprofile = \"{PROFILE_VERSION}\"\n\n[target]\nclient = \"web\"\nserver = \"wasm\"\nmode = \"{}\"\ndeployment = \"{}\"\n\n[toolchain]\ncloudflareCompatibilityDate = \"{COMPATIBILITY_DATE}\"\nwasmBackend = \"bindc-direct-v1\"\n\n[resolution]\njsRuntimeSha256 = \"{runtime_hash}\"\nwasmSha256 = \"{wasm_hash}\"\n\n[artifacts]\n{entries}\n",
+        "# Generated by bindc. Do not edit.\n\n[bind]\nlanguage = \"0.1.0\"\nprofile = \"{PROFILE_VERSION}\"\n\n[target]\nclient = \"web\"\nserver = \"wasm\"\nmode = \"{}\"\ndeployment = \"{}\"\n\n[toolchain]\ncloudflareCompatibilityDate = \"{COMPATIBILITY_DATE}\"\nwasmBackend = \"bindc-direct-v1\"\n\n[resolution]\njsRuntimeSha256 = \"{runtime_hash}\"\n",
         target.mode_name(),
         target.deployment,
     )
@@ -419,7 +403,10 @@ mod tests {
             &app,
             &config,
             &config.targets["worker"],
-            BuildMode::Build,
+            BuildOptions {
+                mode: BuildMode::Build,
+                update_lock: false,
+            },
         )
         .unwrap();
         assert!(
@@ -433,6 +420,69 @@ mod tests {
                 .unwrap()
                 .contains("\"profile\": \"cloudflare-worker-wasm-v1\"")
         );
+        // The build recorded the locks; the target lock holds no application artifact hash.
+        let lock = fs::read_to_string(&report.target_lock).unwrap();
+        assert!(
+            lock.contains("jsRuntimeSha256") && !lock.contains("worker.js"),
+            "{lock}"
+        );
+        assert!(root.join("bind.lock").is_file());
+        // Emitted IR and graph files are never deployable artifacts.
+        fs::write(generated.join(crate::compiler::EMITTED_IR), "{}").unwrap();
+        fs::write(generated.join(crate::compiler::EMITTED_GRAPH), "").unwrap();
+        let names: Vec<String> = deploy_artifacts(&generated)
+            .unwrap()
+            .iter()
+            .map(|path| relative_name(&generated, path))
+            .collect();
+        assert!(names.contains(&"wrangler.jsonc".to_string()));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name.ends_with(".ir.json") || name.ends_with("graph.txt")),
+            "{names:?}"
+        );
+        // certify now accepts the committed locks; a changed lock is refused without
+        // --update-lock and accepted with it.
+        let certify = BuildOptions {
+            mode: BuildMode::Certify,
+            update_lock: false,
+        };
+        if node_available() {
+            build(
+                &generated,
+                &app,
+                &config,
+                &config.targets["worker"],
+                certify,
+            )
+            .unwrap();
+            fs::write(&report.target_lock, "tampered").unwrap();
+            let error = build(
+                &generated,
+                &app,
+                &config,
+                &config.targets["worker"],
+                certify,
+            )
+            .unwrap_err();
+            assert!(error.contains("does not match"), "{error}");
+            let update = BuildOptions {
+                update_lock: true,
+                ..certify
+            };
+            build(&generated, &app, &config, &config.targets["worker"], update).unwrap();
+            assert_eq!(fs::read_to_string(&report.target_lock).unwrap(), lock);
+        }
+        // Regenerating replaces the previous project; a foreign directory is never replaced.
+        generate(&app, &config, None).unwrap();
+        let foreign = root.join("foreign");
+        fs::create_dir_all(&foreign).unwrap();
+        fs::write(foreign.join("important.txt"), "keep").unwrap();
+        assert!(generate(&app, &config, Some(&foreign)).is_err());
+        assert!(foreign.join("important.txt").is_file());
+        assert!(generate(&app, &config, Some(&root)).is_err());
+        assert!(root.join("bind.toml").is_file());
         fs::remove_dir_all(root).unwrap();
     }
 }
