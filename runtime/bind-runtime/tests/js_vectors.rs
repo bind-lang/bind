@@ -185,6 +185,17 @@ fn f32_bits(value: f32) -> String {
     format!("{:08x}", value.to_bits())
 }
 
+/// The bits of an operation's result. The payload of a NaN produced by arithmetic differs between
+/// targets (x86 propagates the operand's, ARM returns the default NaN), and JS cannot observe it,
+/// so every NaN result is written as the canonical quiet NaN.
+fn result_bits(value: f32) -> String {
+    if value.is_nan() {
+        f32_bits(f32::NAN)
+    } else {
+        f32_bits(value)
+    }
+}
+
 fn edge_f32s() -> Vec<f32> {
     vec![
         0.0,
@@ -240,10 +251,10 @@ fn f32_vectors() -> Value {
             json!({
                 "a": f32_bits(a),
                 "b": f32_bits(b),
-                "add": f32_bits(a + b),
-                "sub": f32_bits(a - b),
-                "mul": f32_bits(a * b),
-                "div": f32_bits(a / b),
+                "add": result_bits(a + b),
+                "sub": result_bits(a - b),
+                "mul": result_bits(a * b),
+                "div": result_bits(a / b),
             })
         })
         .collect();
@@ -269,7 +280,7 @@ fn f32_vectors() -> Value {
     }
     let from_f64: Vec<Value> = doubles
         .iter()
-        .map(|&d| json!({"f64": format!("{:016x}", d.to_bits()), "f32": f32_bits(d as f32)}))
+        .map(|&d| json!({"f64": format!("{:016x}", d.to_bits()), "f32": result_bits(d as f32)}))
         .collect();
     let mut texts: Vec<f32> = edges.clone();
     for _ in 0..200 {
