@@ -3,7 +3,8 @@
 //! Calling convention: every Bind function is
 //! `pub fn bind_<name><T…>(ctx: Ctx, p…) -> BoxFuture<R>`, whose future enters one level of
 //! call depth (`ctx.enter()?`) and evaluates the body. Lambdas are
-//! `Arc<dyn Fn(Ctx, A…) -> BoxFuture<R> + Send + Sync>` whose futures also enter one level;
+//! `Arc<dyn Fn(Ctx, A…) -> BoxFuture<R> + Send + Sync>` whose futures also enter one level, and
+//! that keep their captures in one runtime `Rec`, so chains of closures drop without recursion;
 //! builtins and the wrappers that turn functions and builtins into values do not count, as in
 //! the reference evaluator (`core::eval`).
 //!
@@ -974,16 +975,19 @@ impl Generator<'_, '_> {
             .filter(|local| local_type(body, **local).is_none_or(|ty| !self.layout.is_copy(&ty)))
             .map(|local| self.local(*local))
             .collect();
-        let clones: Vec<String> = captures
-            .iter()
-            .map(|name| format!("let {name} = {name}.clone();"))
-            .collect();
         let mut inputs = vec![format!("ctx: {RUNTIME}::Ctx")];
         for (local, _, param) in params {
             inputs.push(format!("{}: {}", self.local(*local), self.ty(param)));
         }
         let future = self.future_body(body);
-        let mut inner = clones.clone();
+        // The captures live in one `Rec`, the closure's environment: dropping the last handle on
+        // a closure queues its environment instead of dropping it in place, so a closure that
+        // captures a closure that captures a closure… is freed in constant stack, as values are.
+        let mut inner: Vec<String> = captures
+            .iter()
+            .enumerate()
+            .map(|(index, name)| format!("let {name} = env.{index}.clone();"))
+            .collect();
         inner.push(format!("{BOX}::pin(async move {{\n{future}\n}})"));
         let closure = format!(
             "{ARC}::new(move |{}| -> {RUNTIME}::BoxFuture<{result}> {{\n{}\n}}) as {}",
@@ -991,10 +995,17 @@ impl Generator<'_, '_> {
             inner.join("\n"),
             self.ty(ty)
         );
-        if clones.is_empty() {
+        if captures.is_empty() {
             complex(closure)
         } else {
-            complex(format!("{{\n{}\n{closure}\n}}", clones.join("\n")))
+            let clones: Vec<String> = captures
+                .iter()
+                .map(|name| format!("{name}.clone(),"))
+                .collect();
+            complex(format!(
+                "{{\nlet env = {REC}::new(({}));\n{closure}\n}}",
+                clones.join(" ")
+            ))
         }
     }
 
