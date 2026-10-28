@@ -157,7 +157,10 @@ like the other builtins, do not count toward the recursion depth limit. `Set` an
 as arrays in canonical order (a `Map` as `[k, v]` pairs) and have no database mapping; see the
 [certified profile v0.4](certified-profile-v0.4.md).
 
-Without mutation the value restriction is unnecessary: every `val` is generalized.
+A `val` is generalized only when its right-hand side is a syntactic value (a literal, a name, a
+lambda, or a field of one). Any other right-hand side, such as a call that may perform effects, is
+evaluated once and gets a monomorphic type: `val xs = load()` used both as `List<Int>` and as
+`List<String>` is a type error (E7101).
 
 `server fun`, `client component` and functions without a body must annotate every parameter and the
 result (E7003). A component's result is `Ui`. Default parameter values (`x: Int = 1`) are not
@@ -414,8 +417,10 @@ depend on what is known when the expression is checked; annotating the value res
 
 - Nesting is bounded so that hostile input is reported rather than crashing the compiler: expressions,
   patterns and types nest at most 256 levels deep ("Expression is nested too deeply (limit 256).",
-  E7004), and the operator chains being parsed hold at most 1000 operators ("Operator chain is too long
-  (limit 1000).", E7004).
+  E7004), the operator chains being parsed hold at most 1000 operators ("Operator chain is too long
+  (limit 1000).", E7004), and an expression tree is at most 2048 levels tall, counting postfix chains
+  such as `a.b.c` and `f()()` ("Expression is nested too deeply (limit 2048 levels).", E7004). Each `?`
+  of a type counts as one nesting level.
 
 - `a?.f` flattens to `F?` when the field type `F` is already known to be nullable at that point. When
   that is only learned later (an unannotated generic receiver), the result may be `F??`.

@@ -2,10 +2,12 @@ mod ast;
 mod backend;
 mod certified;
 mod cli;
+mod cloudflare;
 mod compiler;
 mod config;
 mod core;
 mod diagnostic;
+mod json;
 mod lexer;
 mod parser;
 mod pipeline;
@@ -34,6 +36,6 @@ fn main() {
     let args = std::env::args().skip(1).collect();
     if let Err(error) = with_compiler_stack(|| cli::run(args)) {
         eprintln!("{error}");
-        std::process::exit(1);
+        std::process::exit(error.exit_code());
     }
 }

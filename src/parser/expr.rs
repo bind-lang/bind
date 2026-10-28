@@ -67,6 +67,12 @@ const MAX_DEPTH: usize = 256;
 /// Most operators in the open operator chains, which later passes traverse recursively.
 const MAX_CHAIN: usize = 1000;
 
+/// Tallest expression tree the parser builds. The recursion and chain limits do not bound it
+/// alone: postfix chains (`a.b.c…`, `f()()…`) and operands grouped in parentheses
+/// (`((1 + … + 1) + … + 1) + …`) grow the tree without nesting the parse, and the later passes
+/// recurse over the tree's height.
+const MAX_HEIGHT: usize = 2048;
+
 enum Infix {
     Op(BinaryOp),
     Elvis,
@@ -90,6 +96,8 @@ pub(crate) struct ExprParser {
     chain: usize,
     /// Set once a limit is reported; parsing then unwinds without further diagnostics.
     limit_reported: bool,
+    /// Height of the tree under each node (expression or block), indexed by `NodeId`.
+    heights: Vec<usize>,
     pub(crate) diagnostics: Vec<Diagnostic>,
 }
 
@@ -117,6 +125,7 @@ impl ExprParser {
             depth: 0,
             chain: 0,
             limit_reported: false,
+            heights: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -218,15 +227,94 @@ impl ExprParser {
     fn next_id(&mut self) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
+        self.heights.push(1);
         id
     }
 
-    fn node(&mut self, kind: ExprKind, span: Span) -> Expr {
-        Expr {
-            id: self.next_id(),
-            kind,
-            span,
+    fn height(&self, id: NodeId) -> usize {
+        self.heights.get(id).copied().unwrap_or(1)
+    }
+
+    fn block_height(&self, stmts: &[Stmt]) -> usize {
+        stmts
+            .iter()
+            .map(|stmt| match stmt {
+                Stmt::Val { value, .. } => self.height(value.id),
+                Stmt::Expr(expr) => self.height(expr.id),
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Records the height of a new node and reports E7004 (once) beyond `MAX_HEIGHT`.
+    fn set_height(&mut self, id: NodeId, below: usize) {
+        let height = below + 1;
+        if let Some(slot) = self.heights.get_mut(id) {
+            *slot = height;
         }
+        if height > MAX_HEIGHT {
+            self.limit("Expression is nested too deeply (limit 2048 levels).");
+        }
+    }
+
+    fn new_block(&mut self, stmts: Vec<Stmt>, span: Span) -> Block {
+        let id = self.next_id();
+        let below = self.block_height(&stmts);
+        self.set_height(id, below);
+        Block { id, stmts, span }
+    }
+
+    fn node(&mut self, kind: ExprKind, span: Span) -> Expr {
+        let height = |expr: &Expr| self.height(expr.id);
+        let below = match &kind {
+            ExprKind::Int(_)
+            | ExprKind::Double(_)
+            | ExprKind::Float(_)
+            | ExprKind::Str(_)
+            | ExprKind::Bool(_)
+            | ExprKind::Null
+            | ExprKind::Name(_) => 0,
+            ExprKind::Call {
+                callee,
+                args,
+                children,
+            } => args
+                .iter()
+                .map(height)
+                .chain(std::iter::once(height(callee)))
+                .chain(children.iter().map(|block| self.height(block.id)))
+                .max()
+                .unwrap_or(0),
+            ExprKind::Field { target, .. }
+            | ExprKind::SafeField { target, .. }
+            | ExprKind::Return(target) => height(target),
+            ExprKind::Unary { operand, .. } => height(operand),
+            ExprKind::Binary { left, right, .. } => height(left).max(height(right)),
+            ExprKind::Elvis { value, fallback } => height(value).max(height(fallback)),
+            ExprKind::If {
+                condition,
+                then_branch,
+                else_branch,
+            } => height(condition)
+                .max(height(then_branch))
+                .max(height(else_branch)),
+            ExprKind::When { scrutinee, arms } => arms
+                .iter()
+                .map(|arm| height(&arm.body))
+                .chain(std::iter::once(height(scrutinee)))
+                .max()
+                .unwrap_or(0),
+            ExprKind::Lambda { body, .. } | ExprKind::Block(body) => self.height(body.id),
+            ExprKind::Builder { target, fields } => fields
+                .iter()
+                .map(|field| height(&field.value))
+                .chain(std::iter::once(height(target)))
+                .max()
+                .unwrap_or(0),
+        };
+        let id = self.next_id();
+        self.set_height(id, below);
+        Expr { id, kind, span }
     }
 
     fn error(&mut self, code: &'static str, message: impl Into<String>, span: Span) {
@@ -373,6 +461,9 @@ impl ExprParser {
                 },
             };
             left = self.node(kind, span);
+            if self.limit_reported {
+                return None;
+            }
         }
         Some(left)
     }
@@ -399,6 +490,10 @@ impl ExprParser {
     fn postfix(&mut self) -> Option<Expr> {
         let mut expr = self.primary()?;
         loop {
+            // A chain too tall (`MAX_HEIGHT`) has been reported; unwind.
+            if self.limit_reported {
+                return None;
+            }
             if self.is("(") && self.same_line() {
                 let mut args = self.arguments()?;
                 let children = self.trailing(&mut args);
@@ -692,11 +787,7 @@ impl ExprParser {
         let stmts = self.statements(Some("}"));
         let _ = self.expect("}");
         self.nesting = saved;
-        Block {
-            id: self.next_id(),
-            stmts,
-            span,
-        }
+        self.new_block(stmts, span)
     }
 
     /// `{ x, y -> ... }` or `{ -> ... }`.
@@ -732,11 +823,7 @@ impl ExprParser {
         let stmts = self.statements(Some("}"));
         let closed = self.expect("}").is_some();
         self.nesting = saved;
-        let body = Block {
-            id: self.next_id(),
-            stmts,
-            span: body_span,
-        };
+        let body = self.new_block(stmts, body_span);
         if !closed {
             return None;
         }
@@ -1052,7 +1139,14 @@ impl ExprParser {
             }
             TypeExpr::Named { name, args, span }
         };
+        // Each `?` nests one more option, so it counts toward the depth limit.
+        let mut levels = 0;
         while self.consume("?") {
+            levels += 1;
+            if self.depth + levels > MAX_DEPTH {
+                self.limit("Expression is nested too deeply (limit 256).");
+                return None;
+            }
             ty = TypeExpr::Nullable(Box::new(ty));
         }
         Some(ty)
@@ -1072,8 +1166,13 @@ fn classify_number(text: &str) -> Result<NumberLiteral, &'static str> {
     if cleaned.ends_with('u') || cleaned.ends_with("ul") {
         return Err("Unsigned literals are not supported.");
     }
+    // A Long literal would be typed `Int` (arbitrary precision), not `Long`: rejected rather
+    // than silently given another type and range.
+    if cleaned.ends_with('l') {
+        return Err("Long literals (`L` suffix) are not supported; write the value without `L`.");
+    }
     let radix = |digits: &str, base: u32| {
-        u128::from_str_radix(digits.trim_end_matches('l'), base)
+        u128::from_str_radix(digits, base)
             .map_or_else(|_| cleaned.clone(), |value| value.to_string())
     };
     if let Some(hex) = cleaned.strip_prefix("0x") {
@@ -1088,7 +1187,7 @@ fn classify_number(text: &str) -> Result<NumberLiteral, &'static str> {
     if cleaned.contains('.') || cleaned.contains('e') {
         return Ok(NumberLiteral::Double(cleaned));
     }
-    let digits = cleaned.trim_end_matches('l').trim_start_matches('0');
+    let digits = cleaned.trim_start_matches('0');
     Ok(NumberLiteral::Int(if digits.is_empty() {
         "0".into()
     } else {
@@ -1153,7 +1252,8 @@ mod tests {
         assert_eq!(expression("1_000"), "{ 1000 }");
         assert_eq!(expression("0xFF"), "{ 255 }");
         assert_eq!(expression("0b101"), "{ 5 }");
-        assert_eq!(expression("42L"), "{ 42 }");
+        assert_eq!(codes("42L"), vec!["E7004"]);
+        assert_eq!(codes("0xFFL"), vec!["E7004"]);
         assert_eq!(expression("2.5"), "{ 2.5 }");
         assert_eq!(expression("1.5f"), "{ 1.5f }");
         assert_eq!(codes("7u"), vec!["E7004"]);
@@ -1322,6 +1422,30 @@ mod tests {
             .is_err()
         );
         assert!(codes(&nested(200)).is_empty());
+        // `?` nests options, so it counts toward the type depth.
+        assert!(parse_type_text(&format!("Int{}", "?".repeat(300)), &Span::default()).is_err());
+        assert!(parse_type_text(&format!("Int{}", "?".repeat(100_000)), &Span::default()).is_err());
+        assert!(parse_type_text(&format!("Int{}", "?".repeat(100)), &Span::default()).is_ok());
+    }
+
+    /// Postfix chains and parenthesized operands grow the tree without nesting the parse.
+    #[test]
+    fn tall_trees_are_reported_without_overflowing() {
+        crate::with_compiler_stack(tall_tree_cases);
+    }
+
+    fn tall_tree_cases() {
+        assert_eq!(codes(&format!("x{}", ".a".repeat(5_000))), vec!["E7004"]);
+        assert_eq!(codes(&format!("x{}", ".a".repeat(100_000))), vec!["E7004"]);
+        assert_eq!(codes(&format!("f{}", "(1)".repeat(5_000))), vec!["E7004"]);
+        assert_eq!(codes(&format!("x{}", "?.a".repeat(5_000))), vec!["E7004"]);
+        let mut grouped = "1".to_string();
+        for _ in 0..200 {
+            grouped = format!("({grouped}){}", " + 1".repeat(900));
+        }
+        assert_eq!(codes(&grouped), vec!["E7004"]);
+        assert!(codes(&format!("x{}", ".a".repeat(1_000))).is_empty());
+        assert!(codes(&format!("f{}", "(1)".repeat(1_000))).is_empty());
     }
 
     #[test]

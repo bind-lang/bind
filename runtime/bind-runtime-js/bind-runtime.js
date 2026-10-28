@@ -97,6 +97,36 @@ export function intToString(n) {
   return n.toString();
 }
 
+/**
+ * Largest magnitude of an Int produced by arithmetic, in bits: a sum, difference or product
+ * beyond it is BindError("Overflow"). The same bound as the Rust runtime's MAX_INT_BITS and the
+ * evaluator's MAX_INT_LIMBS (1024 limbs of 32 bits).
+ */
+export const MAX_INT_BITS = 32768;
+const INT_BOUND = 1n << BigInt(MAX_INT_BITS); // |n| < 2^32768 <=> n has at most 32768 bits
+
+function intBounded(n, what) {
+  if (n >= INT_BOUND || n <= -INT_BOUND) {
+    throw new BindError("Overflow", `Int ${what} beyond ${MAX_INT_BITS} bits`);
+  }
+  return n;
+}
+
+/** a + b, or BindError("Overflow") beyond MAX_INT_BITS. */
+export function intAdd(a, b) {
+  return intBounded(a + b, "addition");
+}
+
+/** a - b, or BindError("Overflow") beyond MAX_INT_BITS. */
+export function intSub(a, b) {
+  return intBounded(a - b, "subtraction");
+}
+
+/** a * b, or BindError("Overflow") beyond MAX_INT_BITS. */
+export function intMul(a, b) {
+  return intBounded(a * b, "multiplication");
+}
+
 /** Division truncating toward zero, as an Int?: some(quotient), or null when the divisor is zero. */
 export function intDiv(a, b) {
   return b === 0n ? null : some(a / b);
@@ -683,8 +713,12 @@ export function decodeDecimal(json) {
   return value === null ? fail("a decimal string") : value;
 }
 
+/**
+ * Double: a finite number. JSON.parse reads an out-of-range literal (`1e400`) as Infinity;
+ * serde_json rejects it (NumberOutOfRange), so it is a DecodeError here too.
+ */
 export function decodeDouble(json) {
-  return typeof json === "number" ? json : fail("a number");
+  return Number.isFinite(json) ? json : fail("a finite number");
 }
 
 /**
@@ -693,7 +727,8 @@ export function decodeDouble(json) {
  * number as f64 and casts it to f32, which is exactly this rounding.
  */
 export function decodeFloat(json) {
-  return typeof json === "number" ? Math.fround(json) : fail("a number");
+  // The JSON number must be a finite f64 (serde_json); its f32 cast may still overflow.
+  return Number.isFinite(json) ? Math.fround(json) : fail("a finite number");
 }
 
 /** Unit: null (serde's `()`); the value is `undefined`. */

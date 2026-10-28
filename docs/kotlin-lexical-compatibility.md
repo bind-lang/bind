@@ -18,7 +18,7 @@ The Bind lexer accepts the Kotlin lexical forms defined by that grammar revision
 
 - Kotlin whitespace, CR/LF/CRLF, shebangs, line comments, and nested block comments;
 - Unicode identifiers in categories `Lu`, `Ll`, `Lt`, `Lm`, `Lo`, and digits in `Nd`;
-- escaped backtick identifiers and labelled jumps/references;
+- escaped backtick identifiers and labelled jumps/references, restricted to contents that are themselves identifiers (so a keyword can be a name; spaces and punctuation are E1004, because names reach generated code and file paths);
 - decimal, hexadecimal, binary, long, unsigned, float, exponent, and underscore-separated literals;
 - character literals and Kotlin escape sequences;
 - line strings, multiline raw strings, field references, and nested `${...}` interpolation;

@@ -23,11 +23,11 @@ pub struct Codigo {
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub enum Lista<T> {
+pub enum Lista<T: 'static> {
     #[serde(rename = "cons")]
     Cons {
         cabeca: T,
-        cauda: ::std::boxed::Box<Lista<T>>,
+        cauda: crate::bind_runtime::Rec<Lista<T>>,
     },
     #[serde(rename = "vazia")]
     Vazia,
@@ -38,7 +38,7 @@ pub enum Lista<T> {
 pub struct Config {
     pub r#type: ::std::string::String,
     pub r#match: crate::bind_runtime::Int,
-    pub filho: ::std::boxed::Box<::std::option::Option<Config>>,
+    pub filho: crate::bind_runtime::Rec<::std::option::Option<Config>>,
 }
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
@@ -56,13 +56,13 @@ pub enum Arv {
     #[serde(rename = "nodo")]
     Nodo {
         v: crate::bind_runtime::Int,
-        filhos: ::std::sync::Arc<::std::vec::Vec<Arv>>,
+        filhos: crate::bind_runtime::Rec<::std::sync::Arc<::std::vec::Vec<Arv>>>,
     },
 }
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub enum Opt<T> {
+pub enum Opt<T: 'static> {
     #[serde(rename = "nada")]
     Nada,
     #[serde(skip)]
@@ -71,7 +71,7 @@ pub enum Opt<T> {
 
 #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Marca<T> {
+pub struct Marca<T: 'static> {
     pub nome: ::std::string::String,
     #[serde(skip)]
     pub __phantom: ::std::marker::PhantomData<fn() -> (T,)>,
@@ -123,7 +123,7 @@ pub fn bind_segundo(ctx: crate::bind_runtime::Ctx, v0_l: Lista<crate::bind_runti
 pub fn bind_um(ctx: crate::bind_runtime::Ctx, v0_l: Lista<::std::string::String>) -> crate::bind_runtime::BoxFuture<Lista<::std::string::String>> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(Lista::<::std::string::String>::Cons { cabeca: ::std::string::String::from("a"), cauda: ::std::boxed::Box::new(v0_l.clone()) })
+        ::std::result::Result::Ok(Lista::<::std::string::String>::Cons { cabeca: ::std::string::String::from("a"), cauda: crate::bind_runtime::Rec::new(v0_l.clone()) })
     })
 }
 
@@ -195,11 +195,11 @@ pub fn bind_total(ctx: crate::bind_runtime::Ctx, v0_a: Arv) -> crate::bind_runti
         ::std::result::Result::Ok(match &v0_a {
             Arv::Nodo { v: p0, filhos: p1 } => {
                 let v1_v = p0.clone();
-                let v2_fs = p1.clone();
+                let v2_fs = (**p1).clone();
                 crate::bind_runtime::fold(ctx.clone(), v2_fs.clone(), v1_v.clone(), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v3_s: crate::bind_runtime::Int, v4_f: Arv| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
                     ::std::boxed::Box::pin(async move {
                         let ctx = ctx.enter()?;
-                        ::std::result::Result::Ok(v3_s.add(&bind_total(ctx.clone(), v4_f.clone()).await?))
+                        v3_s.add(&bind_total(ctx.clone(), v4_f.clone()).await?)
                     })
                 }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int, Arv) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>).await?
             }
@@ -255,7 +255,7 @@ pub fn bind_rotulo(ctx: crate::bind_runtime::Ctx) -> crate::bind_runtime::BoxFut
 pub fn bind_literalNaCondicao(ctx: crate::bind_runtime::Ctx, v0_m: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::string::String> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(if (Config { r#type: ::std::string::String::from("t"), r#match: v0_m.clone(), filho: ::std::boxed::Box::new(::std::option::Option::<Config>::None) }.r#match.clone() > crate::bind_runtime::Int::from_i64(0)) {
+        ::std::result::Result::Ok(if (Config { r#type: ::std::string::String::from("t"), r#match: v0_m.clone(), filho: crate::bind_runtime::Rec::new(::std::option::Option::<Config>::None) }.r#match.clone() > crate::bind_runtime::Int::from_i64(0)) {
             ::std::string::String::from("sim")
         } else {
             ::std::string::String::from("nao")
@@ -266,7 +266,7 @@ pub fn bind_literalNaCondicao(ctx: crate::bind_runtime::Ctx, v0_m: crate::bind_r
 pub fn bind_varianteNaCondicao(ctx: crate::bind_runtime::Ctx, v0_m: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::string::String> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(if (Lista::<crate::bind_runtime::Int>::Cons { cabeca: crate::bind_runtime::Int::from_i64(1), cauda: ::std::boxed::Box::new(Lista::<crate::bind_runtime::Int>::Vazia) } == Lista::<crate::bind_runtime::Int>::Cons { cabeca: v0_m.clone(), cauda: ::std::boxed::Box::new(Lista::<crate::bind_runtime::Int>::Vazia) }) {
+        ::std::result::Result::Ok(if (Lista::<crate::bind_runtime::Int>::Cons { cabeca: crate::bind_runtime::Int::from_i64(1), cauda: crate::bind_runtime::Rec::new(Lista::<crate::bind_runtime::Int>::Vazia) } == Lista::<crate::bind_runtime::Int>::Cons { cabeca: v0_m.clone(), cauda: crate::bind_runtime::Rec::new(Lista::<crate::bind_runtime::Int>::Vazia) }) {
             ::std::string::String::from("sim")
         } else {
             ::std::string::String::from("nao")

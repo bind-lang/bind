@@ -12,6 +12,8 @@ use crate::types::ty::Type;
 
 pub const ARC: &str = "::std::sync::Arc";
 pub const BOX: &str = "::std::boxed::Box";
+/// The runtime's handle for a recursive field (shallow clone, iterative drop).
+pub const REC: &str = "crate::bind_runtime::Rec";
 pub const OPTION: &str = "::std::option::Option";
 pub const STRING: &str = "::std::string::String";
 pub const RESULT: &str = "::std::result::Result";
@@ -379,15 +381,16 @@ impl<'p> Layout<'p> {
 
     // ---- recursion -----------------------------------------------------------------------
 
-    /// User types stored inline by a value of type `ty` (behind `Option`, `Result` and user
-    /// type arguments; `List`, `Set`, `Map` and functions are behind a pointer already).
+    /// User types a value of type `ty` holds: inline (behind `Option`, `Result` and user type
+    /// arguments) or inside a `List`, `Set` or `Map`. Functions are opaque: what a closure
+    /// captures is not counted.
     fn inline_types(&self, ty: &Type, output: &mut BTreeSet<&'p str>) {
         let Type::Con(name, args) = ty else {
             return;
         };
         if let Some(user) = self.user_types.get(name.as_str()) {
             output.insert(user);
-        } else if !matches!(name.as_str(), "Option" | "Result") {
+        } else if !matches!(name.as_str(), "Option" | "Result" | "List" | "Set" | "Map") {
             return;
         }
         for arg in args {
@@ -395,8 +398,10 @@ impl<'p> Layout<'p> {
         }
     }
 
-    /// Fields whose inline types reach back to the declaring type: boxing them breaks every
-    /// cycle of inline storage, so each type has a finite size.
+    /// Fields whose types reach back to the declaring type, inline or through a collection:
+    /// they are stored as a runtime `Rec`. That breaks every cycle of inline storage, so each
+    /// type has a finite size, and every chain of nested values, of any length, passes through
+    /// `Rec`s, which are dropped without recursion and serialized with a depth bound.
     fn recursive_fields(&self) -> BTreeSet<(String, usize)> {
         let mut edges: BTreeMap<&'p str, BTreeSet<&'p str>> = BTreeMap::new();
         for name in &self.user_types {
@@ -507,7 +512,11 @@ impl<'p> Layout<'p> {
             let generics = if params.is_empty() {
                 String::new()
             } else {
-                let params: Vec<String> = params.iter().map(|param| self.ident(param)).collect();
+                // `'static`: a recursive field (`Rec`) holds only values that own their data.
+                let params: Vec<String> = params
+                    .iter()
+                    .map(|param| format!("{}: 'static", self.ident(param)))
+                    .collect();
                 format!("<{}>", params.join(", "))
             };
             let ident = self.ident(name);
@@ -530,8 +539,9 @@ impl<'p> Layout<'p> {
                     for (variant, fields) in variants {
                         if serde {
                             // The `bind-json` name of a variant (`certified::lower_camel`, as in the JS codecs).
+                            // A Rust string literal (`{:?}`) whatever the name holds.
                             output.push_str(&format!(
-                                "#[serde(rename = \"{}\")]\n",
+                                "#[serde(rename = {:?})]\n",
                                 crate::certified::lower_camel(variant)
                             ));
                         }
@@ -617,7 +627,7 @@ impl<'p> Layout<'p> {
     ) -> String {
         let rendered = self.ty(ty, generics);
         if self.is_boxed(ctor, index) {
-            format!("{BOX}<{rendered}>")
+            format!("{REC}<{rendered}>")
         } else {
             rendered
         }
@@ -693,7 +703,7 @@ fn markers(ty: &Type, output: &mut BTreeSet<String>) {
 pub(super) fn field_line(visibility: &str, field: &str, ty: &str, serde: bool) -> String {
     let ident = field_ident(field);
     let rename = if serde && !ident.starts_with("r#") && ident != field {
-        format!("#[serde(rename = \"{field}\")]\n")
+        format!("#[serde(rename = {field:?})]\n")
     } else {
         String::new()
     };
@@ -772,9 +782,32 @@ mod tests {
         let layout = Layout::new(&program);
         assert!(layout.is_boxed("No", 0));
         assert!(!layout.is_boxed("No", 1));
-        assert!(!layout.is_boxed("No", 2));
+        // Through a list too: a chain of nested lists is as deep as a chain of fields.
+        assert!(layout.is_boxed("No", 2));
         assert!(layout.is_boxed("No", 3));
         assert!(!layout.is_boxed("Par", 1));
+        let output = layout.declarations();
+        assert!(
+            output.contains("esq: crate::bind_runtime::Rec<Arvore>,"),
+            "{output}"
+        );
+        assert!(output.contains(
+            "filhos: crate::bind_runtime::Rec<::std::sync::Arc<::std::vec::Vec<Arvore>>>,"
+        ));
+    }
+
+    #[test]
+    fn generic_parameters_are_static_and_renames_are_literals() {
+        let program = compile(
+            "sealed class Lista<T> {\n    data class Cons(val cabeca: T, val cauda: Lista<T>)\n    data object Vazia\n}\n",
+        );
+        let output = Layout::new(&program).declarations();
+        assert!(output.contains("pub enum Lista<T: 'static> {"), "{output}");
+        assert!(output.contains("#[serde(rename = \"cons\")]"), "{output}");
+        assert!(
+            output.contains("cauda: crate::bind_runtime::Rec<Lista<T>>,"),
+            "{output}"
+        );
     }
 
     #[test]

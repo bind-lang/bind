@@ -13,6 +13,9 @@ pub fn parse(tokens: Vec<Token>) -> (Program, Vec<Diagnostic>) {
     .program()
 }
 
+/// Deepest nesting of function types in a declaration's type (as in the expression parser).
+const MAX_TYPE_DEPTH: usize = 256;
+
 struct Parser {
     tokens: Vec<Token>,
     index: usize,
@@ -559,10 +562,24 @@ impl Parser {
     }
 
     fn type_ref(&mut self) -> Option<TypeRef> {
+        self.type_ref_at(0)
+    }
+
+    /// `depth` counts the function types this one is the result of (`() -> () -> …`), bounded
+    /// like every other nesting so that hostile input is reported instead of overflowing.
+    fn type_ref_at(&mut self, depth: usize) -> Option<TypeRef> {
+        if depth >= MAX_TYPE_DEPTH {
+            self.diagnostics.push(Diagnostic::error(
+                "E7004",
+                "Type is nested too deeply (limit 256).",
+                self.peek().span.clone(),
+            ));
+            return None;
+        }
         if self.peek_text() == "(" {
             let mut name = self.balanced_group();
             if self.consume("->") {
-                let result = self.type_ref()?;
+                let result = self.type_ref_at(depth + 1)?;
                 name.push_str("->");
                 name.push_str(&result.display());
                 if self.peek_text() == "!" && self.peek_n(1) == "[" {
@@ -581,16 +598,31 @@ impl Parser {
             return Some(TypeRef { name, nullable });
         }
         let mut name = self.identifier()?;
-        if self.consume("<") {
+        if self.peek_text() == "<" {
+            let open = self.advance().span.clone();
             let mut depth = 1;
+            let mut parens = 0usize;
             name.push('<');
-            while !self.at_eof() && depth > 0 {
-                let text = self.advance().text.clone();
-                if text == "<" {
-                    depth += 1;
+            while depth > 0 {
+                // A type argument list never contains these: stop there instead of
+                // swallowing the rest of the file when the `>` is missing.
+                let text = structural_text(self.peek());
+                if self.at_eof() || matches!(text, "{" | "}" | "=") || (text == ")" && parens == 0)
+                {
+                    self.diagnostics.push(Diagnostic::error(
+                        "E7005",
+                        "Expected `>` to close the type arguments opened here.",
+                        open,
+                    ));
+                    return None;
                 }
-                if text == ">" {
-                    depth -= 1;
+                let text = self.advance().text.clone();
+                match text.as_str() {
+                    "<" => depth += 1,
+                    ">" => depth -= 1,
+                    "(" => parens += 1,
+                    ")" => parens -= 1,
+                    _ => {}
                 }
                 name.push_str(&text);
             }
@@ -1029,6 +1061,34 @@ mod tests {
         let (tokens, _) = lex("test.bd", source);
         let (program, diagnostics) = parse(tokens);
         (program, diagnostics.iter().map(|item| item.code).collect())
+    }
+
+    #[test]
+    fn deep_function_types_in_declarations_are_bounded() {
+        let source = format!("fun f(p: {}Int): Int = 1\n", "() -> ".repeat(100_000));
+        let (program, codes) = parse_with_codes(&source);
+        assert!(program.functions.is_empty());
+        assert_eq!(codes.first(), Some(&"E7004"));
+        let source = format!("fun f(p: {}Int): Int = 1\n", "() -> ".repeat(10));
+        assert!(parse_with_codes(&source).1.is_empty());
+    }
+
+    #[test]
+    fn unclosed_type_arguments_do_not_swallow_the_file() {
+        let (program, codes) = parse_with_codes("fun f(x: List<Int): Int = 1\nfun g(): Int = 2\n");
+        assert_eq!(codes.first(), Some(&"E7005"));
+        assert!(
+            program
+                .functions
+                .iter()
+                .any(|function| function.name == "g")
+        );
+        let program =
+            parse_source("fun f(x: List<(Int) -> Int>, y: Map<String, List<Int>>): Int = 1\n");
+        assert_eq!(
+            program.functions[0].parameters[0].declared_type().display(),
+            "List<(Int)->Int>"
+        );
     }
 
     #[test]

@@ -32,7 +32,7 @@ pub fn bind_esquerda(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::I
 pub fn bind_direita(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.mul(&crate::bind_runtime::Int::from_i64(10)))
+        v0_x.mul(&crate::bind_runtime::Int::from_i64(10))
     })
 }
 
@@ -60,7 +60,7 @@ pub fn bind_dinheiro(ctx: crate::bind_runtime::Ctx, v0_m: ::rust_decimal::Decima
 pub fn bind_escolhe(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.add(&crate::bind_runtime::Int::from_i64(1)))
+        v0_x.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 
@@ -70,7 +70,7 @@ pub fn bind_fundo(ctx: crate::bind_runtime::Ctx, v0_n: crate::bind_runtime::Int)
         ::std::result::Result::Ok(if v0_n <= crate::bind_runtime::Int::from_i64(0) {
             crate::bind_runtime::Int::from_i64(0)
         } else {
-            bind_fundo(ctx.clone(), v0_n.sub(&crate::bind_runtime::Int::from_i64(1))).await?
+            bind_fundo(ctx.clone(), v0_n.sub(&crate::bind_runtime::Int::from_i64(1))?).await?
         })
     })
 }
@@ -78,7 +78,7 @@ pub fn bind_fundo(ctx: crate::bind_runtime::Ctx, v0_n: crate::bind_runtime::Int)
 pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_a: crate::bind_runtime::Int, v1_b: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_a.add(&v1_b))
+        v0_a.add(&v1_b)
     })
 }
 

@@ -46,7 +46,7 @@ pub mod app {
 
     #[derive(Clone, Debug, PartialEq, ::serde::Serialize, ::serde::Deserialize)]
     #[serde(deny_unknown_fields)]
-    pub struct Pagina<T> {
+    pub struct Pagina<T: 'static> {
         pub itens: ::std::sync::Arc<::std::vec::Vec<T>>,
         pub total: crate::bind_runtime::Int,
     }
@@ -144,8 +144,10 @@ pub struct HttpResult {
     pub body: ::std::string::String,
 }
 
-/// `{"error": message}` with the error's status; the message never exposes internals.
+/// `{"error": message}` with the error's status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn error_result(error: &crate::bind_runtime::AppError) -> HttpResult {
+    crate::bind_runtime::log_error(error);
     let body = ::serde_json::json!({ "error": error.public_message() }).to_string();
     HttpResult { status: error.status(), body }
 }
@@ -176,23 +178,28 @@ async fn finish<T: ::serde::Serialize>(
     }
 }
 
-/// Decodes the request, opens the transaction and builds the call's context.
+/// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
+/// (with its statement timeout: the runtime's `begin_transaction`) and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
     body: &[u8],
     pool: &::sqlx::PgPool,
 ) -> ::std::result::Result<(I, crate::bind_runtime::Ctx), HttpResult> {
-    let input = ::serde_json::from_slice(body)
+    let text = crate::bind_runtime::request_text(body).map_err(|error| error_result(&error))?;
+    let input = ::serde_json::from_str(text)
     .map_err(|error| error_result(&crate::bind_runtime::AppError::BadRequest(error.to_string())))?;
-    let transaction = pool
-    .begin()
+    let transaction = crate::bind_runtime::begin_transaction(pool, false)
     .await
-    .map_err(|error| error_result(&crate::bind_runtime::AppError::from(error)))?;
+    .map_err(|error| error_result(&error))?;
     ::std::result::Result::Ok((input, crate::bind_runtime::Ctx::with_transaction(transaction)))
 }
 
-/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction. The path's
+/// percent-escapes are decoded first (a browser sends `/api/café` as `/api/caf%C3%A9`).
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {
-    match path.trim_end_matches('/') {
+    let ::std::option::Option::Some(path) = crate::bind_runtime::decode_path(path) else {
+        return error_result(&crate::bind_runtime::AppError::BadRequest(::std::string::String::from("malformed request path")));
+    };
+    match crate::bind_runtime::rpc_route(&path) {
         "/api/agrupa" => {
             let (input, ctx) = match begin::<AgrupaInput>(body, pool).await {
                 ::std::result::Result::Ok(started) => started,

@@ -40,17 +40,21 @@ fn string_kind(template: bool) -> TokenKind {
     }
 }
 
-/// Whether the source of a string literal contains a template: `$` followed by `{`, `_` or a
-/// letter. In a line string (`escapes`) a `\$` is a literal dollar sign and an escape is
-/// skipped as a whole, so in `"\\$x"` the `$` is a template again; a raw string has no escapes.
+/// Whether the source of a string literal contains a template: `$` followed by `{`, an
+/// identifier start (Kotlin's `Letter` or `_`) or a backtick identifier (`$`x``), as in
+/// Kotlin's `FieldIdentifier`. In a line string (`escapes`) a `\$` is a literal dollar sign and
+/// an escape is skipped as a whole, so in `"\\$x"` the `$` is a template again; a raw string
+/// has no escapes.
 fn has_template(source: &[char], escapes: bool) -> bool {
     let mut index = 0;
     while index < source.len() {
         match source[index] {
             '\\' if escapes => index += 2,
-            '$' if source
-                .get(index + 1)
-                .is_some_and(|next| *next == '{' || *next == '_' || next.is_alphabetic()) =>
+            '$' if source.get(index + 1).is_some_and(|next| {
+                *next == '{'
+                    || is_identifier_start(*next)
+                    || (*next == '`' && backtick_identifier_follows(&source[index + 1..]))
+            }) =>
             {
                 return true;
             }
@@ -60,6 +64,28 @@ fn has_template(source: &[char], escapes: bool) -> bool {
     false
 }
 
+/// Whether `source` starts with a closed, non-empty backtick identifier.
+fn backtick_identifier_follows(source: &[char]) -> bool {
+    let body = source
+        .iter()
+        .skip(1)
+        .take_while(|ch| !matches!(ch, '`' | '\r' | '\n'));
+    let length = body.count();
+    length > 0 && source.get(length + 1) == Some(&'`')
+}
+
+/// Whether `text` (the content of a backtick-escaped identifier) is itself a valid identifier.
+/// Escaping only lets a keyword be used as a name; the text reaches generated code and file
+/// names, so it never holds spaces, punctuation or path separators.
+fn is_valid_escaped_identifier(text: &[char]) -> bool {
+    text.first()
+        .is_some_and(|first| is_identifier_start(*first))
+        && text[1..].iter().all(|ch| is_identifier_continue(*ch))
+}
+
+/// Deepest nesting of `${...}` inside string templates the lexer skips over.
+const MAX_INTERPOLATION_DEPTH: usize = 256;
+
 struct Lexer<'a> {
     file: &'a str,
     chars: Vec<char>,
@@ -67,6 +93,10 @@ struct Lexer<'a> {
     line: usize,
     column: usize,
     previous_was_cr: bool,
+    /// Open `${...}` templates being skipped, bounded by `MAX_INTERPOLATION_DEPTH`.
+    interpolation_depth: usize,
+    /// Set once the interpolation limit is reported; the unwinding adds no diagnostics.
+    interpolation_overflow: bool,
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -80,6 +110,8 @@ impl<'a> Lexer<'a> {
             line: 1,
             column: 1,
             previous_was_cr: false,
+            interpolation_depth: 0,
+            interpolation_overflow: false,
             tokens: Vec::new(),
             diagnostics: Vec::new(),
         }
@@ -177,12 +209,18 @@ impl<'a> Lexer<'a> {
             self.advance();
             text.push('@');
             if self.peek(0) == Some('`') {
+                let label_span = self.span();
                 self.advance();
+                let label_start = self.index;
                 while self
                     .peek(0)
                     .is_some_and(|ch| !matches!(ch, '`' | '\r' | '\n'))
                 {
                     text.push(self.advance().expect("escaped label character exists"));
+                }
+                if !is_valid_escaped_identifier(&self.chars[label_start..self.index]) {
+                    self.diagnostics
+                        .push(invalid_escaped_identifier(label_span));
                 }
                 if self.peek(0) == Some('`') {
                     self.advance();
@@ -215,6 +253,12 @@ impl<'a> Lexer<'a> {
                         "An escaped Kotlin identifier cannot be empty.",
                         span.clone(),
                     ));
+                }
+                if self.index > start
+                    && !is_valid_escaped_identifier(&self.chars[start..self.index])
+                {
+                    self.diagnostics
+                        .push(invalid_escaped_identifier(span.clone()));
                 }
                 let text: String = self.chars[start..self.index].iter().collect();
                 self.advance();
@@ -279,7 +323,7 @@ impl<'a> Lexer<'a> {
         let start = self.index;
         let (text, closed) = self.line_string_value();
         let template = has_template(&self.chars[start..self.index], true);
-        if !closed {
+        if !closed && !self.interpolation_overflow {
             self.diagnostics.push(Diagnostic::error(
                 "E1002",
                 "Unterminated Kotlin line string.",
@@ -305,25 +349,33 @@ impl<'a> Lexer<'a> {
                 '\r' | '\n' => return (text, false),
                 '\\' => {
                     let escape_start = self.index;
+                    let escape_span = self.span();
                     if let Some(value) = self.scan_escape() {
                         text.push_str(&value);
                     } else {
                         self.diagnostics.push(Diagnostic::error(
                             "E1006",
                             "Invalid escape sequence in Kotlin string.",
-                            self.span_at(escape_start),
+                            escape_span,
                         ));
-                        self.advance();
+                        // Skip the unknown escaped character; a partial `\u` escape already
+                        // consumed what it read (which may not include the closing quote).
+                        if self.index == escape_start + 1 {
+                            self.advance();
+                        }
                     }
                 }
                 '$' if self.peek(1) == Some('{') => {
                     let start = self.index;
+                    let start_span = self.span();
                     if !self.skip_interpolation() {
-                        self.diagnostics.push(Diagnostic::error(
-                            "E1007",
-                            "Unterminated Kotlin string interpolation.",
-                            self.span_at(start),
-                        ));
+                        if !self.interpolation_overflow {
+                            self.diagnostics.push(Diagnostic::error(
+                                "E1007",
+                                "Unterminated Kotlin string interpolation.",
+                                start_span,
+                            ));
+                        }
                         return (text, false);
                     }
                     text.extend(&self.chars[start..self.index]);
@@ -357,12 +409,15 @@ impl<'a> Lexer<'a> {
             }
             if self.starts_with("${") {
                 let start = self.index;
+                let start_span = self.span();
                 if !self.skip_interpolation() {
-                    self.diagnostics.push(Diagnostic::error(
-                        "E1007",
-                        "Unterminated Kotlin multiline string interpolation.",
-                        self.span_at(start),
-                    ));
+                    if !self.interpolation_overflow {
+                        self.diagnostics.push(Diagnostic::error(
+                            "E1007",
+                            "Unterminated Kotlin multiline string interpolation.",
+                            start_span,
+                        ));
+                    }
                     break;
                 }
                 text.extend(&self.chars[start..self.index]);
@@ -370,7 +425,7 @@ impl<'a> Lexer<'a> {
                 text.push(self.advance().expect("multiline character exists"));
             }
         }
-        if !closed {
+        if !closed && !self.interpolation_overflow {
             self.diagnostics.push(Diagnostic::error(
                 "E1002",
                 "Unterminated Kotlin multiline string.",
@@ -387,6 +442,25 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_interpolation(&mut self) -> bool {
+        if self.interpolation_depth >= MAX_INTERPOLATION_DEPTH {
+            if !self.interpolation_overflow {
+                self.interpolation_overflow = true;
+                self.diagnostics.push(Diagnostic::error(
+                    "E1007",
+                    "String interpolation is nested too deeply (limit 256).",
+                    self.span(),
+                ));
+            }
+            self.skip_until_newline();
+            return false;
+        }
+        self.interpolation_depth += 1;
+        let closed = self.skip_interpolation_body();
+        self.interpolation_depth -= 1;
+        closed
+    }
+
+    fn skip_interpolation_body(&mut self) -> bool {
         self.advance_count(2);
         let mut depth = 1;
         while self.peek(0).is_some() {
@@ -468,9 +542,25 @@ impl<'a> Lexer<'a> {
             }
             let digits: String = self.chars[start..self.index].iter().collect();
             let value = u32::from_str_radix(&digits, 16).ok()?;
-            return char::from_u32(value)
-                .map(|ch| ch.to_string())
-                .or_else(|| Some(format!("\\u{digits}")));
+            if let Some(ch) = char::from_u32(value) {
+                return Some(ch.to_string());
+            }
+            // Kotlin strings are UTF-16: a high surrogate escape followed by a low surrogate
+            // escape is one character (`"\uD83D\uDE00"` is 😀). A lone surrogate is invalid.
+            if !(0xD800..0xDC00).contains(&value) || !self.starts_with("\\u") {
+                return None;
+            }
+            let low_digits = self.chars.get(self.index + 2..self.index + 6)?;
+            if !low_digits.iter().all(char::is_ascii_hexdigit) {
+                return None;
+            }
+            let low = u32::from_str_radix(&low_digits.iter().collect::<String>(), 16).ok()?;
+            if !(0xDC00..0xE000).contains(&low) {
+                return None;
+            }
+            self.advance_count(6);
+            let combined = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+            return char::from_u32(combined).map(|ch| ch.to_string());
         }
         let value = match escaped {
             't' => "\t",
@@ -602,37 +692,14 @@ impl<'a> Lexer<'a> {
             column: self.column,
         }
     }
+}
 
-    fn span_at(&self, index: usize) -> Span {
-        let mut line = 1;
-        let mut column = 1;
-        let mut previous_cr = false;
-        for ch in &self.chars[..index] {
-            match ch {
-                '\r' => {
-                    line += 1;
-                    column = 1;
-                    previous_cr = true;
-                }
-                '\n' => {
-                    if !previous_cr {
-                        line += 1;
-                    }
-                    column = 1;
-                    previous_cr = false;
-                }
-                _ => {
-                    column += 1;
-                    previous_cr = false;
-                }
-            }
-        }
-        Span {
-            file: self.file.into(),
-            line,
-            column,
-        }
-    }
+fn invalid_escaped_identifier(span: Span) -> Diagnostic {
+    Diagnostic::error(
+        "E1004",
+        "An escaped identifier must itself be a valid identifier (letters, digits and `_`, not starting with a digit); backticks only allow a keyword as a name.",
+        span,
+    )
 }
 
 fn is_kotlin_whitespace(ch: char) -> bool {
@@ -811,10 +878,7 @@ mod tests {
 
     #[test]
     fn supports_unicode_and_escaped_identifiers() {
-        assert_eq!(
-            texts("val ação٢ = `when value`"),
-            ["val", "ação٢", "=", "when value"]
-        );
+        assert_eq!(texts("val ação٢ = `when`"), ["val", "ação٢", "=", "when"]);
     }
 
     #[test]
@@ -849,10 +913,7 @@ mod tests {
             texts("value !is String && item !in list"),
             ["value", "!is", "String", "&&", "item", "!in", "list"]
         );
-        assert_eq!(
-            texts("return@loop this@`odd label`"),
-            ["return@loop", "this@odd label"]
-        );
+        assert_eq!(texts("return@loop this@`fun`"), ["return@loop", "this@fun"]);
     }
 
     #[test]
@@ -953,6 +1014,78 @@ text ${map["key"]}""""#;
         );
         let (_, diagnostics) = lex("unicode.bd", "Ⅳalue");
         assert!(diagnostics.iter().any(|item| item.code == "E1003"));
+    }
+
+    fn codes(source: &str) -> Vec<&'static str> {
+        lex("t.bd", source)
+            .1
+            .into_iter()
+            .map(|diagnostic| diagnostic.code)
+            .collect()
+    }
+
+    fn string_value(source: &str) -> (TokenKind, String) {
+        let (tokens, diagnostics) = lex("t.bd", source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        (tokens[0].kind.clone(), tokens[0].text.clone())
+    }
+
+    #[test]
+    fn escaped_identifiers_must_be_identifiers() {
+        // Backticks only let a keyword be a name: the text reaches generated code and paths.
+        assert_eq!(texts("fun `fun`(`val`: Int)")[1], "fun");
+        assert_eq!(texts("`ação_2`"), ["ação_2"]);
+        for payload in [
+            "fun `x() -> i64 { 0 } pub fn evil`() = 1",
+            "server fun `../../../pwned`(): Int effects [] = 1",
+            "val `a b` = 1",
+            "val `1a` = 1",
+            "return@`a-b` x",
+        ] {
+            assert_eq!(codes(payload), vec!["E1004"], "{payload}");
+        }
+    }
+
+    #[test]
+    fn surrogate_pair_escapes_are_one_character() {
+        assert_eq!(
+            string_value(r#""\uD83D\uDE00!""#),
+            (TokenKind::String, "😀!".to_string())
+        );
+        assert_eq!(codes(r#""\uD800""#), vec!["E1006"]);
+        assert_eq!(codes(r#""\uDE00\uD83D""#), vec!["E1006", "E1006"]);
+        assert_eq!(codes(r#""\uD83Dx""#), vec!["E1006"]);
+        // A partial `\u` escape does not swallow the closing quote.
+        let (tokens, diagnostics) = lex("t.bd", r#""\u12" x"#);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(tokens[1].text, "x");
+    }
+
+    #[test]
+    fn templates_follow_kotlin_field_identifiers() {
+        assert_eq!(string_value(r#""$`x`""#).0, TokenKind::TemplateString);
+        assert_eq!(string_value(r#""$``""#).0, TokenKind::String);
+        // `Ⅳ` is a letter number (Nl), not a Kotlin `Letter`.
+        assert_eq!(string_value("\"$Ⅳ\"").0, TokenKind::String);
+        assert_eq!(string_value("\"$ação\"").0, TokenKind::TemplateString);
+    }
+
+    #[test]
+    fn interpolation_nesting_is_bounded() {
+        let depth = 10_000;
+        let source = format!("{}1{}", "\"${".repeat(depth), "}\"".repeat(depth));
+        let found = codes(&source);
+        assert_eq!(found, vec!["E1007"]);
+        let source = format!("{}1{}", "\"${".repeat(200), "}\"".repeat(200));
+        assert!(codes(&source).is_empty());
+    }
+
+    #[test]
+    fn invalid_escapes_are_reported_in_linear_time() {
+        let source = format!("\"{}\"", "\\q".repeat(50_000));
+        let started = std::time::Instant::now();
+        assert_eq!(codes(&source).len(), 50_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

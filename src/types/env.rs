@@ -344,10 +344,66 @@ impl Env {
                 env.lower(field, &rigid, diagnostics);
             }
         }
+        env.check_distinct_cycles(program, diagnostics);
         env.non_equatable = env.non_equatable_types();
         env.key_types = env.key_types();
         env.check_collection_fields(diagnostics);
         env
+    }
+
+    /// A distinct type that wraps itself, directly (`distinct type A = A`), through options
+    /// (`A = A?`) or through other distinct types (`A = B`, `B = A`), has no representation
+    /// (E7004): it would be a newtype of itself.
+    fn check_distinct_cycles(&self, program: &Program, diagnostics: &mut Vec<Diagnostic>) {
+        /// The type a distinct type's representation is made of, seen through options.
+        fn wrapped(mut ty: &TypeExpr) -> Option<&str> {
+            loop {
+                match ty {
+                    TypeExpr::Nullable(inner) => ty = inner,
+                    TypeExpr::Named { name, args, .. } if name == "Option" && args.len() == 1 => {
+                        ty = &args[0];
+                    }
+                    TypeExpr::Named { name, .. } => return Some(name),
+                    TypeExpr::Function { .. } => return None,
+                }
+            }
+        }
+        for declaration in &program.types {
+            if declaration.kind != TypeKind::Distinct {
+                continue;
+            }
+            let mut path = vec![declaration.name.clone()];
+            let mut current = declaration.name.as_str();
+            while let Some(TypeInfo {
+                kind: TypeKind::Distinct,
+                underlying: Some(underlying),
+                ..
+            }) = self.types.get(current)
+            {
+                let Some(name) = wrapped(underlying) else {
+                    break;
+                };
+                if name == declaration.name {
+                    path.push(name.to_string());
+                    diagnostics.push(Diagnostic::error(
+                        "E7004",
+                        format!(
+                            "Distinct type `{}` wraps itself ({}); a distinct type must wrap another type.",
+                            declaration.name,
+                            path.join(" -> ")
+                        ),
+                        declaration.span.clone(),
+                    ));
+                    break;
+                }
+                // A cycle that does not pass through this declaration is reported at its own.
+                if path.iter().any(|seen| seen == name) {
+                    break;
+                }
+                path.push(name.to_string());
+                current = name;
+            }
+        }
     }
 
     /// `enum class` types and `sealed class` types whose variants all have no fields (only
@@ -906,6 +962,28 @@ mod tests {
         let mut diagnostics = Vec::new();
         let ty = env.lower_with_effects(&te, &BTreeMap::new(), effects, &mut diagnostics);
         (ty, diagnostics.iter().map(|item| item.code).collect())
+    }
+
+    #[test]
+    fn distinct_types_cannot_wrap_themselves() {
+        assert_eq!(build("distinct type A = A\n").1, vec!["E7004"]);
+        assert_eq!(build("distinct type A = A?\n").1, vec!["E7004"]);
+        assert_eq!(
+            build("distinct type A = B\ndistinct type B = Option<A>\n").1,
+            vec!["E7004", "E7004"]
+        );
+        // Another distinct type's cycle is reported once, at its own declarations.
+        assert_eq!(
+            build("distinct type C = A\ndistinct type A = B\ndistinct type B = A\n").1,
+            vec!["E7004", "E7004"]
+        );
+        // Recursion through a collection or a record has a representation.
+        assert!(build("distinct type A = List<A>\n").1.is_empty());
+        assert!(
+            build("data class P(val a: P?)\ndistinct type A = P\n")
+                .1
+                .is_empty()
+        );
     }
 
     #[test]

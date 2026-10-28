@@ -91,6 +91,20 @@ test("intDiv and intRem truncate toward zero; remainder has the dividend's sign"
   eq(rt.intDiv(0n, 0n), null, "0 / 0");
 });
 
+test("intAdd, intSub and intMul overflow beyond MAX_INT_BITS, as the Rust runtime", () => {
+  eq(rt.MAX_INT_BITS, 32768, "the shared bound");
+  eq(rt.intAdd(2n, 3n), 5n);
+  eq(rt.intSub(2n, 3n), -1n);
+  eq(rt.intMul(-4n, 3n), -12n);
+  const top = (1n << 32768n) - 1n; // the largest Int: 32768 bits
+  const half = 1n << 16384n;
+  eq(rt.intAdd(rt.intMul(half, half - 1n), half - 1n), top, "2^32768 - 1 fits");
+  eq(rt.intSub(-top, 0n), -top, "-(2^32768 - 1) fits");
+  throwsKind(() => rt.intAdd(top, 1n), "Overflow", "2^32768");
+  throwsKind(() => rt.intSub(-top, 1n), "Overflow", "-2^32768");
+  throwsKind(() => rt.intMul(half, half), "Overflow", "2^16384 squared");
+});
+
 // ---- Decimal (vectors from rust_decimal) ----
 
 const decimals = readJson("decimal-vectors.json");
@@ -461,6 +475,11 @@ test("record / decodeRecord: no prototype pollution, frozen, strict", () => {
   throwsDecode(() => rt.decodeFloat("0.5"), "float from string");
   eq(rt.decodeDouble(0.1), 0.1);
   throwsDecode(() => rt.decodeDouble("1"), "double from string");
+  // JSON.parse("1e400") is Infinity; serde_json rejects the literal (NumberOutOfRange).
+  throwsDecode(() => rt.decodeDouble(JSON.parse("1e400")), "double out of range");
+  throwsDecode(() => rt.decodeDouble(NaN), "double NaN");
+  throwsDecode(() => rt.decodeFloat(JSON.parse("-1e400")), "float out of range");
+  eq(rt.decodeFloat(1e39), Infinity, "a finite f64 beyond f32 casts to infinity, as serde");
 });
 
 test("decoders with property names; Unit, Long, pairs and some", () => {

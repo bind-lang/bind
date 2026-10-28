@@ -18,7 +18,7 @@
 pub fn bind_f(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.mul(&v0_x).add(&crate::bind_runtime::Int::from_i64(1)))
+        v0_x.mul(&v0_x)?.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 

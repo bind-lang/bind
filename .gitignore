@@ -1,5 +1,11 @@
 /target/
-/.bind/
+
+# Generated workspaces and build caches are not versioned; the locks are (`bind certify`
+# refuses a missing or different lock).
+/.bind/*
+!/.bind/locks/
+**/.bind/*
+!**/.bind/locks/
 .DS_Store
 
 /runtime/bind-runtime/target/

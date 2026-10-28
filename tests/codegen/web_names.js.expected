@@ -18,7 +18,7 @@ async function u_Nomes(ctx, u_x_0) {
 
 async function u_await(ctx, u_x_0) {
     ctx = await rt.enter(ctx);
-    return u_x_0 + 1n;
+    return rt.intAdd(u_x_0, 1n);
 }
 
 async function u_default(ctx, u_o_0) {
@@ -29,7 +29,7 @@ async function u_default(ctx, u_o_0) {
     } else if (u_o_0.tag === "enter") {
         const u_t_1 = u_o_0.u_tag;
         const u_c_2 = u_o_0.u_ctx;
-        t0 = u_t_1 + u_c_2;
+        t0 = rt.intAdd(u_t_1, u_c_2);
     } else {
         throw new Error("bindc: no `when` arm matched");
     }

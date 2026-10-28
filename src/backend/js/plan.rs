@@ -64,7 +64,12 @@ impl FrontendProblem {
     }
 
     pub fn message(&self) -> String {
-        let profile = crate::certified::profile_version();
+        self.message_for(crate::certified::profile_version())
+    }
+
+    /// The problem under the execution profile that owns this frontend. The browser backend is
+    /// shared by Rust and Cloudflare targets, but diagnostics must name the selected contract.
+    pub fn message_for(&self, profile: &str) -> String {
         match self {
             FrontendProblem::MissingMode { target } => format!(
                 "Target `{target}` must choose its mode: `mode = \"ssr\"` (the server renders the page) or `mode = \"split\"` (static frontend calling the API)."

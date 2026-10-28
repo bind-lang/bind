@@ -21,12 +21,12 @@ pub fn bind_f(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::vec:
         crate::bind_runtime::fold(ctx.clone(), crate::bind_runtime::map(ctx.clone(), v0_xs.clone(), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v1_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
             ::std::boxed::Box::pin(async move {
                 let ctx = ctx.enter()?;
-                ::std::result::Result::Ok(v1_x.mul(&crate::bind_runtime::Int::from_i64(2)))
+                v1_x.mul(&crate::bind_runtime::Int::from_i64(2))
             })
         }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>).await?, crate::bind_runtime::Int::from_i64(0), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v2_s: crate::bind_runtime::Int, v3_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
             ::std::boxed::Box::pin(async move {
                 let ctx = ctx.enter()?;
-                ::std::result::Result::Ok(v2_s.add(&v3_x))
+                v2_s.add(&v3_x)
             })
         }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>).await
     })
@@ -36,12 +36,12 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::v
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         crate::bind_runtime::map(ctx.clone(), v0_xs.clone(), {
-            let v1_k = v1_k.clone();
+            let env = crate::bind_runtime::Rec::new((v1_k.clone(),));
             ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v2_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
-                let v1_k = v1_k.clone();
+                let v1_k = env.0.clone();
                 ::std::boxed::Box::pin(async move {
                     let ctx = ctx.enter()?;
-                    ::std::result::Result::Ok(v2_x.add(&v1_k))
+                    v2_x.add(&v1_k)
                 })
             }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>
         }).await
@@ -51,7 +51,7 @@ pub fn bind_soma(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std::v
 pub fn bind_dobro(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        ::std::result::Result::Ok(v0_x.mul(&crate::bind_runtime::Int::from_i64(2)))
+        v0_x.mul(&crate::bind_runtime::Int::from_i64(2))
     })
 }
 
@@ -89,11 +89,10 @@ pub fn bind_escolhe(ctx: crate::bind_runtime::Ctx, v0_xs: ::std::sync::Arc<::std
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         crate::bind_runtime::map(ctx.clone(), v0_xs.clone(), {
-            let v1_f = v1_f.clone();
-            let v3_g = v3_g.clone();
+            let env = crate::bind_runtime::Rec::new((v1_f.clone(), v3_g.clone(),));
             ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v4_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
-                let v1_f = v1_f.clone();
-                let v3_g = v3_g.clone();
+                let v1_f = env.0.clone();
+                let v3_g = env.1.clone();
                 ::std::boxed::Box::pin(async move {
                     let ctx = ctx.enter()?;
                     ::std::result::Result::Ok(if v2_b {
@@ -111,9 +110,9 @@ pub fn bind_ignora(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         ::std::result::Result::Ok({
-            let v0_x = v0_x.clone();
+            let env = crate::bind_runtime::Rec::new((v0_x.clone(),));
             ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v1_y: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
-                let v0_x = v0_x.clone();
+                let v0_x = env.0.clone();
                 ::std::boxed::Box::pin(async move {
                     let ctx = ctx.enter()?;
                     ::std::result::Result::Ok(v0_x.clone())
@@ -127,5 +126,32 @@ pub fn bind_usaIgnora(ctx: crate::bind_runtime::Ctx) -> crate::bind_runtime::Box
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         bind_ignora(ctx.clone(), crate::bind_runtime::Int::from_i64(1)).await?(ctx.clone(), crate::bind_runtime::Int::from_i64(2)).await
+    })
+}
+
+pub fn bind_cadeia(ctx: crate::bind_runtime::Ctx, v0_ns: ::std::sync::Arc<::std::vec::Vec<crate::bind_runtime::Int>>) -> crate::bind_runtime::BoxFuture<::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>> {
+    ::std::boxed::Box::pin(async move {
+        let ctx = ctx.enter()?;
+        crate::bind_runtime::fold(ctx.clone(), v0_ns.clone(), ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v1_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+            ::std::boxed::Box::pin(async move {
+                let ctx = ctx.enter()?;
+                ::std::result::Result::Ok(v1_x.clone())
+            })
+        }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>, ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v2_f: ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>, v3_n: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>> {
+            ::std::boxed::Box::pin(async move {
+                let ctx = ctx.enter()?;
+                ::std::result::Result::Ok({
+                    let env = crate::bind_runtime::Rec::new((v2_f.clone(), v3_n.clone(),));
+                    ::std::sync::Arc::new(move |ctx: crate::bind_runtime::Ctx, v4_x: crate::bind_runtime::Int| -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
+                        let v2_f = env.0.clone();
+                        let v3_n = env.1.clone();
+                        ::std::boxed::Box::pin(async move {
+                            let ctx = ctx.enter()?;
+                            (v2_f)(ctx.clone(), v4_x.clone()).await?.add(&v3_n)
+                        })
+                    }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>
+                })
+            })
+        }) as ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, ::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<::std::sync::Arc<dyn ::std::ops::Fn(crate::bind_runtime::Ctx, crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> + ::std::marker::Send + ::std::marker::Sync>> + ::std::marker::Send + ::std::marker::Sync>).await
     })
 }

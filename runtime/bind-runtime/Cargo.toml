@@ -17,3 +17,5 @@ rust_decimal = { version = "=1.37.2", features = ["serde-str"] }
 chrono = { version = "=0.4.41", features = ["serde"] }
 # `Uuid`: page parameters, and the version generated crates use.
 uuid = { version = "=1.28.0", features = ["serde"] }
+# `Rec`: deep values are compared, hashed and serialized on heap-allocated stack segments.
+stacker = "=0.1.25"

@@ -2186,10 +2186,8 @@ pub(crate) mod tests {
         let values = let_value(&function(&program, "f").body, "xs");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].ty, Type::list(Type::con("Int")));
-        let twice = "server fun f(id: ClienteId): Int effects [db.read] {\n val xs = if (db.clientes.require(id).nome == \"a\") emptyList() else emptyList()\n val a = length(map(xs, { x -> x + 1 }))\n return length(map(xs, { x -> x == \"b\" }))\n}";
-        let program = compile_with(&format!("{ENTIDADE}{twice}"), &schema);
-        let values = let_value(&function(&program, "f").body, "xs");
-        assert_eq!(values.len(), 1, "an effectful value must not be duplicated");
+        // Used at two types, the same `val` is a type error (value restriction; see
+        // `types::infer`), so the lowering never has to copy an effectful value per instance.
     }
 
     #[test]

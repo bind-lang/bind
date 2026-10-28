@@ -13,8 +13,9 @@
 //!   and the tokio runtime the libraries already use; the routing of the generated Lambda entry
 //!   point: `serve` for the `ssr` mode, `cors` then `serve_rpc` for the `split` mode);
 //! - SSR: `GET /?id=` of an existing customer (200, name and e-mail escaped), of a missing one
-//!   (404, the public message), `?id=xyz` (400); the failing page (404) leaves 0 new rows, and
-//!   the same page without the failure writes its row;
+//!   (404, the public message), `?id=xyz` (400), and no row written by `GET /` (the page's
+//!   transaction is read-only; a page calling a function that writes is refused by `verify`,
+//!   E8311);
 //! - CORS: preflight and `POST` from `Origin: http://a.test` accepted, from `http://b.test`
 //!   refused (403, no CORS headers);
 //! - split: the generated `web/app.js` booted in node (`runtime/bind-runtime-js/tests/dom.mjs`,
@@ -62,8 +63,8 @@ fn commerce() -> String {
 /// The commerce example's page component, replaced by `FAILING_PAGE` in the failing variant.
 const CUSTOMER_PAGE: &str = "client component CustomerPage(id: CustomerId) {";
 
-/// A page that writes (`cadastrar`), then fails (`require` of `outro`, missing): the whole page
-/// transaction must be rolled back.
+/// A page that writes (`cadastrar`), then fails (`require` of `outro`, missing): refused by
+/// `verify` in the `ssr` mode (E8311), whose page transaction is read-only.
 const FAILING_PAGE: &str = r#"client component Falha(id: CustomerId, outro: CustomerId, nome: String, email: Email) {
     val existente = server.getCustomer(id)
     val novo = server.cadastrar(nome, email, existente.balance)
@@ -270,7 +271,18 @@ fn ssr_and_split_against_postgres() {
         source.split(CUSTOMER_PAGE).next().unwrap()
     );
     let failing = Project::new("failing", &failing_source);
-    let fail = failing.generate("ssr");
+    let config = ProjectConfig::load(&failing.root.join("bind.toml")).unwrap();
+    let refused = crate::compiler::verify(&config, "ssr");
+    assert!(refused.application.is_none());
+    assert!(
+        refused
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E8311"
+                && diagnostic.message.contains("`cadastrar`")),
+        "{:?}",
+        refused.diagnostics
+    );
     let wire_source = format!("{}{WIRE_PAGE}", source.split(CUSTOMER_PAGE).next().unwrap());
     let wire = Project::new("wire", &wire_source);
     let wire_ssr = wire.generate("ssr");
@@ -290,7 +302,7 @@ fn ssr_and_split_against_postgres() {
     fs::write(
         harness.join("Cargo.toml"),
         format!(
-            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-fail = {{ path = \"fail\" }}\nbind-e2e-wire-ssr = {{ path = \"wire-ssr\" }}\nbind-e2e-wire-split = {{ path = \"wire-split\" }}\nbind-e2e-rich-ssr = {{ path = \"rich-ssr\" }}\nbind-e2e-rich-split = {{ path = \"rich-split\" }}\n",
+            "[package]\nname = \"bind-e2e\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[dependencies]\n{}bind-e2e-ssr = {{ path = \"ssr\" }}\nbind-e2e-split = {{ path = \"split\" }}\nbind-e2e-wire-ssr = {{ path = \"wire-ssr\" }}\nbind-e2e-wire-split = {{ path = \"wire-split\" }}\nbind-e2e-rich-ssr = {{ path = \"rich-ssr\" }}\nbind-e2e-rich-split = {{ path = \"rich-split\" }}\n",
             crate::certified::server_dependencies()
         ),
     )
@@ -304,7 +316,6 @@ fn ssr_and_split_against_postgres() {
     .unwrap();
     member(&harness, "ssr", "bind-e2e-ssr", &ssr);
     member(&harness, "split", "bind-e2e-split", &split);
-    member(&harness, "fail", "bind-e2e-fail", &fail);
     member(&harness, "wire-ssr", "bind-e2e-wire-ssr", &wire_ssr);
     member(&harness, "wire-split", "bind-e2e-wire-split", &wire_split);
     member(&harness, "rich-ssr", "bind-e2e-rich-ssr", &rich_ssr);
@@ -794,19 +805,8 @@ fn scenarios(runtime: &tokio::runtime::Runtime, url: &str, schema: &str) {
     assert_eq!((value["name"].as_str(), value["balance"].as_str()), (Some("Ana & <Bia>"), Some("12.50")));
     println!("ssr: 200 page with data, 404 from require, 400 for ?id=xyz, HEAD and RPC");
 
-    // SSR: a page that writes, then fails, leaves nothing written.
-    let fail = Server::start(page_handler!(bind_e2e_fail, handle, pool));
-    let before = count("true");
-    let failed = http(&fail, "GET", &format!("/?id={ana}&outro={MISSING}&nome=Novo&email=novo%40example.com"), &[], "");
-    assert_eq!(failed.status, 404, "{}", failed.body);
-    assert_eq!(site(&failed.body), not_found);
-    assert_eq!(count("name = 'Novo'"), 0, "the page's insert must be rolled back");
-    assert_eq!(count("true"), before);
-    let written = http(&fail, "GET", &format!("/?id={ana}&outro={ana}&nome=Novo&email=novo%40example.com"), &[], "");
-    assert_eq!(written.status, 200, "{}", written.body);
-    assert_eq!(site(&written.body), "NovoAna &amp; &lt;Bia&gt;");
-    assert_eq!(count("name = 'Novo' AND email = 'novo@example.com' AND balance = 12.50"), 1);
-    println!("ssr: write then fail -> 404 and 0 rows; without the failure the row is committed");
+    // SSR: `GET /` never writes (the read-only transaction; E8311 refuses pages that would).
+    assert_eq!(count("true"), 1, "the ssr pages must not write");
 
     // CORS of the split server (frontend_origin = "http://a.test").
     let mut split = Server::start(split_handler!(bind_e2e_split, handle, pool));

@@ -36,16 +36,16 @@ pub fn bind_cedo(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) 
         } else {
             v0_x.clone()
         };
-        ::std::result::Result::Ok(v1_y.add(&crate::bind_runtime::Int::from_i64(1)))
+        v1_y.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 
 pub fn bind_sequencia(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int) -> crate::bind_runtime::BoxFuture<crate::bind_runtime::Int> {
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
-        let _ = v0_x.add(&crate::bind_runtime::Int::from_i64(1));
-        let v1_a: crate::bind_runtime::Int = v0_x.mul(&crate::bind_runtime::Int::from_i64(2));
-        let v2_b: crate::bind_runtime::Int = v1_a.add(&crate::bind_runtime::Int::from_i64(1));
+        let _ = v0_x.add(&crate::bind_runtime::Int::from_i64(1))?;
+        let v1_a: crate::bind_runtime::Int = v0_x.mul(&crate::bind_runtime::Int::from_i64(2))?;
+        let v2_b: crate::bind_runtime::Int = v1_a.add(&crate::bind_runtime::Int::from_i64(1))?;
         ::std::result::Result::Ok(v2_b.clone())
     })
 }
@@ -129,7 +129,7 @@ pub fn bind_saida(ctx: crate::bind_runtime::Ctx, v0_x: crate::bind_runtime::Int)
     ::std::boxed::Box::pin(async move {
         let ctx = ctx.enter()?;
         let v1_y: crate::bind_runtime::Int = return ::std::result::Result::Ok(v0_x.clone());
-        ::std::result::Result::Ok(v1_y.add(&crate::bind_runtime::Int::from_i64(1)))
+        v1_y.add(&crate::bind_runtime::Int::from_i64(1))
     })
 }
 
@@ -139,7 +139,7 @@ pub fn bind_loop(ctx: crate::bind_runtime::Ctx, v0_n: crate::bind_runtime::Int) 
         ::std::result::Result::Ok(if v0_n == crate::bind_runtime::Int::from_i64(0) {
             crate::bind_runtime::Int::from_i64(0)
         } else {
-            bind_loop(ctx.clone(), v0_n.sub(&crate::bind_runtime::Int::from_i64(1))).await?
+            bind_loop(ctx.clone(), v0_n.sub(&crate::bind_runtime::Int::from_i64(1))?).await?
         })
     })
 }

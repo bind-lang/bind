@@ -83,7 +83,7 @@ async function u_cedo(ctx, u_x_0) {
         t0 = u_x_0;
     }
     const u_y_1 = t0;
-    return u_y_1 + (await u_soma(ctx, rt.variant("No", [["u_esq", rt.variant("Folha", [])], ["u_valor", u_x_0], ["u_dir", rt.variant("Folha", [])]])));
+    return rt.intAdd(u_y_1, await u_soma(ctx, rt.variant("No", [["u_esq", rt.variant("Folha", [])], ["u_valor", u_x_0], ["u_dir", rt.variant("Folha", [])]])));
 }
 
 async function u_codigo(ctx, u_c_0) {
@@ -142,7 +142,7 @@ async function u_soma(ctx, u_a_0) {
         const u_e_1 = u_a_0.u_esq;
         const u_v_2 = u_a_0.u_valor;
         const u_d_3 = u_a_0.u_dir;
-        t0 = ((await u_soma(ctx, u_e_1)) + u_v_2) + (await u_soma(ctx, u_d_3));
+        t0 = rt.intAdd(rt.intAdd(await u_soma(ctx, u_e_1), u_v_2), await u_soma(ctx, u_d_3));
     } else {
         throw new Error("bindc: no `when` arm matched");
     }
@@ -166,7 +166,7 @@ async function u_valor(ctx, u_p_0) {
         } else {
             throw new Error("bindc: no `when` arm matched");
         }
-        t1 = t0 + rt.length(rt.listOf(u_t_1));
+        t1 = rt.intAdd(t0, rt.length(rt.listOf(u_t_1)));
     }
     return t1;
 }

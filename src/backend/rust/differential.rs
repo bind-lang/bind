@@ -53,11 +53,24 @@ fun aplica(g: (Int) -> Int, x: Int): Int = g(x)
 /// Programs at the call-depth limit (10,000 nested Bind calls). `p<k>` itself is one call and
 /// `conta(n, 0)` is `n + 1` more: `conta(9998, 0)` reaches exactly 10,000, `conta(9999, 0)`
 /// is one call too many, and 20,000 is far beyond (Review Focus 3).
-const FIXED: [(&str, &str); 3] = [
+const FIXED: [(&str, &str); 6] = [
     ("Int", "conta(20000, 0)"),
     ("Int", "conta(9998, 0)"),
     ("Int", "conta(9999, 0)"),
+    // The `Int` bound (`MAX_INT_BITS`, 32768 bits): 2^32768 - 1 fits, 2^32768 overflows (by a
+    // sum, then by a product), in the evaluator and the server alike.
+    ("Int", INT_TOP),
+    ("Int", INT_PAST_TOP_SUM),
+    ("Int", INT_PAST_TOP_PRODUCT),
 ];
+
+/// `2^32768 - 1`: `x * (x - 1) + (x - 1)` with `x = 2^16384` (14 squarings of 2).
+const INT_TOP: &str = "aplica({ x -> x * (x - 1) + (x - 1) }, fold(listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), 2, { acc, i -> acc * acc }))";
+/// `2^32768` by a sum: `Overflow`.
+const INT_PAST_TOP_SUM: &str = "aplica({ x -> x * (x - 1) + x }, fold(listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14), 2, { acc, i -> acc * acc }))";
+/// `2^32768` by a product (15 squarings of 2): `Overflow`.
+const INT_PAST_TOP_PRODUCT: &str =
+    "fold(listOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15), 2, { acc, i -> acc * acc })";
 
 /// splitmix64.
 struct Rng(u64);
@@ -214,8 +227,8 @@ const STRING_PIECES: &[(&str, &str)] = &[
     ("é", "é"),
     ("😀", "😀"),
     ("\\u2028", "\u{2028}"),
-    // A lone surrogate escape is kept as its six source characters.
-    ("\\uD800", "\\uD800"),
+    // A surrogate pair escape is one character, as in Kotlin (a lone surrogate is E1006).
+    ("\\uD83D\\uDE00", "😀"),
     ("{", "{"),
     ("}", "}"),
 ];
@@ -240,7 +253,7 @@ const WEB_STRING_PIECES: &[(&str, &str)] = &[
     ("ção", "ção"),
     ("😀", "😀"),
     ("\\u2028", "\u{2028}"),
-    ("\\uD800", "\\uD800"),
+    ("\\uD83D\\uDE00", "😀"),
     ("{", "{"),
     ("<", "<"),
     (">", ">"),
@@ -578,7 +591,7 @@ impl Gen {
         }
     }
 
-    /// An integer literal as source (decimal, hex, binary, underscores, `L`; up to 40 digits),
+    /// An integer literal as source (decimal, hex, binary, underscores; up to 40 digits),
     /// in an expression position (negative ones parenthesized), and its value.
     fn int_literal(&mut self) -> (String, BigInt) {
         self.count("integer literal");
@@ -619,9 +632,11 @@ impl Gen {
                 let n = self.rng.range(0, 64);
                 (format!("0b{n:b}"), BigInt::from(n))
             }
+            // Formerly `{n}L`; Long literals are now rejected (E7004). Kept as a branch so the
+            // generator's draws are unchanged.
             7 => {
                 let n = self.rng.range(0, 99);
-                (format!("{n}L"), BigInt::from(n))
+                (n.to_string(), BigInt::from(n))
             }
             _ => {
                 let length = self.rng.range(10, 40) as usize;
@@ -2853,6 +2868,7 @@ pub(crate) fn expected(program: &CoreProgram, programs: &[(String, Ty, String)])
             let rendered = match eval_function(program, name, vec![]) {
                 Ok(value) => value.render(),
                 Err(EvalError::RecursionLimit) => "!RecursionLimit".into(),
+                Err(EvalError::Overflow) => "!Overflow".into(),
                 Err(EvalError::Unsupported(what)) => {
                     panic!("{name}: the evaluator does not support {what}\n{function}")
                 }
@@ -3094,6 +3110,11 @@ fn generator_is_deterministic_and_well_typed() {
         lines[PROGRAMS + 2],
         format!("p{}=!RecursionLimit", PROGRAMS + 2)
     );
+    let top = lines[PROGRAMS + 3].split_once('=').unwrap().1;
+    assert_eq!(top.len(), 9865, "2^32768 - 1 has 9865 digits");
+    assert!(top.ends_with("3712377855"), "{}", &top[top.len() - 10..]);
+    assert_eq!(lines[PROGRAMS + 4], format!("p{}=!Overflow", PROGRAMS + 4));
+    assert_eq!(lines[PROGRAMS + 5], format!("p{}=!Overflow", PROGRAMS + 5));
 }
 
 /// FNV-1a of `text`.
@@ -3107,13 +3128,15 @@ fn fnv(text: &str) -> u64 {
 }
 
 /// The server's programs are exactly those of before the three-way test's additions to the
-/// generator (same seed, same draws): the hash of their source as of commit 5d426aa.
+/// generator (same seed, same draws): the hash of their source as of commit 5d426aa, updated
+/// when Long literals (`42L`) and lone surrogate escapes became errors and their spellings left
+/// the generator, plus the three fixed programs of the `Int` bound.
 #[test]
 fn server_programs_are_unchanged_by_the_web_generator() {
     let (programs, _) = programs();
     let source = source(&programs);
-    assert_eq!(source.len(), 1_110_786);
-    assert_eq!(fnv(&source), 0x9d0b_ccc1_1fa1_e1ee);
+    assert_eq!(source.len(), 1_103_206);
+    assert_eq!(fnv(&source), 0x3e78_e056_d2c9_17a9);
 }
 
 /// The three-way test's generator is deterministic, produces well-typed programs only and

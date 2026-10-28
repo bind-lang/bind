@@ -11,6 +11,11 @@ use std::cmp::Ordering;
 use std::fmt;
 use std::ops::{Add, Div, Mul, Neg, Rem, Sub};
 
+/// Largest magnitude of an `Int` produced by arithmetic, in 32-bit limbs (32768 bits): a sum,
+/// difference or product with more limbs is an overflow. The same bound as the Rust runtime's
+/// `MAX_INT_BITS` (`32 * MAX_INT_LIMBS`) and the JS runtime's `MAX_INT_BITS`.
+pub const MAX_INT_LIMBS: usize = 1024;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BigInt {
     negative: bool,
@@ -51,6 +56,11 @@ impl BigInt {
     /// The number of 32-bit limbs of the magnitude (0 for zero).
     pub fn limb_count(&self) -> usize {
         self.limbs.len()
+    }
+
+    /// Whether this value is beyond the arithmetic bound [`MAX_INT_LIMBS`].
+    pub fn exceeds_int_bound(&self) -> bool {
+        self.limbs.len() > MAX_INT_LIMBS
     }
 
     fn is_zero(&self) -> bool {

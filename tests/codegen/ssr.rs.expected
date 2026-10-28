@@ -134,8 +134,10 @@ pub struct HttpResult {
     pub body: ::std::string::String,
 }
 
-/// `{"error": message}` with the error's status; the message never exposes internals.
+/// `{"error": message}` with the error's status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn error_result(error: &crate::bind_runtime::AppError) -> HttpResult {
+    crate::bind_runtime::log_error(error);
     let body = ::serde_json::json!({ "error": error.public_message() }).to_string();
     HttpResult { status: error.status(), body }
 }
@@ -166,23 +168,28 @@ async fn finish<T: ::serde::Serialize>(
     }
 }
 
-/// Decodes the request, opens the transaction and builds the call's context.
+/// Decodes the request (strict UTF-8, no byte order mark, then JSON), opens the transaction
+/// (with its statement timeout: the runtime's `begin_transaction`) and builds the call's context.
 async fn begin<I: ::serde::de::DeserializeOwned>(
     body: &[u8],
     pool: &::sqlx::PgPool,
 ) -> ::std::result::Result<(I, crate::bind_runtime::Ctx), HttpResult> {
-    let input = ::serde_json::from_slice(body)
+    let text = crate::bind_runtime::request_text(body).map_err(|error| error_result(&error))?;
+    let input = ::serde_json::from_str(text)
     .map_err(|error| error_result(&crate::bind_runtime::AppError::BadRequest(error.to_string())))?;
-    let transaction = pool
-    .begin()
+    let transaction = crate::bind_runtime::begin_transaction(pool, false)
     .await
-    .map_err(|error| error_result(&crate::bind_runtime::AppError::from(error)))?;
+    .map_err(|error| error_result(&error))?;
     ::std::result::Result::Ok((input, crate::bind_runtime::Ctx::with_transaction(transaction)))
 }
 
-/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction.
+/// Runs the RPC procedure at `path` with the JSON `body`, in one transaction. The path's
+/// percent-escapes are decoded first (a browser sends `/api/café` as `/api/caf%C3%A9`).
 pub async fn handle_rpc(path: &str, body: &[u8], pool: &::sqlx::PgPool) -> HttpResult {
-    match path.trim_end_matches('/') {
+    let ::std::option::Option::Some(path) = crate::bind_runtime::decode_path(path) else {
+        return error_result(&crate::bind_runtime::AppError::BadRequest(::std::string::String::from("malformed request path")));
+    };
+    match crate::bind_runtime::rpc_route(&path) {
         "/api/getCustomer" => {
             let (input, ctx) = match begin::<GetCustomerInput>(body, pool).await {
                 ::std::result::Result::Ok(started) => started,
@@ -222,8 +229,10 @@ const PAGE_META: crate::bind_runtime::PageMeta<'static> = crate::bind_runtime::P
     stylesheet: "/styles.css",
 };
 
-/// The error page of `error`, with its status; the message never exposes internals.
+/// The error page of `error`, with its status; the message never exposes internals (an
+/// internal error is logged on standard error instead).
 fn page_error(error: &crate::bind_runtime::AppError) -> HttpResult {
+    crate::bind_runtime::log_error(error);
     let (status, body) = crate::bind_runtime::error_page(error, &PAGE_META);
     HttpResult { status, body }
 }
@@ -236,17 +245,20 @@ fn page_result(node: &crate::bind_runtime::Node) -> HttpResult {
 
 /// `GET /`: the page of component `CustomerPage` (HTML, `PAGE_CONTENT_TYPE`). Its parameters come
 /// from the query string `query` (absent, repeated or invalid: a 400 page naming the
-/// parameter); server calls run in one transaction, committed when the page renders and rolled
-/// back on an error, whose page has the error's status.
+/// parameter); server calls run in one read-only transaction, always rolled
+/// back (the page is read-only: `GET` and `HEAD` never commit); an error's page has the
+/// error's status.
 pub async fn handle_page(query: &str, pool: &::sqlx::PgPool) -> HttpResult {
     let params = crate::bind_runtime::QueryParams::parse(query);
     let a0 = match crate::bind_runtime::param::<::uuid::Uuid>(&params, "id") {
         ::std::result::Result::Ok(value) => crate::app::CustomerId { value: value },
         ::std::result::Result::Err(error) => return page_error(&error),
     };
-    let transaction = match pool.begin().await {
+    // `GET /` never writes: the server calls share one read-only transaction (a write
+    // fails in PostgreSQL), rolled back once the page is rendered, never committed.
+    let transaction = match crate::bind_runtime::begin_transaction(pool, true).await {
         ::std::result::Result::Ok(transaction) => transaction,
-        ::std::result::Result::Err(error) => return page_error(&crate::bind_runtime::AppError::from(error)),
+        ::std::result::Result::Err(error) => return page_error(&error),
     };
     let ctx = crate::bind_runtime::Ctx::with_transaction(transaction);
     let result = app::bind_CustomerPage(ctx.clone(), a0).await;
@@ -255,16 +267,11 @@ pub async fn handle_page(query: &str, pool: &::sqlx::PgPool) -> HttpResult {
         ::std::result::Result::Err(error) => return page_error(&error),
     };
     ::std::mem::drop(ctx);
+    // Nothing to keep: a failed rollback only closes the connection's transaction.
+    let _ = transaction.rollback().await;
     match result {
-        ::std::result::Result::Ok(node) => match transaction.commit().await {
-            ::std::result::Result::Ok(()) => page_result(&node),
-            ::std::result::Result::Err(error) => page_error(&crate::bind_runtime::AppError::from(error)),
-        },
-        ::std::result::Result::Err(error) => {
-            // The error is the page; a failed rollback leaves nothing committed either.
-            let _ = transaction.rollback().await;
-            page_error(&error)
-        }
+        ::std::result::Result::Ok(node) => page_result(&node),
+        ::std::result::Result::Err(error) => page_error(&error),
     }
 }
 
