@@ -17,3 +17,5 @@ fun escolhe(xs: List<Int>, f: Int, b: Boolean, g: (Int) -> Int) = map(xs, { x ->
 fun ignora(x: Int): (Int) -> Int = { y -> x }
 
 fun usaIgnora() = ignora(1)(2)
+
+fun cadeia(ns: List<Int>): (Int) -> Int = fold(ns, { x -> x }, { f, n -> { x -> f(x) + n } })

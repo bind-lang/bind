@@ -88,7 +88,7 @@ pub enum Value {
     Closure {
         params: Arc<[LocalId]>,
         body: Arc<Expr>,
-        env: Arc<Env>,
+        env: Captures,
     },
     Function(String),
     /// A builtin function; `key` is its first instance type (the element or key type of the
@@ -129,39 +129,70 @@ impl std::ops::Deref for Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        // Only the last owner frees the items; their own shared parts are moved to `pending`
-        // (when this was their last owner too) before they drop, so no drop recurses.
-        let Some(items) = Arc::get_mut(&mut self.0) else {
-            return;
-        };
-        let mut pending: Vec<Value> = std::mem::take(items);
-        while let Some(mut value) = pending.pop() {
-            match &mut value {
-                Value::List(shared) | Value::Set(shared) | Value::Ctor { fields: shared, .. } => {
+        if let Some(items) = Arc::get_mut(&mut self.0) {
+            free(std::mem::take(items));
+        }
+    }
+}
+
+/// The locals a closure captures. Shared like [`Shared`], and dropped iteratively like it: a
+/// closure whose environment holds a closure whose environment holds a closure… is freed
+/// without growing the call stack.
+#[derive(Clone, Debug, Default)]
+pub struct Captures(Arc<Env>);
+
+impl Captures {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The environment, without copying it when this was its last owner.
+    fn into_env(mut self) -> Env {
+        match Arc::get_mut(&mut self.0) {
+            Some(env) => std::mem::take(env),
+            None => (*self.0).clone(),
+        }
+    }
+}
+
+impl Drop for Captures {
+    fn drop(&mut self) {
+        if let Some(env) = Arc::get_mut(&mut self.0) {
+            free(std::mem::take(env).into_values().collect());
+        }
+    }
+}
+
+/// Drops `pending` and everything only it owns. Only the last owner frees a shared part; its
+/// own shared parts are moved to `pending` (when this was their last owner too) before they
+/// drop, so no drop recurses.
+fn free(mut pending: Vec<Value>) {
+    while let Some(mut value) = pending.pop() {
+        match &mut value {
+            Value::List(shared) | Value::Set(shared) | Value::Ctor { fields: shared, .. } => {
+                if let Some(items) = Arc::get_mut(&mut shared.0) {
+                    pending.append(items);
+                }
+            }
+            Value::Map { keys, values } => {
+                for shared in [keys, values] {
                     if let Some(items) = Arc::get_mut(&mut shared.0) {
                         pending.append(items);
                     }
                 }
-                Value::Map { keys, values } => {
-                    for shared in [keys, values] {
-                        if let Some(items) = Arc::get_mut(&mut shared.0) {
-                            pending.append(items);
-                        }
-                    }
-                }
-                Value::Ui { children, .. } => {
-                    if let Some(items) = Arc::get_mut(&mut children.0) {
-                        pending.append(items);
-                    }
-                }
-                Value::Some(inner) => pending.push(std::mem::replace(&mut **inner, Value::Unit)),
-                Value::Closure { env, .. } => {
-                    if let Some(env) = Arc::get_mut(env) {
-                        pending.extend(std::mem::take(env).into_values());
-                    }
-                }
-                _ => {}
             }
+            Value::Ui { children, .. } => {
+                if let Some(items) = Arc::get_mut(&mut children.0) {
+                    pending.append(items);
+                }
+            }
+            Value::Some(inner) => pending.push(std::mem::replace(&mut **inner, Value::Unit)),
+            Value::Closure { env, .. } => {
+                if let Some(env) = Arc::get_mut(&mut env.0) {
+                    pending.extend(std::mem::take(env).into_values());
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -561,7 +592,7 @@ impl Interp<'_> {
             }
             Value::Closure { params, body, env } => {
                 self.charge(env.len() as u64)?;
-                let mut env = Arc::unwrap_or_clone(env);
+                let mut env = env.into_env();
                 for (id, value) in bind_params(params.iter().copied(), args)? {
                     env.insert(id, value);
                 }
@@ -717,7 +748,7 @@ impl Interp<'_> {
         Ok(Value::Closure {
             params: lambda.params,
             body: lambda.body,
-            env: Arc::new(captured),
+            env: Captures(Arc::new(captured)),
         })
     }
 
@@ -1504,6 +1535,27 @@ mod tests {
             name: name.into(),
             fields: fields.into(),
         }
+    }
+
+    /// A closure whose environment holds a closure whose environment holds a closure…, a
+    /// million levels deep and outside any list or record, is freed on a small stack.
+    #[test]
+    fn deep_closure_chains_drop_without_recursion() {
+        let body = Arc::new(compile("fun f(x: Int) = x").functions[0].body.clone());
+        let mut chain = Value::Unit;
+        for _ in 0..1_000_000 {
+            chain = Value::Closure {
+                params: Arc::from([]),
+                body: Arc::clone(&body),
+                env: Captures(Arc::new(Env::from([(0, chain)]))),
+            };
+        }
+        std::thread::Builder::new()
+            .stack_size(256 * 1024)
+            .spawn(move || drop(chain))
+            .expect("spawns")
+            .join()
+            .expect("drops without overflowing");
     }
 
     #[test]

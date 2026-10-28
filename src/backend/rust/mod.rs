@@ -1430,5 +1430,23 @@ fn deep_recursion_reaches_the_limit_without_overflow() {
     };
     assert!(matches!(returns(20_000), Err(AppError::RecursionLimit)));
 }
+
+/// A closure that captures a closure that captures a closure…, a million levels deep, built by
+/// generated code and dropped on a thread with a small stack: each closure keeps its captures
+/// in a `Rec`, so the chain is freed one closure at a time.
+#[test]
+fn deep_closure_chains_drop_without_recursion() {
+    let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+    let ns = |n: i64| Arc::new((1..=n).map(Int::from_i64).collect::<Vec<_>>());
+    let short = rt.block_on(lambdas::bind_cadeia(Ctx::pure(), ns(3))).unwrap();
+    assert_eq!(rt.block_on(short(Ctx::pure(), Int::from_i64(10))).unwrap(), Int::from_i64(16));
+    let long = rt.block_on(lambdas::bind_cadeia(Ctx::pure(), ns(1_000_000))).unwrap();
+    std::thread::Builder::new()
+        .stack_size(256 * 1024)
+        .spawn(move || drop(long))
+        .unwrap()
+        .join()
+        .unwrap();
+}
 "##;
 }
